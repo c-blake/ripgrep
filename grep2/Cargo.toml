@@ -1,0 +1,20 @@
+[package]
+name = "grep2"
+version = "0.1.8"  #:version
+authors = ["Andrew Gallant <jamslam@gmail.com>"]
+description = """
+Fast line oriented regex searching as a library.
+"""
+documentation = "https://docs.rs/grep"
+homepage = "https://github.com/BurntSushi/ripgrep"
+repository = "https://github.com/BurntSushi/ripgrep"
+readme = "README.md"
+keywords = ["regex", "grep", "egrep", "search", "pattern"]
+license = "Unlicense/MIT"
+
+[dependencies]
+failure = "0.1"
+log = "0.4"
+memchr = "2"
+regex = "1"
+regex-syntax = "0.6"

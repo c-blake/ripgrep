@@ -32,7 +32,7 @@ name = "integration"
 path = "tests/tests.rs"
 
 [workspace]
-members = ["grep", "globset", "ignore", "termcolor", "wincolor"]
+members = ["grep", "grep2", "globset", "ignore", "termcolor", "wincolor"]
 
 [dependencies]
 atty = "0.2.9"
