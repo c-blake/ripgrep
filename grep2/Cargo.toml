@@ -11,10 +11,17 @@ repository = "https://github.com/BurntSushi/ripgrep"
 readme = "README.md"
 keywords = ["regex", "grep", "egrep", "search", "pattern"]
 license = "Unlicense/MIT"
+autotests = false
+
+[[test]]
+name = "integration"
+path = "tests/tests.rs"
 
 [dependencies]
 failure = "0.1"
 log = "0.4"
 memchr = "2"
+
+[dev-dependencies]
 regex = "1"
 regex-syntax = "0.6"
