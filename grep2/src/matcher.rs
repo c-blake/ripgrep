@@ -129,7 +129,7 @@ pub trait Matcher {
     /// (or `std::error::Error` if you aren't using the `failure` crate). In
     /// the future, when the "never" (spelled `!`) type is stabilized, then it
     /// should be used instead.
-    type Error: ::failure::Fail;
+    type Error;
 
     /// Returns the start and end byte range of the first match in `haystack`
     /// after `at`, where the byte offsets are relative to that start of
