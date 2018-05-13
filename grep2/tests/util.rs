@@ -1,8 +1,11 @@
 use std::collections::HashMap;
+use std::fmt;
+use std::result;
 
-use regex::bytes::Regex;
+use failure::Fail;
+use regex::bytes::{Locations, Regex};
 
-use grep2::{CaptureMatches, LineMatcher, Matcher};
+use grep2::{Captures, Matcher, NoCaptures};
 
 #[derive(Debug)]
 pub struct RegexMatcher {
@@ -25,21 +28,32 @@ impl RegexMatcher {
     }
 }
 
-impl Matcher for RegexMatcher {
-    type LineMatcher = Self;
+type Result<T> = result::Result<T, NoError>;
 
-    fn find_at(&self, haystack: &[u8], at: usize) -> Option<(usize, usize)> {
+impl Matcher for RegexMatcher {
+    type Captures = RegexCaptures;
+    type Error = NoError;
+
+    fn find_at(
+        &self,
+        haystack: &[u8],
+        at: usize,
+    ) -> Result<Option<(usize, usize)>> {
         // TODO: This relies on an undocumented part of the regex API.
         // It is simple enough that we should probably just expose it.
-        self.re.find_at(haystack, at).map(|m| (m.start(), m.end()))
+        Ok(self.re.find_at(haystack, at).map(|m| (m.start(), m.end())))
+    }
+
+    fn new_captures(&self) -> Result<RegexCaptures> {
+        Ok(RegexCaptures(self.re.locations()))
     }
 
     fn captures_at(
         &self,
         haystack: &[u8],
         at: usize,
-        matches: &mut CaptureMatches,
-    ) -> bool {
+        caps: &mut RegexCaptures,
+    ) -> Result<bool> {
         // TODO: This relies on an undocumented part of the regex API.
         // This needs a little thought. The simplest solution is to push
         // the burden of satisfying the API contract on to the caller, which
@@ -47,17 +61,7 @@ impl Matcher for RegexMatcher {
         // level API.
         //
         // See: https://github.com/rust-lang/regex/issues/219
-        matches.resize(0);
-        let mut locs = self.re.locations();
-        if self.re.read_captures_at(&mut locs, haystack, at).is_none() {
-            return false;
-        }
-
-        matches.resize(locs.len());
-        for (i, m) in locs.iter().enumerate() {
-            matches.set(i, m);
-        }
-        true
+        Ok(self.re.read_captures_at(&mut caps.0, haystack, at).is_some())
     }
 
     fn capture_count(&self) -> usize {
@@ -74,17 +78,55 @@ impl Matcher for RegexMatcher {
     // since the regex crate avoids synchronization overhead.
 }
 
-impl LineMatcher for RegexMatcher {}
-
 #[derive(Debug)]
 pub struct RegexMatcherNoCaps(pub Regex);
 
 impl Matcher for RegexMatcherNoCaps {
-    type LineMatcher = Self;
+    type Captures = NoCaptures;
+    type Error = NoError;
 
-    fn find_at(&self, haystack: &[u8], at: usize) -> Option<(usize, usize)> {
-        self.0.find_at(haystack, at).map(|m| (m.start(), m.end()))
+    fn find_at(
+        &self,
+        haystack: &[u8],
+        at: usize,
+    ) -> Result<Option<(usize, usize)>> {
+        Ok(self.0.find_at(haystack, at).map(|m| (m.start(), m.end())))
+    }
+
+    fn new_captures(&self) -> Result<NoCaptures> {
+        Ok(NoCaptures::new())
     }
 }
 
-impl LineMatcher for RegexMatcherNoCaps {}
+#[derive(Debug)]
+pub struct NoError(());
+
+impl Fail for NoError {}
+
+impl fmt::Display for NoError {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "BUG for NoError: an impossible error occurred")
+    }
+}
+
+pub struct RegexCaptures(Locations);
+
+impl Captures for RegexCaptures {
+    fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    fn get(&self, i: usize) -> Option<(usize, usize)> {
+        self.0.pos(i)
+    }
+}
+
+impl fmt::Debug for RegexCaptures {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        let mut list = f.debug_list();
+        for x in self.0.iter() {
+            list.entry(&x);
+        }
+        list.finish()
+    }
+}

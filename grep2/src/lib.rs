@@ -4,7 +4,7 @@ extern crate failure;
 extern crate memchr;
 
 pub use matcher::{
-    CaptureMatch, CaptureMatches, LineMatch, LineMatcher, Matcher,
+    Captures, LineMatch, Matcher, NoCaptures,
 };
 
 mod interpolate;

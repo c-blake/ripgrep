@@ -1,5 +1,3 @@
-use failure;
-
 use interpolate::interpolate;
 
 /// The type of match for a line oriented matcher.
@@ -17,98 +15,41 @@ pub enum LineMatch {
     Candidate(usize),
 }
 
-/// A matcher optimized for searching line-by-line.
+/// A trait that describes implementations of capturing groups.
 ///
-/// A line matcher is, fundamentally, a normal matcher with the addition of
-/// one optional method: finding a line. By default, this routine is
-/// implemented via the matcher's `shortest_match` method, which always yields
-/// either no match or a `LineMatch::Match`. However, implementors may provide
-/// a routine for this that can return candidate lines that need subsequent
-/// verification to be confirmed as a match. This can be useful in cases where
-/// it may be quicker to find candidate lines via some other means instead of
-/// relying on the more general implementations for `find` and
-/// `shortest_match`.
+/// When a matcher supports capturing group extraction, then it is the
+/// matcher's responsibility to provide an implementation of this trait.
 ///
-/// For example, consider the regex `\w+foo\s+`. Both `find` and
-/// `shortest_match` must consider the entire regex, including the `\w+` and
-/// `\s+`, while searching. However, a `LineMatcher`'s `find_line` method
-/// could look for lines containing `foo` and return them as candidates.
-/// Finding `foo` might be a implemented as a highly optimized substring search
-/// routine (like `memmem`), which is likely to be faster than whatever more
-/// generalized routine is required for resolving `\w+foo\s+`.
+/// Principally, this trait provides a way to access capturing groups
+/// in a uniform way that does not require any specific representation.
+/// Namely, differ matcher implementations may require different in-memory
+/// representations of capturing groups. This trait permits matchers to
+/// maintain their specific in-memory representation.
 ///
-/// Note that while a line matcher may report false positives, a line matcher
-/// must never report false negatives. That is, it can never skip over lines
-/// that contain a match.
-pub trait LineMatcher: Matcher {
-    /// Return one of the following: a confirmed line match, a candidate line
-    /// match (which may be a false positive) or no match at all (which **must
-    /// not** be a false negative). When reporting a confirmed or candidate
-    /// match, the position returned can be any position in the line.
+/// Note that this trait explicitly does not provide a way to construct a new
+/// captures value. Instead, it is the responsibility of a `Matcher` to build
+/// one, which might require knowledge of the matcher's internal implementation
+/// details.
+pub trait Captures {
+    /// Return the total number of capturing groups. This includes capturing
+    /// groups that have not matched anything.
+    fn len(&self) -> usize;
+
+    /// Return the capturing group match at the given index. If no match of
+    /// that capturing group exists, then this returns `None`.
     ///
-    /// By default, this never returns a candidate match, and always either
-    /// returns a confirmed match or no match at all.
-    fn find_line(&self, haystack: &[u8]) -> Option<LineMatch> {
-        self.shortest_match(haystack).map(LineMatch::Confirmed)
-    }
-}
+    /// When a matcher reports a match with capturing groups, then the first
+    /// capturing group (at index `0`) must always correspond to the offsets
+    /// for the overall match.
+    fn get(&self, i: usize) -> Option<(usize, usize)>;
 
-/// CaptureMatch is a match for a single capturing group, if one exists.
-pub type CaptureMatch = Option<(usize, usize)>;
-
-/// CaptureMatches represents the match locations for each capturing group in a
-/// matcher.
-///
-/// After receiving matches, if a matcher supports capturing groups, then this
-/// value always has length equivalent to the number of capturing groups in the
-/// matcher. Each capturing group may or may not have a match, but the first
-/// capturing group always corresponds to the overall match.
-///
-/// If a matcher does not support capturing groups, then this value always has
-/// length zero after attempting a match.
-pub struct CaptureMatches(Vec<CaptureMatch>);
-
-impl CaptureMatches {
-    /// Create an empty set of capture matches. The value returned here may
-    /// be passed to a matcher to retrieve capture locations.
-    pub fn new() -> CaptureMatches {
-        CaptureMatches(vec![])
-    }
-
-    /// Returns the number of possible capture matches. Note that this includes
-    /// unmatched capturing groups.
-    pub fn len(&self) -> usize {
-        self.0.len()
-    }
-
-    /// Returns true if and only if this group of matches is empty.
-    pub fn is_empty(&self) -> bool {
+    /// Returns true if and only if these captures are empty. This occurs
+    /// when `len` is `0`.
+    ///
+    /// Note that capturing groups that have non-zero length but otherwise
+    /// contain no matching groups are *not* empty.
+    fn is_empty(&self) -> bool {
         self.len() == 0
-    }
-
-    /// Resize this container to hold `n` capture matches. If `n` is less
-    /// than the current length, then this truncates. If `n` is more than the
-    /// current length, then this adds new empty matches.
-    pub fn resize(&mut self, n: usize) {
-        self.0.resize(n, None);
-    }
-
-    /// Returns the capture match at the given index.
-    ///
-    /// If no match occurred at the given capturing group, or if the given
-    /// index is out of bounds, then this returns `None`.
-    ///
-    /// The capture match at index `0` is guaranteed to exist whenever a
-    /// matcher reports a successful overall match.
-    pub fn get(&self, i: usize) -> CaptureMatch {
-        self.0.get(i).and_then(|m| *m)
-    }
-
-    /// Sets the given match to the given position.
-    ///
-    /// This panics if `i` is greater than this container's length.
-    pub fn set(&mut self, i: usize, m: CaptureMatch) {
-        self.0[i] = m;
     }
 
     /// Expands all instances of `$name` in `replacement` to the corresponding
@@ -136,7 +77,7 @@ impl CaptureMatches {
     /// the given `haystack`. Generally, this means that `haystack` should be
     /// the same slice that was searched to get the current capture group
     /// matches.
-    pub fn interpolate<F>(
+    fn interpolate<F>(
         &self,
         name_to_index: F,
         haystack: &[u8],
@@ -157,8 +98,38 @@ impl CaptureMatches {
     }
 }
 
+/// NoCaptures provides an always-empty implementation of the `Captures` trait.
+///
+/// This type is useful for implementations of `Matcher` that don't support
+/// capturing groups.
+#[derive(Clone, Debug)]
+pub struct NoCaptures(());
+
+impl NoCaptures {
+    /// Create an empty set of capturing groups.
+    pub fn new() -> NoCaptures { NoCaptures(()) }
+}
+
+impl Captures for NoCaptures {
+    fn len(&self) -> usize { 0 }
+    fn get(&self, _: usize) -> Option<(usize, usize)> { None }
+}
+
 pub trait Matcher {
-    type LineMatcher: LineMatcher;
+    /// The concrete type of capturing groups used for this matcher.
+    ///
+    /// If this implementation does not support capturing groups, then set
+    /// this to `NoCaptures`.
+    type Captures: Captures;
+
+    /// The error type used by this matcher.
+    ///
+    /// For matchers in which an error is not possible, they are encouraged to
+    /// define a new type with a trivial implementation for `failure::Fail`
+    /// (or `std::error::Error` if you aren't using the `failure` crate). In
+    /// the future, when the "never" (spelled `!`) type is stabilized, then it
+    /// should be used instead.
+    type Error: ::failure::Fail;
 
     /// Returns the start and end byte range of the first match in `haystack`
     /// after `at`, where the byte offsets are relative to that start of
@@ -170,13 +141,25 @@ pub trait Matcher {
     /// The significance of the starting point is that it takes the surrounding
     /// context into consideration. For example, the `\A` anchor can only
     /// match when `start == 0`.
-    fn find_at(&self, haystack: &[u8], at: usize) -> Option<(usize, usize)>;
+    fn find_at(
+        &self,
+        haystack: &[u8],
+        at: usize,
+    ) -> Result<Option<(usize, usize)>, Self::Error>;
 
-    /// Populates the first set of capture group matches from `haystack` into
-    /// `matches` after `at`, where the byte offsets in each capturing group
-    /// are relative to the start of `haystack` (and not `at`). If no match
-    /// exists, then `false` is returned and the length of the given matches
-    /// is set to `0`.
+    /// Creates an empty group of captures suitable for use with the capturing
+    /// APIs of this trait.
+    ///
+    /// Implementations that don't support capturing groups should use
+    /// the `NoCaptures` type and implement this method by calling
+    /// `NoCaptures::new()`.
+    fn new_captures(&self) -> Result<Self::Captures, Self::Error>;
+
+    /// Populates the first set of capture group matches from `haystack`
+    /// into `matches` after `at`, where the byte offsets in each capturing
+    /// group are relative to the start of `haystack` (and not `at`). If no
+    /// match exists, then `false` is returned and the contents of the given
+    /// capturing groups are unspecified.
     ///
     /// The text encoding of `haystack` is not strictly specified. Matchers are
     /// advised to assume UTF-8, or at worst, some ASCII compatible encoding.
@@ -196,10 +179,9 @@ pub trait Matcher {
         &self,
         haystack: &[u8],
         at: usize,
-        matches: &mut CaptureMatches,
-    ) -> bool {
-        matches.0.clear();
-        false
+        _caps: &mut Self::Captures,
+    ) -> Result<bool, Self::Error> {
+        Ok(false)
     }
 
     /// Returns the total number of capturing groups in this matcher.
@@ -236,14 +218,21 @@ pub trait Matcher {
     ///
     /// The text encoding of `haystack` is not strictly specified. Matchers are
     /// advised to assume UTF-8, or at worst, some ASCII compatible encoding.
-    fn find(&self, haystack: &[u8]) -> Option<(usize, usize)> {
+    fn find(
+        &self,
+        haystack: &[u8],
+    ) -> Result<Option<(usize, usize)>, Self::Error> {
         self.find_at(haystack, 0)
     }
 
     /// Executes the given function over successive non-overlapping matches
     /// in `haystack`. If no match exists, then the given function is never
     /// called. If the function returns `false`, then iteration stops.
-    fn find_iter<F>(&self, haystack: &[u8], mut matched: F)
+    fn find_iter<F>(
+        &self,
+        haystack: &[u8],
+        mut matched: F,
+    ) -> Result<(), Self::Error>
     where F: FnMut(usize, usize) -> bool
     {
         let mut last_end = 0;
@@ -251,10 +240,10 @@ pub trait Matcher {
 
         loop {
             if last_end > haystack.len() {
-                return;
+                return Ok(());
             }
-            let (s, e) = match self.find_at(haystack, last_end) {
-                None => return,
+            let (s, e) = match self.find_at(haystack, last_end)? {
+                None => return Ok(()),
                 Some((s, e)) => (s, e),
             };
             if s == e {
@@ -272,18 +261,22 @@ pub trait Matcher {
             }
             last_match = Some(e);
             if !matched(s, e) {
-                return;
+                return Ok(());
             }
         }
     }
 
     /// Populates the first set of capture group matches from `haystack` into
-    /// `matches`. If no match exists, then `false` is returned.
+    /// `caps`. If no match exists, then `false` is returned.
     ///
     /// The text encoding of `haystack` is not strictly specified. Matchers are
     /// advised to assume UTF-8, or at worst, some ASCII compatible encoding.
-    fn captures(&self, haystack: &[u8], matches: &mut CaptureMatches) -> bool {
-        self.captures_at(haystack, 0, matches)
+    fn captures(
+        &self,
+        haystack: &[u8],
+        caps: &mut Self::Captures,
+    ) -> Result<bool, Self::Error> {
+        self.captures_at(haystack, 0, caps)
     }
 
     /// Executes the given function over successive non-overlapping matches
@@ -293,22 +286,22 @@ pub trait Matcher {
     fn captures_iter<F>(
         &self,
         haystack: &[u8],
-        matches: &mut CaptureMatches,
+        caps: &mut Self::Captures,
         mut matched: F,
-    )
-    where F: FnMut(&mut CaptureMatches) -> bool
+    ) -> Result<(), Self::Error>
+    where F: FnMut(&Self::Captures) -> bool
     {
         let mut last_end = 0;
         let mut last_match = None;
 
         loop {
             if last_end > haystack.len() {
-                return;
+                return Ok(());
             }
-            if !self.captures_at(haystack, last_end, matches) {
-                return;
+            if !self.captures_at(haystack, last_end, caps)? {
+                return Ok(());
             }
-            let (s, e) = matches.get(0).unwrap();
+            let (s, e) = caps.get(0).unwrap();
             if s == e {
                 // This is an empty match. To ensure we make progress, start
                 // the next search at the smallest possible starting position
@@ -323,8 +316,8 @@ pub trait Matcher {
                 last_end = e;
             }
             last_match = Some(e);
-            if !matched(matches) {
-                return;
+            if !matched(caps) {
+                return Ok(());
             }
         }
     }
@@ -338,7 +331,7 @@ pub trait Matcher {
         haystack: &[u8],
         dst: &mut Vec<u8>,
         mut append: F,
-    )
+    ) -> Result<(), Self::Error>
     where F: FnMut(usize, usize, &mut Vec<u8>) -> bool
     {
         let mut last_match = 0;
@@ -346,8 +339,9 @@ pub trait Matcher {
             dst.extend(&haystack[last_match..start]);
             last_match = end;
             append(start, end, dst)
-        });
+        })?;
         dst.extend(&haystack[last_match..]);
+        Ok(())
     }
 
     /// Replaces every match in the given haystack with the result of calling
@@ -357,20 +351,21 @@ pub trait Matcher {
     fn replace_with_captures<F>(
         &self,
         haystack: &[u8],
-        matches: &mut CaptureMatches,
+        caps: &mut Self::Captures,
         dst: &mut Vec<u8>,
         mut append: F,
-    )
-    where F: FnMut(&CaptureMatches, &mut Vec<u8>) -> bool
+    ) -> Result<(), Self::Error>
+    where F: FnMut(&Self::Captures, &mut Vec<u8>) -> bool
     {
         let mut last_match = 0;
-        self.captures_iter(haystack, matches, |matches| {
-            let (start, end) = matches.get(0).unwrap();
+        self.captures_iter(haystack, caps, |caps| {
+            let (start, end) = caps.get(0).unwrap();
             dst.extend(&haystack[last_match..start]);
             last_match = end;
-            append(matches, dst)
-        });
+            append(caps, dst)
+        })?;
         dst.extend(&haystack[last_match..]);
+        Ok(())
     }
 
     /// Returns an end location of the first match in `haystack`. If no match
@@ -387,52 +382,94 @@ pub trait Matcher {
     /// a faster implementation of this than what `find` does.
     ///
     /// By default, this method is implemented by calling `find`.
-    fn shortest_match(&self, haystack: &[u8]) -> Option<usize> {
-        self.find(haystack).map(|(_, end)| end)
+    fn shortest_match(
+        &self,
+        haystack: &[u8],
+    ) -> Result<Option<usize>, Self::Error> {
+        Ok(self.find(haystack)?.map(|(_, end)| end))
     }
 
-    /// Returns a new matcher, if possible, that is optimized for matching
-    /// lines.
+    /// If this matcher was compiled as a line oriented matcher, then this
+    /// method returns the line terminator. If this wasn't compiled as a line
+    /// oriented matcher, then this must return `None`, which is the default.
     ///
-    /// The `line_terminator` given is a single arbitrary byte that is used to
-    /// terminate lines. Typically, this is `b'\n'`. The line matcher returned
-    /// **must never** match the line terminator. That is, in the set of all
-    /// possible strings matched, the line terminator must not appear in any of
-    /// them. If an implementor cannot uphold this contract, then `None` **must
-    /// be** returned. Violating this contract will result in unspecified
-    /// behavior, which may include program crashes, loops or incorrect results
-    /// (but never memory unsafety).
+    /// A line terminator is typically `b'\n'`, but can be any single byte.
+    /// The contract of a line terminator is that it must never appear in a
+    /// match reported by this matcher. That is, if you enumerated every
+    /// possible string that was matched by this matcher, then none of them
+    /// would contain the line terminator.
+    fn line_terminator(&self) -> Option<u8> {
+        None
+    }
+
+    /// Return one of the following: a confirmed line match, a candidate line
+    /// match (which may be a false positive) or no match at all (which **must
+    /// not** be a false negative). When reporting a confirmed or candidate
+    /// match, the position returned can be any position in the line.
     ///
-    /// The purpose of this method is to allow implementors to provide a
-    /// routine for finding matching lines more quickly than what `find` or
-    /// `shortest_match` can achieve.
+    /// By default, this never returns a candidate match, and always either
+    /// returns a confirmed match or no match at all.
     ///
-    /// Implementors may choose to return an error if failing to build a line
-    /// matcher would be undesirable or if some other unexpected problem
-    /// occurred.
-    #[allow(unused_variables)]
-    fn line_matcher(
+    /// When a matcher can match spans over multiple lines, then the behavior
+    /// of this method is unspecified. Namely, use of this method only makes
+    /// sense in a context where the caller is looking for the next matching
+    /// line.
+    ///
+    /// # Design rational
+    ///
+    /// A line matcher is, fundamentally, a normal matcher with the addition
+    /// of one optional method: finding a line. By default, this routine
+    /// is implemented via the matcher's `shortest_match` method, which
+    /// always yields either no match or a `LineMatch::Confirmed`. However,
+    /// implementors may provide a routine for this that can return candidate
+    /// lines that need subsequent verification to be confirmed as a match.
+    /// This can be useful in cases where it may be quicker to find candidate
+    /// lines via some other means instead of relying on the more general
+    /// implementations for `find` and `shortest_match`.
+    ///
+    /// For example, consider the regex `\w+foo\s+`. Both `find` and
+    /// `shortest_match` must consider the entire regex, including the `\w+`
+    /// and `\s+`, while searching. However, this method could look for lines
+    /// containing `foo` and return them as candidates. Finding `foo` might
+    /// be a implemented as a highly optimized substring search routine (like
+    /// `memmem`), which is likely to be faster than whatever more generalized
+    /// routine is required for resolving `\w+foo\s+`. The caller is then
+    /// responsible for confirming whether a match exists or not.
+    ///
+    /// Note that while a this method may report false positives, it must never
+    /// report false negatives. That is, it can never skip over lines that
+    /// contain a match.
+    fn find_candidate_line(
         &self,
-        line_terminator: u8,
-    ) -> Result<Option<Self::LineMatcher>, failure::Error> {
-        Ok(None)
+        haystack: &[u8],
+    ) -> Result<Option<LineMatch>, Self::Error> {
+        Ok(self.shortest_match(haystack)?.map(LineMatch::Confirmed))
     }
 }
 
 impl<'a, M: Matcher> Matcher for &'a M {
-    type LineMatcher = M::LineMatcher;
+    type Captures = M::Captures;
+    type Error = M::Error;
 
-    fn find_at(&self, haystack: &[u8], at: usize) -> Option<(usize, usize)> {
+    fn find_at(
+        &self,
+        haystack: &[u8],
+        at: usize,
+    ) -> Result<Option<(usize, usize)>, Self::Error> {
         (*self).find_at(haystack, at)
+    }
+
+    fn new_captures(&self) -> Result<Self::Captures, Self::Error> {
+        (*self).new_captures()
     }
 
     fn captures_at(
         &self,
         haystack: &[u8],
         at: usize,
-        matches: &mut CaptureMatches,
-    ) -> bool {
-        (*self).captures_at(haystack, at, matches)
+        caps: &mut Self::Captures,
+    ) -> Result<bool, Self::Error> {
+        (*self).captures_at(haystack, at, caps)
     }
 
     fn capture_index(&self, name: &str) -> Option<usize> {
@@ -443,29 +480,40 @@ impl<'a, M: Matcher> Matcher for &'a M {
         (*self).capture_count()
     }
 
-    fn find(&self, haystack: &[u8]) -> Option<(usize, usize)> {
+    fn find(
+        &self,
+        haystack: &[u8]
+    ) -> Result<Option<(usize, usize)>, Self::Error> {
         (*self).find(haystack)
     }
 
-    fn find_iter<F>(&self, haystack: &[u8], matched: F)
+    fn find_iter<F>(
+        &self,
+        haystack: &[u8],
+        matched: F,
+    ) -> Result<(), Self::Error>
     where F: FnMut(usize, usize) -> bool
     {
         (*self).find_iter(haystack, matched)
     }
 
-    fn captures(&self, haystack: &[u8], matches: &mut CaptureMatches) -> bool {
-        (*self).captures(haystack, matches)
+    fn captures(
+        &self,
+        haystack: &[u8],
+        caps: &mut Self::Captures,
+    ) -> Result<bool, Self::Error> {
+        (*self).captures(haystack, caps)
     }
 
     fn captures_iter<F>(
         &self,
         haystack: &[u8],
-        matches: &mut CaptureMatches,
+        caps: &mut Self::Captures,
         matched: F,
-    )
-    where F: FnMut(&mut CaptureMatches) -> bool
+    ) -> Result<(), Self::Error>
+    where F: FnMut(&Self::Captures) -> bool
     {
-        (*self).captures_iter(haystack, matches, matched)
+        (*self).captures_iter(haystack, caps, matched)
     }
 
     fn replace<F>(
@@ -473,7 +521,7 @@ impl<'a, M: Matcher> Matcher for &'a M {
         haystack: &[u8],
         dst: &mut Vec<u8>,
         append: F,
-    )
+    ) -> Result<(), Self::Error>
     where F: FnMut(usize, usize, &mut Vec<u8>) -> bool
     {
         (*self).replace(haystack, dst, append)
@@ -482,29 +530,30 @@ impl<'a, M: Matcher> Matcher for &'a M {
     fn replace_with_captures<F>(
         &self,
         haystack: &[u8],
-        matches: &mut CaptureMatches,
+        caps: &mut Self::Captures,
         dst: &mut Vec<u8>,
         append: F,
-    )
-    where F: FnMut(&CaptureMatches, &mut Vec<u8>) -> bool
+    ) -> Result<(), Self::Error>
+    where F: FnMut(&Self::Captures, &mut Vec<u8>) -> bool
     {
-        (*self).replace_with_captures(haystack, matches, dst, append)
+        (*self).replace_with_captures(haystack, caps, dst, append)
     }
 
-    fn shortest_match(&self, haystack: &[u8]) -> Option<usize> {
+    fn shortest_match(
+        &self,
+        haystack: &[u8],
+    ) -> Result<Option<usize>, Self::Error> {
         (*self).shortest_match(haystack)
     }
 
-    fn line_matcher(
-        &self,
-        line_terminator: u8,
-    ) -> Result<Option<Self::LineMatcher>, failure::Error> {
-        (*self).line_matcher(line_terminator)
+    fn line_terminator(&self) -> Option<u8> {
+        (*self).line_terminator()
     }
-}
 
-impl<'a, L: LineMatcher> LineMatcher for &'a L {
-    fn find_line(&self, haystack: &[u8]) -> Option<LineMatch> {
-        (*self).find_line(haystack)
+    fn find_candidate_line(
+        &self,
+        haystack: &[u8],
+    ) -> Result<Option<LineMatch>, Self::Error> {
+        (*self).find_candidate_line(haystack)
     }
 }

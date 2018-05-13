@@ -1,7 +1,8 @@
+extern crate failure;
 extern crate grep2;
 extern crate regex;
 
-use grep2::{CaptureMatches, Matcher};
+use grep2::{Captures, Matcher};
 use regex::bytes::Regex;
 
 use util::{RegexMatcher, RegexMatcherNoCaps};
@@ -19,7 +20,7 @@ fn matcher_no_caps(pattern: &str) -> RegexMatcherNoCaps {
 #[test]
 fn find() {
     let matcher = matcher(r"(\w+)\s+(\w+)");
-    assert_eq!(matcher.find(b" homer simpson "), Some((1, 14)));
+    assert_eq!(matcher.find(b" homer simpson ").unwrap(), Some((1, 14)));
 }
 
 #[test]
@@ -29,7 +30,7 @@ fn find_iter() {
     matcher.find_iter(b"aa bb cc dd", |s, e| {
         matches.push((s, e));
         true
-    });
+    }).unwrap();
     assert_eq!(matches, vec![(0, 5), (6, 11)]);
 
     // Test that find_iter respects short circuiting.
@@ -37,7 +38,7 @@ fn find_iter() {
     matcher.find_iter(b"aa bb cc dd", |s, e| {
         matches.push((s, e));
         false
-    });
+    }).unwrap();
     assert_eq!(matches, vec![(0, 5)]);
 }
 
@@ -46,7 +47,7 @@ fn shortest_match() {
     let matcher = matcher(r"a+");
     // This tests that the default impl isn't doing anything smart, and simply
     // defers to `find`.
-    assert_eq!(matcher.shortest_match(b"aaa"), Some(3));
+    assert_eq!(matcher.shortest_match(b"aaa").unwrap(), Some(3));
     // The actual underlying regex is smarter.
     assert_eq!(matcher.re.shortest_match(b"aaa"), Some(1));
 }
@@ -59,8 +60,8 @@ fn captures() {
     assert_eq!(matcher.capture_index("b"), Some(2));
     assert_eq!(matcher.capture_index("nada"), None);
 
-    let mut caps = CaptureMatches::new();
-    assert!(matcher.captures(b" homer simpson ", &mut caps));
+    let mut caps = matcher.new_captures().unwrap();
+    assert!(matcher.captures(b" homer simpson ", &mut caps).unwrap());
     assert_eq!(caps.get(0), Some((1, 14)));
     assert_eq!(caps.get(1), Some((1, 6)));
     assert_eq!(caps.get(2), Some((7, 14)));
@@ -69,14 +70,14 @@ fn captures() {
 #[test]
 fn captures_iter() {
     let matcher = matcher(r"(?P<a>\w+)\s+(?P<b>\w+)");
-    let mut caps = CaptureMatches::new();
+    let mut caps = matcher.new_captures().unwrap();
     let mut matches = vec![];
     matcher.captures_iter(b"aa bb cc dd", &mut caps, |caps| {
         matches.push(caps.get(0).unwrap());
         matches.push(caps.get(1).unwrap());
         matches.push(caps.get(2).unwrap());
         true
-    });
+    }).unwrap();
     assert_eq!(matches, vec![
         (0, 5), (0, 2), (3, 5),
         (6, 11), (6, 8), (9, 11),
@@ -89,7 +90,7 @@ fn captures_iter() {
         matches.push(caps.get(1).unwrap());
         matches.push(caps.get(2).unwrap());
         false
-    });
+    }).unwrap();
     assert_eq!(matches, vec![
         (0, 5), (0, 2), (3, 5),
     ]);
@@ -106,14 +107,14 @@ fn no_captures() {
     assert_eq!(matcher.capture_index("b"), None);
     assert_eq!(matcher.capture_index("nada"), None);
 
-    let mut caps = CaptureMatches::new();
-    assert!(!matcher.captures(b"homer simpson", &mut caps));
+    let mut caps = matcher.new_captures().unwrap();
+    assert!(!matcher.captures(b"homer simpson", &mut caps).unwrap());
 
     let mut called = false;
     matcher.captures_iter(b"homer simpson", &mut caps, |_| {
         called = true;
         true
-    });
+    }).unwrap();
     assert!(!called);
 }
 
@@ -124,7 +125,7 @@ fn replace() {
     matcher.replace(b"aa bb cc dd", &mut dst, |_, _, dst| {
         dst.push(b'z');
         true
-    });
+    }).unwrap();
     assert_eq!(dst, b"z z");
 
     // Test that replacements respect short circuiting.
@@ -132,7 +133,7 @@ fn replace() {
     matcher.replace(b"aa bb cc dd", &mut dst, |_, _, dst| {
         dst.push(b'z');
         false
-    });
+    }).unwrap();
     assert_eq!(dst, b"z cc dd");
 }
 
@@ -140,7 +141,7 @@ fn replace() {
 fn replace_with_captures() {
     let matcher = matcher(r"(\w+)\s+(\w+)");
     let haystack = b"aa bb cc dd";
-    let mut caps = CaptureMatches::new();
+    let mut caps = matcher.new_captures().unwrap();
     let mut dst = vec![];
     matcher.replace_with_captures(haystack, &mut caps, &mut dst, |caps, dst| {
         caps.interpolate(
@@ -150,7 +151,7 @@ fn replace_with_captures() {
             dst,
         );
         true
-    });
+    }).unwrap();
     assert_eq!(dst, b"bb aa dd cc");
 
     // Test that replacements respect short circuiting.
@@ -163,6 +164,6 @@ fn replace_with_captures() {
             dst,
         );
         false
-    });
+    }).unwrap();
     assert_eq!(dst, b"bb aa cc dd");
 }
