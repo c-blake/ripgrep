@@ -1,7 +1,7 @@
 use interpolate::interpolate;
 
 /// The type of match for a line oriented matcher.
-pub enum LineMatch {
+pub enum LineMatchKind {
     /// A position inside a line that is known to contain a match.
     ///
     /// This position can be anywhere in the line. It does not need to point
@@ -420,7 +420,7 @@ pub trait Matcher {
     /// A line matcher is, fundamentally, a normal matcher with the addition
     /// of one optional method: finding a line. By default, this routine
     /// is implemented via the matcher's `shortest_match` method, which
-    /// always yields either no match or a `LineMatch::Confirmed`. However,
+    /// always yields either no match or a `LineMatchKind::Confirmed`. However,
     /// implementors may provide a routine for this that can return candidate
     /// lines that need subsequent verification to be confirmed as a match.
     /// This can be useful in cases where it may be quicker to find candidate
@@ -442,8 +442,8 @@ pub trait Matcher {
     fn find_candidate_line(
         &self,
         haystack: &[u8],
-    ) -> Result<Option<LineMatch>, Self::Error> {
-        Ok(self.shortest_match(haystack)?.map(LineMatch::Confirmed))
+    ) -> Result<Option<LineMatchKind>, Self::Error> {
+        Ok(self.shortest_match(haystack)?.map(LineMatchKind::Confirmed))
     }
 }
 
@@ -553,7 +553,120 @@ impl<'a, M: Matcher> Matcher for &'a M {
     fn find_candidate_line(
         &self,
         haystack: &[u8],
-    ) -> Result<Option<LineMatch>, Self::Error> {
+    ) -> Result<Option<LineMatchKind>, Self::Error> {
         (*self).find_candidate_line(haystack)
     }
 }
+
+/*
+impl<M: Matcher> Matcher for Arc<M> {
+    type Captures = M::Captures;
+    type Error = M::Error;
+
+    fn find_at(
+        &self,
+        haystack: &[u8],
+        at: usize,
+    ) -> Result<Option<(usize, usize)>, Self::Error> {
+        (**self).find_at(haystack, at)
+    }
+
+    fn new_captures(&self) -> Result<Self::Captures, Self::Error> {
+        (**self).new_captures()
+    }
+
+    fn captures_at(
+        &self,
+        haystack: &[u8],
+        at: usize,
+        caps: &mut Self::Captures,
+    ) -> Result<bool, Self::Error> {
+        (**self).captures_at(haystack, at, caps)
+    }
+
+    fn capture_index(&self, name: &str) -> Option<usize> {
+        (**self).capture_index(name)
+    }
+
+    fn capture_count(&self) -> usize {
+        (**self).capture_count()
+    }
+
+    fn find(
+        &self,
+        haystack: &[u8]
+    ) -> Result<Option<(usize, usize)>, Self::Error> {
+        (**self).find(haystack)
+    }
+
+    fn find_iter<F>(
+        &self,
+        haystack: &[u8],
+        matched: F,
+    ) -> Result<(), Self::Error>
+    where F: FnMut(usize, usize) -> bool
+    {
+        (**self).find_iter(haystack, matched)
+    }
+
+    fn captures(
+        &self,
+        haystack: &[u8],
+        caps: &mut Self::Captures,
+    ) -> Result<bool, Self::Error> {
+        (**self).captures(haystack, caps)
+    }
+
+    fn captures_iter<F>(
+        &self,
+        haystack: &[u8],
+        caps: &mut Self::Captures,
+        matched: F,
+    ) -> Result<(), Self::Error>
+    where F: FnMut(&Self::Captures) -> bool
+    {
+        (**self).captures_iter(haystack, caps, matched)
+    }
+
+    fn replace<F>(
+        &self,
+        haystack: &[u8],
+        dst: &mut Vec<u8>,
+        append: F,
+    ) -> Result<(), Self::Error>
+    where F: FnMut(usize, usize, &mut Vec<u8>) -> bool
+    {
+        (**self).replace(haystack, dst, append)
+    }
+
+    fn replace_with_captures<F>(
+        &self,
+        haystack: &[u8],
+        caps: &mut Self::Captures,
+        dst: &mut Vec<u8>,
+        append: F,
+    ) -> Result<(), Self::Error>
+    where F: FnMut(&Self::Captures, &mut Vec<u8>) -> bool
+    {
+        (**self).replace_with_captures(haystack, caps, dst, append)
+    }
+
+    fn shortest_match(
+        &self,
+        haystack: &[u8],
+    ) -> Result<Option<usize>, Self::Error> {
+        (**self).shortest_match(haystack)
+    }
+
+    fn line_terminator(&self) -> Option<u8> {
+        (**self).line_terminator()
+    }
+
+    fn find_candidate_line(
+        &self,
+        haystack: &[u8],
+    ) -> Result<Option<LineMatchKind>, Self::Error> {
+        (**self).find_candidate_line(haystack)
+    }
+}
+*/
