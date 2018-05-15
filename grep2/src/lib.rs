@@ -6,8 +6,9 @@ extern crate memchr;
 pub use matcher::{
     Captures, LineMatchKind, Matcher, NoCaptures,
 };
-pub use searcher::LineMatch;
+pub use sink::{LineMatch, Sink};
 
 mod interpolate;
 mod matcher;
 mod searcher;
+mod sink;
