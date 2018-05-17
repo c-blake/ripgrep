@@ -9,6 +9,7 @@ pub use matcher::{
 pub use sink::{LineMatch, Sink};
 
 mod interpolate;
+mod buffer;
 mod matcher;
 mod searcher;
 mod sink;
