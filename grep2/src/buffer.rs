@@ -27,6 +27,35 @@ impl Default for BufferAllocation {
     }
 }
 
+/// The behavior of binary detection in the line buffer.
+///
+/// Binary detection is the process of _heuristically_ identifying whether a
+/// given chunk of data is binary or not, and then taking an action based on
+/// the result of that heuristic. The motivation behind detecting binary data
+/// is that binary data often indicates data that is undesirable to search
+/// using textual patterns. Of course, there are many cases in which this isn't
+/// true, which is why binary detection is disabled by default.
+#[derive(Clone, Copy, Debug)]
+pub enum BinaryDetection {
+    /// No binary detection is performed. Data reported by the line buffer may
+    /// contain arbitrary bytes.
+    None,
+    /// The given byte is searched in all contents read by the line buffer. If
+    /// it occurs, then the data is considered binary and the line buffer acts
+    /// as if it reached EOF.
+    Quit(u8),
+    /// The given byte is searched in all contents read by the line buffer. If
+    /// it occurs, then it is replaced by the line terminator. The line buffer
+    /// guarantees that this byte will never be observable by callers.
+    Convert(u8),
+}
+
+impl Default for BinaryDetection {
+    fn default() -> BinaryDetection {
+        BinaryDetection::None
+    }
+}
+
 /// The configuration of a buffer. This contains options that are fixed once
 /// a buffer has been constructed.
 #[derive(Clone, Copy, Debug)]
@@ -38,7 +67,7 @@ struct Config {
     /// The behavior for handling long lines.
     buffer_alloc: BufferAllocation,
     /// When set, the presence of the given byte indicates binary content.
-    binary_detection: Option<u8>,
+    binary_detection: BinaryDetection,
 }
 
 impl Default for Config {
@@ -47,7 +76,7 @@ impl Default for Config {
             capacity: 8 * (1<<10), // 8 KB
             lineterm: b'\n',
             buffer_alloc: BufferAllocation::default(),
-            binary_detection: None,
+            binary_detection: BinaryDetection::default(),
         }
     }
 }
@@ -69,10 +98,10 @@ impl LineBufferBuilder {
         LineBuffer {
             config: self.config,
             buf: vec![0; self.config.capacity],
-            tmp: vec![0; self.config.capacity],
             pos: 0,
             end: 0,
-            is_binary: false,
+            absolute_byte_offset: 0,
+            binary_byte_offset: None,
         }
     }
 
@@ -127,16 +156,17 @@ impl LineBufferBuilder {
         self
     }
 
-    /// Whether to enable binary detection or not. When enabled, if the given
-    /// byte occurs anywhere within the input buffer, then the buffer's binary
-    /// flag is set to `true`.
+    /// Whether to enable binary detection or not. Depending on the setting,
+    /// this can either cause the line buffer to report EOF early or it can
+    /// cause the line buffer to clean the data.
     ///
-    /// By default, this is disabled.
+    /// By default, this is disabled. In general, binary detection should be
+    /// viewed as an imperfect heuristic.
     pub fn binary_detection(
         &mut self,
-        byte: Option<u8>,
+        detection: BinaryDetection,
     ) -> &mut LineBufferBuilder {
-        self.config.binary_detection = byte;
+        self.config.binary_detection = detection;
         self
     }
 }
@@ -152,6 +182,9 @@ pub struct LineBufferReader<'b, R> {
 impl<'b, R: io::Read> LineBufferReader<'b, R> {
     /// Create a new buffered reader that reads from `rdr` and uses the given
     /// `line_buffer` as an intermediate buffer.
+    ///
+    /// This does not change the binary detection behavior of the given line
+    /// buffer.
     pub fn new(
         rdr: R,
         line_buffer: &'b mut LineBuffer,
@@ -160,10 +193,22 @@ impl<'b, R: io::Read> LineBufferReader<'b, R> {
         LineBufferReader { rdr, line_buffer }
     }
 
-    /// Returns true if and only if this buffer currently contains binary
-    /// data. This is recomputed each time new data is added to the buffer.
-    fn is_binary(&self) -> bool {
-        self.line_buffer.is_binary()
+    /// Like `new`, but sets the binary detection behavior of the line buffer
+    /// to the behavior specified.
+    pub fn with_binary_detection(
+        rdr: R,
+        line_buffer: &'b mut LineBuffer,
+        detection: BinaryDetection,
+    ) -> LineBufferReader<'b, R> {
+        line_buffer.clear();
+        line_buffer.binary_detection(detection);
+        LineBufferReader { rdr, line_buffer }
+    }
+
+    /// If binary data was detected, then this returns the absolute byte offset
+    /// at which binary data was initially found.
+    pub fn binary_byte_offset(&self) -> Option<u64> {
+        self.line_buffer.binary_byte_offset()
     }
 }
 
@@ -174,8 +219,6 @@ pub struct LineBuffer {
     config: Config,
     /// The primary buffer with which to hold data.
     buf: Vec<u8>,
-    /// A scratch buffer for use when rolling buffer contents.
-    tmp: Vec<u8>,
     /// The current position of this buffer. This is always a valid sliceable
     /// index into `buf`, and its maximum value is the length of `buf`.
     pos: usize,
@@ -183,9 +226,14 @@ pub struct LineBuffer {
     /// set to the final line terminator in the buffer, or to the end of the
     /// buffer when the underlying reader has been exhausted.
     end: usize,
-    /// Set to true if and only if binary detection is enabled and if the
-    /// contents of `buf` contain binary data.
-    is_binary: bool,
+    /// The absolute byte offset corresponding to `pos`. This is most typically
+    /// not a valid index into addressable memory, but rather, an offset that
+    /// is relative to all data that passes through a line buffer (since
+    /// construction or since the last time `clear` was called).
+    absolute_byte_offset: u64,
+    /// If binary data was found, this records the absolute byte offset at
+    /// which it was first detected.
+    binary_byte_offset: Option<u64>,
 }
 
 impl LineBuffer {
@@ -193,13 +241,25 @@ impl LineBuffer {
     fn clear(&mut self) {
         self.pos = 0;
         self.end = 0;
-        self.is_binary = false;
+        self.absolute_byte_offset = 0;
+        self.binary_byte_offset = None;
     }
 
-    /// Returns true if and only if this buffer currently contains binary
-    /// data. This is recomputed each time new data is added to the buffer.
-    fn is_binary(&self) -> bool {
-        self.is_binary
+    /// If binary data was detected, then this returns the absolute byte offset
+    /// at which binary data was initially found.
+    fn binary_byte_offset(&self) -> Option<u64> {
+        self.binary_byte_offset
+    }
+
+    /// Set the binary detection behavior of this input buffer. The behavior
+    /// of this input buffer is not specified if this is called after `fill`
+    /// and before `clear`.
+    fn binary_detection(
+        &mut self,
+        detection: BinaryDetection,
+    ) -> &mut LineBuffer {
+        self.config.binary_detection = detection;
+        self
     }
 
     fn fill<R: io::Read>(&mut self, rdr: R) -> Result<bool, io::Error> {
