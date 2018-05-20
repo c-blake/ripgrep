@@ -1,6 +1,8 @@
+use std::cmp;
 use std::io;
+use std::ptr;
 
-use memchr::memchr;
+use memchr::{memchr, memrchr};
 
 /// The behavior of a searcher in the face of long lines and big contexts.
 ///
@@ -57,6 +59,17 @@ impl Default for BinaryDetection {
     }
 }
 
+impl BinaryDetection {
+    /// Returns true if and only if the detection heuristic demands that
+    /// the line buffer stop read data once binary data is observed.
+    fn is_quit(&self) -> bool {
+        match *self {
+            BinaryDetection::Quit(_) => true,
+            _ => false,
+        }
+    }
+}
+
 /// The configuration of a buffer. This contains options that are fixed once
 /// a buffer has been constructed.
 #[derive(Clone, Copy, Debug)]
@@ -68,7 +81,7 @@ struct Config {
     /// The behavior for handling long lines.
     buffer_alloc: BufferAllocation,
     /// When set, the presence of the given byte indicates binary content.
-    binary_detection: BinaryDetection,
+    binary: BinaryDetection,
 }
 
 impl Default for Config {
@@ -77,7 +90,7 @@ impl Default for Config {
             capacity: 8 * (1<<10), // 8 KB
             lineterm: b'\n',
             buffer_alloc: BufferAllocation::default(),
-            binary_detection: BinaryDetection::default(),
+            binary: BinaryDetection::default(),
         }
     }
 }
@@ -99,7 +112,7 @@ impl LineBufferBuilder {
         LineBuffer {
             config: self.config,
             buf: vec![0; self.config.capacity],
-            start: 0,
+            pos: 0,
             last_lineterm: 0,
             end: 0,
             absolute_byte_offset: 0,
@@ -168,7 +181,7 @@ impl LineBufferBuilder {
         &mut self,
         detection: BinaryDetection,
     ) -> &mut LineBufferBuilder {
-        self.config.binary_detection = detection;
+        self.config.binary = detection;
         self
     }
 }
@@ -223,10 +236,11 @@ pub struct LineBuffer {
     buf: Vec<u8>,
     /// The current position of this buffer. This is always a valid sliceable
     /// index into `buf`, and its maximum value is the length of `buf`.
-    start: usize,
+    pos: usize,
     /// The end position of searchable content in this buffer. This is either
-    /// set to the final line terminator in the buffer, or to last byte emitted
-    /// by the reader when it has been exhausted.
+    /// set to just after the final line terminator in the buffer, or to just
+    /// after the end of the last byte emitted by the reader when the reader
+    /// has been exhausted.
     last_lineterm: usize,
     /// The end position of the buffer. This is always greater than or equal to
     /// lastnl. The bytes between lastnl and end, if any, always correspond to
@@ -236,6 +250,9 @@ pub struct LineBuffer {
     /// not a valid index into addressable memory, but rather, an offset that
     /// is relative to all data that passes through a line buffer (since
     /// construction or since the last time `clear` was called).
+    ///
+    /// When the line buffer reaches EOF, this is set to the position of the
+    /// last byte read from the underlying reader.
     absolute_byte_offset: u64,
     /// If binary data was found, this records the absolute byte offset at
     /// which it was first detected.
@@ -245,7 +262,7 @@ pub struct LineBuffer {
 impl LineBuffer {
     /// Reset this buffer, such that it can be used with a new reader.
     fn clear(&mut self) {
-        self.start = 0;
+        self.pos = 0;
         self.last_lineterm = 0;
         self.end = 0;
         self.absolute_byte_offset = 0;
@@ -276,20 +293,26 @@ impl LineBuffer {
         &mut self,
         detection: BinaryDetection,
     ) -> &mut LineBuffer {
-        self.config.binary_detection = detection;
+        self.config.binary = detection;
         self
     }
 
     /// Return the contents of this buffer.
     fn buffer(&self) -> &[u8] {
-        &self.buf[self.start..self.last_lineterm]
+        &self.buf[self.pos..self.last_lineterm]
+    }
+
+    /// Return the contents of the free space beyond the end of the buffer as
+    /// a mutable slice.
+    fn free_buffer(&mut self) -> &mut [u8] {
+        &mut self.buf[self.end..]
     }
 
     /// Consume the number of bytes provided. This must be less than or equal
     /// to the number of bytes returned by `buffer`.
     fn consume(&mut self, amt: usize) {
         assert!(amt <= self.buffer().len());
-        self.start += amt;
+        self.pos += amt;
         self.absolute_byte_offset += amt as u64;
     }
 
@@ -320,11 +343,149 @@ impl LineBuffer {
     /// error if the buffer must be expanded past its allocation limit, as
     /// governed by the buffer allocation strategy.
     #[allow(unused_variables)]
-    fn fill<R: io::Read>(&mut self, rdr: R) -> Result<bool, io::Error> {
-        Ok(false)
+    fn fill<R: io::Read>(&mut self, mut rdr: R) -> Result<bool, io::Error> {
+        // If the binary detection heuristic tells us to quit once binary data
+        // has been observed, then we no longer read new data and reach EOF
+        // once the current buffer has been consumed.
+        if self.config.binary.is_quit() && self.binary_byte_offset.is_some() {
+            return Ok(!self.buffer().is_empty());
+        }
+
+        self.roll();
+        assert_eq!(self.pos, 0);
+        loop {
+            self.ensure_capacity()?;
+            let readlen = rdr.read(self.free_buffer())?;
+            if readlen == 0 {
+                // We're only done reading for good once the caller has
+                // consumed everything.
+                return Ok(!self.buffer().is_empty());
+            }
+
+            // Get a mutable view into the bytes we've just read. These are
+            // the bytes that we do binary detection on, and also the bytes we
+            // search to find the last line terminator. We need a mutable slice
+            // in the case of binary conversion.
+            let newbytes = &mut self.buf[self.end..self.end + readlen];
+
+            // Binary detection.
+            match self.config.binary {
+                BinaryDetection::None => {} // nothing to do
+                BinaryDetection::Quit(byte) => {
+                    if let Some(i) = memchr(byte, newbytes) {
+                        self.end += i;
+                        self.last_lineterm = self.end;
+                        self.binary_byte_offset =
+                            Some(self.absolute_byte_offset + self.end as u64);
+                        return Ok(true);
+                    }
+                }
+                BinaryDetection::Convert(byte) => {
+                    if let Some(mut i) = replace_bytes(
+                        newbytes,
+                        byte,
+                        self.config.lineterm,
+                    ) {
+                        // Record only the first binary offset.
+                        if self.binary_byte_offset.is_none() {
+                            self.binary_byte_offset =
+                                Some(self.absolute_byte_offset
+                                     + (self.end + i) as u64);
+                        }
+                    }
+                }
+            }
+
+            // Update our `end` and `last_lineterm` positions.
+            self.end += readlen;
+            if let Some(i) = memrchr(self.config.lineterm, newbytes) {
+                self.last_lineterm += i + 1;
+                return Ok(true);
+            }
+            // At this point, if we couldn't find a line terminator, then we
+            // don't have a complete line. Therefore, we try to read more!
+        }
+    }
+
+    /// Roll the unconsumed parts of the buffer to the front.
+    ///
+    /// This operation is idempotent.
+    ///
+    /// After rolling, `last_lineterm` and `end` point to the same location,
+    /// and `pos` is always set to `0`.
+    fn roll(&mut self) {
+        if self.pos == self.end {
+            self.pos = 0;
+            self.last_lineterm = 0;
+            self.end = 0;
+            return;
+        }
+
+        assert!(self.pos < self.end && self.end <= self.buf.len());
+        let roll_len = self.end - self.pos;
+        unsafe {
+            // SAFETY: A buffer contains Copy data, so there's no problem
+            // moving it around. Safety also depends on our indices being
+            // in bounds, which they should always be, and we enforce with
+            // an assert above.
+            //
+            // TODO: It seems like it should be possible to do this in safe
+            // code that results in the same codegen.
+            ptr::copy(
+                self.buf[self.pos..].as_ptr(),
+                self.buf.as_mut_ptr(),
+                roll_len,
+            );
+        }
+        self.pos = 0;
+        self.last_lineterm = roll_len;
+        self.end = self.last_lineterm;
+    }
+
+    /// Ensures that the internal buffer has a non-zero amount of free space
+    /// in which to read more data. If there is no free space, then more is
+    /// allocated. If the allocation must exceed the configured limit, then
+    /// this returns an error.
+    fn ensure_capacity(&mut self) -> Result<(), io::Error> {
+        if !self.free_buffer().is_empty() {
+            return Ok(());
+        }
+        let additional = match self.config.buffer_alloc {
+            BufferAllocation::Eager => self.buf.len() * 2,
+            BufferAllocation::Error(limit) => {
+                let used = self.buf.len() - self.config.capacity;
+                let n = cmp::min(self.buf.len() * 2, limit - used);
+                if n == 0 {
+                    let msg = format!(
+                        "configured allocation limit ({}) exceeded", limit);
+                    return Err(io::Error::new(io::ErrorKind::Other, msg));
+                }
+                n
+            }
+        };
+        assert!(additional > 0);
+        let newlen = self.buf.len() + additional;
+        self.buf.resize(newlen, 0);
+        assert!(!self.free_buffer().is_empty());
+        Ok(())
     }
 }
 
-fn is_binary(buf: &[u8], b: u8) -> bool {
-    memchr(b, buf).is_some()
+/// Replaces `src` with `replacement` in bytes.
+fn replace_bytes(bytes: &mut [u8], src: u8, replacement: u8) -> Option<usize> {
+    if src == replacement {
+        return None;
+    }
+    let mut first_pos = None;
+    let mut pos = 0;
+    while let Some(i) = memchr(src, &bytes[pos..]).map(|i| pos + i) {
+        first_pos = Some(i);
+        bytes[i] = replacement;
+        pos = i + 1;
+        while bytes.get(pos) == Some(&src) {
+            bytes[pos] = replacement;
+            pos += 1;
+        }
+    }
+    first_pos
 }

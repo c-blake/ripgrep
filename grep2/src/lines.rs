@@ -35,10 +35,10 @@ impl LineIter {
     /// Return the start and end position of the next line in the given bytes.
     ///
     /// The caller must past exactly the same slice of bytes for each call to
-    /// `next`.
+    /// `next_offsets`.
     ///
     /// The range returned includes the line terminator.
-    pub fn next(&mut self, bytes: &[u8]) -> Option<(usize, usize)> {
+    fn next(&mut self, bytes: &[u8]) -> Option<(usize, usize)> {
         match memchr(self.line_term, &bytes[self.pos..self.end]) {
             None => {
                 if self.pos < bytes.len() {
@@ -58,24 +58,15 @@ impl LineIter {
     }
 }
 
-// Returns the starting index of the Nth line preceding `end`.
-//
-// If `buf` is empty, then `0` is returned. If `count` is `0`, then `end` is
-// returned.
-//
-// If `end` points at a new line in `buf`, then searching starts as if `end`
-// pointed immediately before the new line.
-//
-// The position returned corresponds to the first byte in the given line.
-
-/// Returns a slice starting with the line that occurs `count` lines before the
-/// last line in `bytes`. Lines are terminated by `line_term`. If `count` is
-/// zero, then this returns the starting offset of the last line in `bytes`.
+/// Returns the minimal starting offset of the line that occurs `count` lines
+/// before the last line in `bytes`. Lines are terminated by `line_term`. If
+/// `count` is zero, then this returns the starting offset of the last line in
+/// `bytes`.
 ///
 /// If `bytes` ends with a line terminator, then the terminator itself is
 /// considered part of the last line.
-pub fn preceding(bytes: &[u8], line_term: u8, count: usize) -> &[u8] {
-    &bytes[preceding_by_pos(bytes, bytes.len(), line_term, count)..]
+pub fn preceding(bytes: &[u8], line_term: u8, count: usize) -> usize {
+    preceding_by_pos(bytes, bytes.len(), line_term, count)
 }
 
 /// Returns the minimal starting offset of the line that occurs `count` lines
@@ -119,6 +110,7 @@ fn preceding_by_pos(
 #[cfg(test)]
 mod tests {
     use std::ops::Range;
+    use std::str;
     use super::*;
 
     const SHERLOCK: &'static str = "\
@@ -133,8 +125,8 @@ and exhibited clearly, with a label attached.\
     fn lines(text: &str) -> Vec<&str> {
         let mut results = vec![];
         let mut it = LineIter::new(b'\n', 0, text.len());
-        while let Some((s, e)) = it.next(text.as_bytes()) {
-            results.push(&text[s..e]);
+        while let Some((start, end)) = it.next(text.as_bytes()) {
+            results.push(&text[start..end]);
         }
         results
     }
