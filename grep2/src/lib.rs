@@ -1,5 +1,6 @@
 #![allow(dead_code)]
 
+extern crate bytecount;
 extern crate failure;
 extern crate memchr;
 
@@ -9,7 +10,8 @@ pub use matcher::{
 pub use sink::{LineMatch, Sink};
 
 mod interpolate;
-mod buffer;
+mod line_buffer;
+mod lines;
 mod matcher;
 mod searcher;
 mod sink;

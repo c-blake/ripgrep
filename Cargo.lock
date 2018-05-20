@@ -164,6 +164,7 @@ dependencies = [
 name = "grep2"
 version = "0.1.8"
 dependencies = [
+ "bytecount 0.3.1 (registry+https://github.com/rust-lang/crates.io-index)",
  "failure 0.1.1 (registry+https://github.com/rust-lang/crates.io-index)",
  "log 0.4.1 (registry+https://github.com/rust-lang/crates.io-index)",
  "memchr 2.0.1 (registry+https://github.com/rust-lang/crates.io-index)",

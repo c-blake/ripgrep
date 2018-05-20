@@ -42,7 +42,8 @@ pub enum BinaryDetection {
     None,
     /// The given byte is searched in all contents read by the line buffer. If
     /// it occurs, then the data is considered binary and the line buffer acts
-    /// as if it reached EOF.
+    /// as if it reached EOF. The line buffer guarantees that this byte will
+    /// never be observable by callers.
     Quit(u8),
     /// The given byte is searched in all contents read by the line buffer. If
     /// it occurs, then it is replaced by the line terminator. The line buffer
@@ -98,7 +99,8 @@ impl LineBufferBuilder {
         LineBuffer {
             config: self.config,
             buf: vec![0; self.config.capacity],
-            pos: 0,
+            start: 0,
+            last_lineterm: 0,
             end: 0,
             absolute_byte_offset: 0,
             binary_byte_offset: None,
@@ -221,10 +223,14 @@ pub struct LineBuffer {
     buf: Vec<u8>,
     /// The current position of this buffer. This is always a valid sliceable
     /// index into `buf`, and its maximum value is the length of `buf`.
-    pos: usize,
+    start: usize,
     /// The end position of searchable content in this buffer. This is either
-    /// set to the final line terminator in the buffer, or to the end of the
-    /// buffer when the underlying reader has been exhausted.
+    /// set to the final line terminator in the buffer, or to last byte emitted
+    /// by the reader when it has been exhausted.
+    last_lineterm: usize,
+    /// The end position of the buffer. This is always greater than or equal to
+    /// lastnl. The bytes between lastnl and end, if any, always correspond to
+    /// a partial line.
     end: usize,
     /// The absolute byte offset corresponding to `pos`. This is most typically
     /// not a valid index into addressable memory, but rather, an offset that
@@ -239,10 +245,22 @@ pub struct LineBuffer {
 impl LineBuffer {
     /// Reset this buffer, such that it can be used with a new reader.
     fn clear(&mut self) {
-        self.pos = 0;
+        self.start = 0;
+        self.last_lineterm = 0;
         self.end = 0;
         self.absolute_byte_offset = 0;
         self.binary_byte_offset = None;
+    }
+
+    /// The absolute byte offset which corresponds to the starting offsets
+    /// of the data returned by `buffer` relative to the beginning of the
+    /// reader's contents. As such, this offset does not generally correspond
+    /// to an offset in memory. It is typically used for reporting purposes,
+    /// particularly in error messages.
+    ///
+    /// This is reset to `0` when `clear` is called.
+    fn absolute_byte_offset(&self) -> u64 {
+        self.absolute_byte_offset
     }
 
     /// If binary data was detected, then this returns the absolute byte offset
@@ -262,6 +280,46 @@ impl LineBuffer {
         self
     }
 
+    /// Return the contents of this buffer.
+    fn buffer(&self) -> &[u8] {
+        &self.buf[self.start..self.last_lineterm]
+    }
+
+    /// Consume the number of bytes provided. This must be less than or equal
+    /// to the number of bytes returned by `buffer`.
+    fn consume(&mut self, amt: usize) {
+        assert!(amt <= self.buffer().len());
+        self.start += amt;
+        self.absolute_byte_offset += amt as u64;
+    }
+
+    /// Consumes the remainder of the buffer. Subsequent calls to `buffer` are
+    /// guaranteed to return an empty slice until the buffer is refilled.
+    ///
+    /// This is a convenience function for `consume(buffer.len())`.
+    fn consume_all(&mut self) {
+        let amt = self.buffer().len();
+        self.consume(amt);
+    }
+
+    /// Fill the contents of this buffer by discarding the part of the buffer
+    /// that has been consumed. The free space created by discarding the
+    /// consumed part of the buffer is then filled with new data from the given
+    /// reader.
+    ///
+    /// Callers should provide the same reader to this line buffer in
+    /// subsequent calls to fill. A different reader can only be used
+    /// immediately following a call to `clear`.
+    ///
+    /// If EOF is reached, then `false` is returned. Otherwise, `true` is
+    /// returned. (Note that if this line buffer's binary detection is set to
+    /// `Quit`, then the presence of binary data will cause this buffer to
+    /// behave as if it had seen EOF.)
+    ///
+    /// This forwards any errors returned by `rdr`, and will also return an
+    /// error if the buffer must be expanded past its allocation limit, as
+    /// governed by the buffer allocation strategy.
+    #[allow(unused_variables)]
     fn fill<R: io::Read>(&mut self, rdr: R) -> Result<bool, io::Error> {
         Ok(false)
     }
