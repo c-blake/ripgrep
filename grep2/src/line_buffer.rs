@@ -128,8 +128,10 @@ impl LineBufferBuilder {
     ///
     /// This is set to a reasonable default and probably shouldn't be changed
     /// unless there's a specific reason to do so.
+    ///
+    /// If `0` is given, then it is treated as if `1` were provided.
     pub fn capacity(&mut self, capacity: usize) -> &mut LineBufferBuilder {
-        self.config.capacity = capacity;
+        self.config.capacity = cmp::max(1, capacity);
         self
     }
 
@@ -300,8 +302,8 @@ pub struct LineBuffer {
     /// is relative to all data that passes through a line buffer (since
     /// construction or since the last time `clear` was called).
     ///
-    /// When the line buffer reaches EOF, this is set to the position of the
-    /// last byte read from the underlying reader.
+    /// When the line buffer reaches EOF, this is set to the position just
+    /// after the last byte read from the underlying reader.
     absolute_byte_offset: u64,
     /// If binary data was found, this records the absolute byte offset at
     /// which it was first detected.
@@ -407,6 +409,7 @@ impl LineBuffer {
             if readlen == 0 {
                 // We're only done reading for good once the caller has
                 // consumed everything.
+                self.last_lineterm = self.end;
                 return Ok(!self.buffer().is_empty());
             }
 
@@ -414,14 +417,16 @@ impl LineBuffer {
             // the bytes that we do binary detection on, and also the bytes we
             // search to find the last line terminator. We need a mutable slice
             // in the case of binary conversion.
-            let newbytes = &mut self.buf[self.end..self.end + readlen];
+            let oldend = self.end;
+            self.end += readlen;
+            let newbytes = &mut self.buf[oldend..self.end];
 
             // Binary detection.
             match self.config.binary {
                 BinaryDetection::None => {} // nothing to do
                 BinaryDetection::Quit(byte) => {
                     if let Some(i) = memchr(byte, newbytes) {
-                        self.end += i;
+                        self.end = oldend + i;
                         self.last_lineterm = self.end;
                         self.binary_byte_offset =
                             Some(self.absolute_byte_offset + self.end as u64);
@@ -438,16 +443,15 @@ impl LineBuffer {
                         if self.binary_byte_offset.is_none() {
                             self.binary_byte_offset =
                                 Some(self.absolute_byte_offset
-                                     + (self.end + i) as u64);
+                                     + (oldend + i) as u64);
                         }
                     }
                 }
             }
 
-            // Update our `end` and `last_lineterm` positions.
-            self.end += readlen;
+            // Update our `last_lineterm` positions if we read one.
             if let Some(i) = memrchr(self.config.lineterm, newbytes) {
-                self.last_lineterm += i + 1;
+                self.last_lineterm = oldend + i + 1;
                 return Ok(true);
             }
             // At this point, if we couldn't find a line terminator, then we
@@ -540,10 +544,15 @@ fn replace_bytes(bytes: &mut [u8], src: u8, replacement: u8) -> Option<usize> {
 
 #[cfg(test)]
 mod tests {
+    use std::str;
     use super::*;
 
     fn s(slice: &str) -> String {
         slice.to_string()
+    }
+
+    fn btos(slice: &[u8]) -> &str {
+        str::from_utf8(slice).unwrap()
     }
 
     fn replace_str(
@@ -562,5 +571,135 @@ mod tests {
         assert_eq!(replace_str("abb", b'b', b'z'), (s("azz"), Some(1)));
         assert_eq!(replace_str("bbb", b'b', b'z'), (s("zzz"), Some(0)));
         assert_eq!(replace_str("bac", b'b', b'z'), (s("zac"), Some(0)));
+    }
+
+    #[test]
+    fn buffer_basics1() {
+        let bytes = "homer\nlisa\nmaggie";
+        let mut linebuf = LineBufferBuilder::new().build();
+        let mut rdr = LineBufferReader::new(bytes.as_bytes(), &mut linebuf);
+
+        assert!(rdr.buffer().is_empty());
+
+        assert!(rdr.fill().unwrap());
+        assert_eq!(btos(rdr.buffer()), "homer\nlisa\n");
+        assert_eq!(rdr.absolute_byte_offset(), 0);
+        rdr.consume(5);
+        assert_eq!(rdr.absolute_byte_offset(), 5);
+        rdr.consume_all();
+        assert_eq!(rdr.absolute_byte_offset(), 11);
+
+        assert!(rdr.fill().unwrap());
+        assert_eq!(btos(rdr.buffer()), "maggie");
+        rdr.consume_all();
+
+        assert!(!rdr.fill().unwrap());
+        assert_eq!(rdr.absolute_byte_offset(), bytes.len() as u64);
+        assert_eq!(rdr.binary_byte_offset(), None);
+    }
+
+    #[test]
+    fn buffer_basics2() {
+        let bytes = "homer\nlisa\nmaggie\n";
+        let mut linebuf = LineBufferBuilder::new().build();
+        let mut rdr = LineBufferReader::new(bytes.as_bytes(), &mut linebuf);
+
+        assert!(rdr.buffer().is_empty());
+
+        assert!(rdr.fill().unwrap());
+        assert_eq!(btos(rdr.buffer()), "homer\nlisa\nmaggie\n");
+        rdr.consume_all();
+
+        assert!(!rdr.fill().unwrap());
+        assert_eq!(rdr.absolute_byte_offset(), bytes.len() as u64);
+        assert_eq!(rdr.binary_byte_offset(), None);
+    }
+
+    #[test]
+    fn buffer_zero_capacity() {
+        let bytes = "homer\nlisa\nmaggie";
+        let mut linebuf = LineBufferBuilder::new().capacity(0).build();
+        let mut rdr = LineBufferReader::new(bytes.as_bytes(), &mut linebuf);
+
+        while rdr.fill().unwrap() {
+            rdr.consume_all();
+        }
+        assert_eq!(rdr.absolute_byte_offset(), bytes.len() as u64);
+        assert_eq!(rdr.binary_byte_offset(), None);
+    }
+
+    #[test]
+    fn buffer_small_capacity() {
+        let bytes = "homer\nlisa\nmaggie";
+        let mut linebuf = LineBufferBuilder::new().capacity(1).build();
+        let mut rdr = LineBufferReader::new(bytes.as_bytes(), &mut linebuf);
+
+        let mut got = vec![];
+        while rdr.fill().unwrap() {
+            got.extend(rdr.buffer());
+            rdr.consume_all();
+        }
+        assert_eq!(bytes, btos(&got));
+        assert_eq!(rdr.absolute_byte_offset(), bytes.len() as u64);
+        assert_eq!(rdr.binary_byte_offset(), None);
+    }
+
+    #[test]
+    fn buffer_small_capacity_error1() {
+        let bytes = "homer\nlisa\nmaggie";
+        let mut linebuf = LineBufferBuilder::new()
+            .capacity(1)
+            .buffer_alloc(BufferAllocation::Error(5))
+            .build();
+        let mut rdr = LineBufferReader::new(bytes.as_bytes(), &mut linebuf);
+
+        assert!(rdr.fill().unwrap());
+        assert_eq!(btos(rdr.buffer()), "homer\n");
+        rdr.consume_all();
+
+        assert!(rdr.fill().unwrap());
+        assert_eq!(btos(rdr.buffer()), "lisa\n");
+        rdr.consume_all();
+
+        // This returns an error because while we have just enough room to
+        // store maggie in the buffer, we *don't* have enough room to read one
+        // more byte, so we don't know whether we're at EOF or not, and
+        // therefore must give up.
+        assert!(rdr.fill().is_err());
+
+        // We can mush on though!
+        assert_eq!(btos(rdr.buffer()), "m");
+        rdr.consume_all();
+
+        assert!(rdr.fill().unwrap());
+        assert_eq!(btos(rdr.buffer()), "aggie");
+        rdr.consume_all();
+
+        assert!(!rdr.fill().unwrap());
+    }
+
+    #[test]
+    fn buffer_small_capacity_noerror1() {
+        let bytes = "homer\nlisa\nmaggie";
+        let mut linebuf = LineBufferBuilder::new()
+            .capacity(1)
+            .buffer_alloc(BufferAllocation::Error(6))
+            .build();
+        let mut rdr = LineBufferReader::new(bytes.as_bytes(), &mut linebuf);
+
+        assert!(rdr.fill().unwrap());
+        assert_eq!(btos(rdr.buffer()), "homer\n");
+        rdr.consume_all();
+
+        assert!(rdr.fill().unwrap());
+        assert_eq!(btos(rdr.buffer()), "lisa\n");
+        rdr.consume_all();
+
+        // We have just enough space.
+        assert!(rdr.fill().unwrap());
+        assert_eq!(btos(rdr.buffer()), "maggie");
+        rdr.consume_all();
+
+        assert!(!rdr.fill().unwrap());
     }
 }
