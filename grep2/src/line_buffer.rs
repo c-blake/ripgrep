@@ -220,14 +220,63 @@ impl<'b, R: io::Read> LineBufferReader<'b, R> {
         LineBufferReader { rdr, line_buffer }
     }
 
+    /// The absolute byte offset which corresponds to the starting offsets
+    /// of the data returned by `buffer` relative to the beginning of the
+    /// underlying reader's contents. As such, this offset does not generally
+    /// correspond to an offset in memory. It is typically used for reporting
+    /// purposes, particularly in error messages.
+    pub fn absolute_byte_offset(&self) -> u64 {
+        self.line_buffer.absolute_byte_offset()
+    }
+
     /// If binary data was detected, then this returns the absolute byte offset
     /// at which binary data was initially found.
     pub fn binary_byte_offset(&self) -> Option<u64> {
         self.line_buffer.binary_byte_offset()
     }
+
+    /// Fill the contents of this buffer by discarding the part of the buffer
+    /// that has been consumed. The free space created by discarding the
+    /// consumed part of the buffer is then filled with new data from the
+    /// reader.
+    ///
+    /// If EOF is reached, then `false` is returned. Otherwise, `true` is
+    /// returned. (Note that if this line buffer's binary detection is set to
+    /// `Quit`, then the presence of binary data will cause this buffer to
+    /// behave as if it had seen EOF at the first occurrence of binary data.)
+    ///
+    /// This forwards any errors returned by the underlying reader, and will
+    /// also return an error if the buffer must be expanded past its allocation
+    /// limit, as governed by the buffer allocation strategy.
+    pub fn fill(&mut self) -> Result<bool, io::Error> {
+        self.line_buffer.fill(&mut self.rdr)
+    }
+
+    /// Return the contents of this buffer.
+    pub fn buffer(&self) -> &[u8] {
+        self.line_buffer.buffer()
+    }
+
+    /// Consume the number of bytes provided. This must be less than or equal
+    /// to the number of bytes returned by `buffer`.
+    pub fn consume(&mut self, amt: usize) {
+        self.line_buffer.consume(amt);
+    }
+
+    /// Consumes the remainder of the buffer. Subsequent calls to `buffer` are
+    /// guaranteed to return an empty slice until the buffer is refilled.
+    ///
+    /// This is a convenience function for `consume(buffer.len())`.
+    pub fn consume_all(&mut self) {
+        self.line_buffer.consume_all();
+    }
 }
 
 /// A line buffer manages a (typically fixed) buffer for holding lines.
+///
+/// Callers should create line buffers sparingly and reuse them when possible.
+/// Line buffers cannot be used directly, but instead must be used via the
+/// LineBufferReader.
 #[derive(Clone, Debug)]
 pub struct LineBuffer {
     /// The configuration of this buffer.
@@ -342,7 +391,6 @@ impl LineBuffer {
     /// This forwards any errors returned by `rdr`, and will also return an
     /// error if the buffer must be expanded past its allocation limit, as
     /// governed by the buffer allocation strategy.
-    #[allow(unused_variables)]
     fn fill<R: io::Read>(&mut self, mut rdr: R) -> Result<bool, io::Error> {
         // If the binary detection heuristic tells us to quit once binary data
         // has been observed, then we no longer read new data and reach EOF
@@ -488,4 +536,31 @@ fn replace_bytes(bytes: &mut [u8], src: u8, replacement: u8) -> Option<usize> {
         }
     }
     first_pos
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn s(slice: &str) -> String {
+        slice.to_string()
+    }
+
+    fn replace_str(
+        slice: &str,
+        src: u8,
+        replacement: u8,
+    ) -> (String, Option<usize>) {
+        let mut dst = slice.to_string().into_bytes();
+        let result = replace_bytes(&mut dst, src, replacement);
+        (String::from_utf8(dst).unwrap(), result)
+    }
+
+    #[test]
+    fn replace() {
+        assert_eq!(replace_str("abc", b'b', b'z'), (s("azc"), Some(1)));
+        assert_eq!(replace_str("abb", b'b', b'z'), (s("azz"), Some(1)));
+        assert_eq!(replace_str("bbb", b'b', b'z'), (s("zzz"), Some(0)));
+        assert_eq!(replace_str("bac", b'b', b'z'), (s("zac"), Some(0)));
+    }
 }
