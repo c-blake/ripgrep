@@ -174,11 +174,10 @@ pub trait Matcher {
     /// Implementors that provide support for capturing groups must guarantee
     /// that when a match occurs, the first capture match (at index `0`) is
     /// always set to the overall match offsets.
-    #[allow(unused_variables)]
     fn captures_at(
         &self,
-        haystack: &[u8],
-        at: usize,
+        _haystack: &[u8],
+        _at: usize,
         _caps: &mut Self::Captures,
     ) -> Result<bool, Self::Error> {
         Ok(false)
@@ -186,9 +185,9 @@ pub trait Matcher {
 
     /// Returns the total number of capturing groups in this matcher.
     ///
-    /// If a matcher supports capturing groups, then this value must always
-    /// be 1, where the first capturing group always corresponds to the overall
-    /// match.
+    /// If a matcher supports capturing groups, then this value must always be
+    /// at least 1, where the first capturing group always corresponds to the
+    /// overall match.
     ///
     /// If a matcher does not support capturing groups, then this should
     /// always return 0.
@@ -208,8 +207,7 @@ pub trait Matcher {
     ///
     /// By default, capturing groups are not supported, so this always returns
     /// `None`.
-    #[allow(unused_variables)]
-    fn capture_index(&self, name: &str) -> Option<usize> {
+    fn capture_index(&self, _name: &str) -> Option<usize> {
         None
     }
 
@@ -323,7 +321,8 @@ pub trait Matcher {
     }
 
     /// Replaces every match in the given haystack with the result of calling
-    /// `append`.
+    /// `append`. `append` is given the start and end of a match, along with
+    /// a handle to the `dst` buffer provided.
     ///
     /// If the given `append` function returns `false`, then replacement stops.
     fn replace<F>(
@@ -431,12 +430,12 @@ pub trait Matcher {
     /// `shortest_match` must consider the entire regex, including the `\w+`
     /// and `\s+`, while searching. However, this method could look for lines
     /// containing `foo` and return them as candidates. Finding `foo` might
-    /// be a implemented as a highly optimized substring search routine (like
+    /// be implemented as a highly optimized substring search routine (like
     /// `memmem`), which is likely to be faster than whatever more generalized
     /// routine is required for resolving `\w+foo\s+`. The caller is then
     /// responsible for confirming whether a match exists or not.
     ///
-    /// Note that while a this method may report false positives, it must never
+    /// Note that while this method may report false positives, it must never
     /// report false negatives. That is, it can never skip over lines that
     /// contain a match.
     fn find_candidate_line(
