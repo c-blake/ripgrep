@@ -1,3 +1,5 @@
+use std::io;
+
 use memchr::{memchr, memrchr};
 
 use matcher::Matcher;
@@ -192,5 +194,29 @@ impl<'a> MultiLineMatch<'a> {
     /// to compute them.
     pub fn absolute_byte_offset(&self) -> Option<u64> {
         self.absolute_byte_offset
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct StandardSink<W> {
+    wtr: W,
+}
+
+impl<W: io::Write> StandardSink<W> {
+    pub fn new(wtr: W) -> StandardSink<W> {
+        StandardSink { wtr }
+    }
+}
+
+impl<W: io::Write> Sink for StandardSink<W> {
+    type Error = io::Error;
+
+    fn matched_line<M: Matcher>(
+        &mut self,
+        _matcher: M,
+        line_match: &LineMatch,
+    ) -> Result<bool, io::Error> {
+        self.wtr.write_all(line_match.line())?;
+        Ok(true)
     }
 }
