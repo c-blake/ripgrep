@@ -1,3 +1,7 @@
+/*!
+A collection of routines for performing operations on lines.
+*/
+
 use bytecount;
 use memchr::{memchr, memrchr};
 
@@ -30,18 +34,48 @@ pub fn locate(
 
 /// An iterator over lines in a particular slice of bytes.
 ///
+/// Line terminators are considered part of the line they terminate.
+///
+/// `'b` refers to the lifetime of the underlying bytes.
+#[derive(Debug)]
+pub struct LineIter<'b> {
+    bytes: &'b [u8],
+    stepper: LineStep,
+}
+
+impl<'b> LineIter<'b> {
+    /// Create a new line iterator that yields lines in the given bytes that
+    /// are terminated by `line_term`.
+    pub(crate) fn new(line_term: u8, bytes: &'b [u8]) -> LineIter<'b> {
+        LineIter {
+            bytes: bytes,
+            stepper: LineStep::new(line_term, 0, bytes.len()),
+        }
+    }
+}
+
+impl<'b> Iterator for LineIter<'b> {
+    type Item = &'b [u8];
+
+    fn next(&mut self) -> Option<&'b [u8]> {
+        self.stepper.next(self.bytes).map(|(s, e)| &self.bytes[s..e])
+    }
+}
+
+/// An iterator over lines in a particular slice of bytes.
+///
 /// This iterator avoids borrowing the bytes themselves, and instead requires
 /// callers to explicitly provide the bytes when moving through the iterator.
 /// While not idiomatic, this provides a simple way of iterating over lines
 /// that doesn't require borrowing the slice itself, which can be convenient.
 #[derive(Debug)]
-pub struct LineIter {
+pub struct LineStep {
     line_term: u8,
     pos: usize,
     end: usize,
 }
 
-impl LineIter {
+impl LineStep {
     /// Create a new line iterator over the given range of bytes using the
     /// given line terminator.
     ///
@@ -49,19 +83,20 @@ impl LineIter {
     /// same slice must be provided to each call.
     ///
     /// This panics if `start` is not less than or equal to `end`.
-    pub fn new(line_term: u8, start: usize, end: usize) -> LineIter {
+    pub fn new(line_term: u8, start: usize, end: usize) -> LineStep {
         assert!(start <= end);
-        LineIter { line_term, pos: start, end }
+        LineStep { line_term, pos: start, end }
     }
 
     /// Return the start and end position of the next line in the given bytes.
     ///
     /// The caller must past exactly the same slice of bytes for each call to
-    /// `next_offsets`.
+    /// `next`.
     ///
     /// The range returned includes the line terminator.
-    fn next(&mut self, bytes: &[u8]) -> Option<(usize, usize)> {
-        match memchr(self.line_term, &bytes[self.pos..self.end]) {
+    pub fn next(&mut self, mut bytes: &[u8]) -> Option<(usize, usize)> {
+        bytes = &bytes[..self.end];
+        match memchr(self.line_term, &bytes[self.pos..]) {
             None => {
                 if self.pos < bytes.len() {
                     let start = self.pos;
@@ -81,9 +116,10 @@ impl LineIter {
 }
 
 /// Returns the minimal starting offset of the line that occurs `count` lines
-/// before the last line in `bytes`. Lines are terminated by `line_term`. If
-/// `count` is zero, then this returns the starting offset of the last line in
-/// `bytes`.
+/// before the last line in `bytes`.
+///
+/// Lines are terminated by `line_term`. If `count` is zero, then this returns
+/// the starting offset of the last line in `bytes`.
 ///
 /// If `bytes` ends with a line terminator, then the terminator itself is
 /// considered part of the last line.
@@ -146,7 +182,7 @@ and exhibited clearly, with a label attached.\
 
     fn lines(text: &str) -> Vec<&str> {
         let mut results = vec![];
-        let mut it = LineIter::new(b'\n', 0, text.len());
+        let mut it = LineStep::new(b'\n', 0, text.len());
         while let Some((start, end)) = it.next(text.as_bytes()) {
             results.push(&text[start..end]);
         }
@@ -155,7 +191,7 @@ and exhibited clearly, with a label attached.\
 
     fn line_ranges(text: &str) -> Vec<Range<usize>> {
         let mut results = vec![];
-        let mut it = LineIter::new(b'\n', 0, text.len());
+        let mut it = LineStep::new(b'\n', 0, text.len());
         while let Some((start, end)) = it.next(text.as_bytes()) {
             results.push(Range { start, end });
         }
@@ -247,6 +283,12 @@ and exhibited clearly, with a label attached.\
 
         assert_eq!(lines("\n"), vec!["\n"]);
         assert_eq!(lines(""), Vec::<&str>::new());
+    }
+
+    #[test]
+    fn line_iter_empty() {
+        let mut it = LineStep::new(b'\n', 0, 0);
+        assert_eq!(it.next(b"abc"), None);
     }
 
     #[test]

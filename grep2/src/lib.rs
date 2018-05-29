@@ -4,10 +4,15 @@ extern crate bytecount;
 extern crate failure;
 extern crate memchr;
 
+pub use lines::LineIter;
 pub use matcher::{
     Captures, LineMatchKind, Matcher, NoCaptures,
 };
-pub use sink::{SinkMatch, Sink};
+pub use searcher::{
+    BinaryDetection, ConfigError, MmapChoice,
+    Searcher, SearcherBuilder,
+};
+pub use sink::{Sink, SinkContext, SinkContextKind, SinkFinish, SinkMatch};
 
 mod interpolate;
 mod line_buffer;

@@ -1,7 +1,9 @@
 use std::fmt;
 use std::io;
 
+use lines::LineIter;
 use matcher::Matcher;
+use searcher::{ConfigError, Searcher};
 
 pub trait Sink {
     type Error;
@@ -12,11 +14,18 @@ pub trait Sink {
         Self::error_message(err)
     }
 
-    fn matched<M: Matcher>(
+    fn error_config(err: ConfigError) -> Self::Error {
+        Self::error_message(err)
+    }
+
+    fn matched<M>(
         &mut self,
-        _matcher: M,
+        _searcher: &Searcher<M>,
         _mat: &SinkMatch,
-    ) -> Result<bool, Self::Error> {
+    ) -> Result<bool, Self::Error>
+    where M: Matcher,
+          M::Error: fmt::Display
+    {
         Ok(false)
     }
 
@@ -47,12 +56,15 @@ impl<'a, S: Sink> Sink for &'a mut S {
         S::error_io(err)
     }
 
-    fn matched<M: Matcher>(
+    fn matched<M>(
         &mut self,
-        matcher: M,
+        searcher: &Searcher<M>,
         mat: &SinkMatch,
-    ) -> Result<bool, S::Error> {
-        (**self).matched(matcher, mat)
+    ) -> Result<bool, S::Error>
+    where M: Matcher,
+          M::Error: fmt::Display
+    {
+        (**self).matched(searcher, mat)
     }
 
     fn context(
@@ -84,17 +96,23 @@ impl SinkFinish {
 }
 
 #[derive(Clone, Debug)]
-pub struct SinkMatch<'a> {
-    pub(crate) bytes: &'a [u8],
+pub struct SinkMatch<'b> {
+    pub(crate) line_term: u8,
+    pub(crate) bytes: &'b [u8],
     pub(crate) absolute_byte_offset: u64,
     pub(crate) line_number: Option<u64>,
 }
 
-impl<'a> SinkMatch<'a> {
+impl<'b> SinkMatch<'b> {
     /// Returns the bytes for all matching lines, including the line
     /// terminators, if they exist.
-    pub fn bytes(&self) -> &[u8] {
+    pub fn bytes(&self) -> &'b [u8] {
         self.bytes
+    }
+
+    /// Return an iterator over the lines in this match.
+    pub fn lines(&self) -> LineIter<'b> {
+        LineIter::new(self.line_term, self.bytes)
     }
 
     /// Returns the absolute byte offset of the start of this match. This
@@ -183,11 +201,14 @@ impl<W: io::Write> Sink for StandardSink<W> {
         err
     }
 
-    fn matched<M: Matcher>(
+    fn matched<M>(
         &mut self,
-        _matcher: M,
+        _searcher: &Searcher<M>,
         mat: &SinkMatch,
-    ) -> Result<bool, io::Error> {
+    ) -> Result<bool, io::Error>
+    where M: Matcher,
+          M::Error: fmt::Display
+    {
         self.wtr.write_all(mat.bytes())?;
         Ok(true)
     }

@@ -1,7 +1,9 @@
+use std::cell::RefCell;
 use std::fmt;
 use std::io;
+use std::ops::Range;
 
-use lines;
+use lines::{self, LineStep};
 use line_buffer::{
     self, BufferAllocation, LineBuffer, LineBufferBuilder, LineBufferReader,
     DEFAULT_BUFFER_CAPACITY,
@@ -239,6 +241,29 @@ impl SearcherBuilder {
         }
     }
 
+    pub fn build<M>(&self, matcher: M) -> Result<Searcher<M>, ConfigError>
+    where M: Matcher,
+          M::Error: fmt::Display
+    {
+        if self.config.heap_limit == Some(0)
+            && !self.config.mmap.is_enabled()
+        {
+            return Err(ConfigError::SearchUnavailable);
+        } else if let Some(matcher_line_term) = matcher.line_terminator() {
+            if matcher_line_term != self.config.line_term {
+                return Err(ConfigError::MismatchedLineTerminators {
+                    matcher: matcher_line_term,
+                    searcher: self.config.line_term,
+                });
+            }
+        }
+        Ok(Searcher {
+            config: self.config.clone(),
+            matcher: matcher,
+            line_buffer: RefCell::new(self.config.line_buffer()),
+        })
+    }
+
     pub fn line_terminator(&mut self, line_term: u8) -> &mut SearcherBuilder {
         self.config.line_term = line_term;
         self
@@ -306,68 +331,79 @@ impl SearcherBuilder {
         self.config.multi_line = yes;
         self
     }
-
-    pub fn build<M>(&self, matcher: M) -> Result<Searcher<M>, ConfigError>
-    where M: Matcher,
-          M::Error: fmt::Display
-    {
-        if self.config.heap_limit == Some(0)
-            && !self.config.mmap.is_enabled()
-        {
-            return Err(ConfigError::SearchUnavailable);
-        } else if let Some(matcher_line_term) = matcher.line_terminator() {
-            if matcher_line_term != self.config.line_term {
-                return Err(ConfigError::MismatchedLineTerminators {
-                    matcher: matcher_line_term,
-                    searcher: self.config.line_term,
-                });
-            }
-        }
-        Ok(Searcher {
-            config: self.config.clone(),
-            matcher: matcher,
-            line_buffer: self.config.line_buffer(),
-        })
-    }
 }
 
 #[derive(Debug)]
 pub struct Searcher<M> {
     config: Config,
     matcher: M,
-    line_buffer: LineBuffer,
+    /// A line buffer for use in line oriented searching.
+    ///
+    /// We wrap it in a RefCell to permit lending out borrows of `Searcher`
+    /// to sinks. We still require a mutable borrow to execute a search, so
+    /// we statically prevent callers from causing RefCell to panic at runtime
+    /// due to a borrowing violation.
+    line_buffer: RefCell<LineBuffer>,
 }
 
 impl<M> Searcher<M>
 where M: Matcher,
       M::Error: fmt::Display
 {
-    fn search_reader<R: io::Read, S: Sink>(
+    pub fn search_reader<R: io::Read, S: Sink>(
         &mut self,
-        read_from: R,
+        mut read_from: R,
         write_to: S,
     ) -> Result<(), S::Error> {
-        let rdr = LineBufferReader::new(read_from, &mut self.line_buffer);
-        SearcherExec {
-            config: &self.config,
-            matcher: &self.matcher,
-            rdr: rdr,
-            sink: write_to,
-            search_pos: 0,
-        }.run()
+        if self.config.multi_line {
+            let mut bytes = vec![];
+            if let Err(err) = read_from.read_to_end(&mut bytes) {
+                return Err(S::error_io(err));
+            }
+            return self.search_slice(&bytes, write_to);
+        }
+        let mut line_buffer = self.line_buffer.borrow_mut();
+        let rdr = LineBufferReader::new(read_from, &mut *line_buffer);
+        self.search(rdr, write_to)
     }
 
-    fn search_slice<S: Sink>(
+    pub fn search_slice<S: Sink>(
         &mut self,
         slice: &[u8],
         write_to: S,
     ) -> Result<(), S::Error> {
-        SearcherExec {
+        if self.config.multi_line {
+            SearcherMultiLine {
+                searcher: self,
+                config: &self.config,
+                matcher: &self.matcher,
+                sink: write_to,
+                slice: slice,
+                search_pos: 0,
+                last_match: None,
+                line_number:
+                    if self.config.line_number { Some(1) } else { None },
+                last_line_counted: 0,
+            }.run()
+        } else {
+            self.search(SliceReader::new(slice), write_to)
+        }
+    }
+
+    fn search<R: Reader, S: Sink>(
+        &self,
+        read_from: R,
+        write_to: S,
+    ) -> Result<(), S::Error> {
+        SearcherByLine {
+            searcher: self,
             config: &self.config,
             matcher: &self.matcher,
-            rdr: SliceReader::new(slice),
             sink: write_to,
+            rdr: read_from,
             search_pos: 0,
+            line_number: if self.config.line_number { Some(1) } else { None },
+            last_line_counted: 0,
         }.run()
     }
 }
@@ -420,10 +456,6 @@ impl<'b, R: io::Read> Reader for LineBufferReader<'b, R> {
 /// it starts empty, like a LineBuffer. The first call to `fill` causes the
 /// entire slice to be available. Subsequent calls to `fill` return `true`
 /// until the entire buffer is consumed.
-///
-/// This is a bit of a sneaky trick, but it lets multi-line search work because
-/// the entire contents of the source will be searched before consuming
-/// anything.
 struct SliceReader<'b> {
     slice: &'b [u8],
     filled: bool,
@@ -473,28 +505,32 @@ impl<'b> Reader for SliceReader<'b> {
 }
 
 #[derive(Debug)]
-struct SearcherExec<'s, M: 's, R, S> {
+struct SearcherByLine<'s, M: 's, R, S> {
+    searcher: &'s Searcher<M>,
     config: &'s Config,
     matcher: &'s M,
-    rdr: R,
     sink: S,
+    rdr: R,
     search_pos: usize,
+    line_number: Option<u64>,
+    last_line_counted: usize,
 }
 
-impl<'s, M, R, S> SearcherExec<'s, M, R, S>
+impl<'s, M, R, S> SearcherByLine<'s, M, R, S>
 where M: Matcher,
       M::Error: fmt::Display,
       R: Reader,
       S: Sink
 {
     fn run(mut self) -> Result<(), S::Error> {
+        assert!(!self.config.multi_line);
     'LOOP:
         loop {
             if !self.fill()? {
                 break;
             }
             while !self.search_buffer().is_empty() {
-                if !self.process_next_match()? {
+                if !self.sink()? {
                     break 'LOOP;
                 }
             }
@@ -512,8 +548,10 @@ where M: Matcher,
 
     fn fill(&mut self) -> Result<bool, S::Error> {
         assert!(self.search_buffer().is_empty());
+        self.count_remaining_lines();
         self.rdr.consume_all();
         self.search_pos = 0;
+        self.last_line_counted = 0;
         let didread = match self.rdr.fill() {
             Err(err) => return Err(S::error_io(err)),
             Ok(didread) => didread,
@@ -524,30 +562,65 @@ where M: Matcher,
         Ok(true)
     }
 
-    fn process_next_match(&mut self) -> Result<bool, S::Error> {
-        let (line_start, line_end) = match self.find()? {
-            Some(range) => range,
+    fn sink(&mut self) -> Result<bool, S::Error> {
+        if self.config.invert_match {
+            self.sink_inverted_matches()
+        } else if let Some((line_start, line_end)) = self.find()? {
+            self.count_lines(line_start);
+            let keepgoing = self.sink_matched(line_start, line_end)?;
+            self.search_pos = line_end;
+            Ok(keepgoing)
+        } else {
+            self.search_pos = self.buffer().len();
+            Ok(true)
+        }
+    }
+
+    fn sink_inverted_matches(&mut self) -> Result<bool, S::Error> {
+        assert!(self.config.invert_match);
+
+        let (invert_start, invert_end) = match self.find()? {
             None => {
+                let start = self.search_pos;
                 self.search_pos = self.buffer().len();
-                return Ok(true);
+                (start, self.buffer().len())
+            }
+            Some((mat_start, mat_end)) => {
+                let start = self.search_pos;
+                self.search_pos = mat_end;
+                (start, mat_start)
             }
         };
-        let keepgoing = self.sink.matched(
-            &self.matcher,
+        self.count_lines(invert_start);
+        let mut stepper = LineStep::new(
+            self.config.line_term, invert_start, invert_end);
+        while let Some((s, e)) = stepper.next(self.buffer()) {
+            if !self.sink_matched(s, e)? {
+                return Ok(false);
+            }
+            self.add_one_line(e);
+        }
+        Ok(true)
+    }
+
+    fn sink_matched(
+        &mut self,
+        line_start: usize,
+        line_end: usize,
+    ) -> Result<bool, S::Error> {
+        let offset = self.rdr.absolute_byte_offset() + line_start as u64;
+        self.sink.matched(
+            self.searcher,
             &SinkMatch {
+                line_term: self.config.line_term,
                 bytes: &self.rdr.buffer()[line_start..line_end],
-                absolute_byte_offset: 0,
-                line_number: None,
+                absolute_byte_offset: offset,
+                line_number: self.line_number,
             },
-        )?;
-        self.search_pos = line_end;
-        Ok(keepgoing)
+        )
     }
 
     fn find(&mut self) -> Result<Option<(usize, usize)>, S::Error> {
-        if self.config.multi_line {
-            return self.find_multi_line();
-        }
         match self.matcher.find(self.search_buffer()) {
             Err(err) => return Err(S::error_message(err)),
             Ok(None) => return Ok(None),
@@ -563,23 +636,190 @@ where M: Matcher,
         }
     }
 
-    fn find_multi_line(&mut self) -> Result<Option<(usize, usize)>, S::Error> {
+    fn count_remaining_lines(&mut self) {
+        let upto = self.buffer().len();
+        self.count_lines(upto);
+    }
+
+    fn count_lines(&mut self, upto: usize) {
+        if let Some(ref mut line_number) = self.line_number {
+            let slice = &self.rdr.buffer()[self.last_line_counted..upto];
+            *line_number += lines::count(slice, self.config.line_term);
+            self.last_line_counted = upto;
+        }
+    }
+
+    fn add_one_line(&mut self, line_end: usize) {
+        if let Some(ref mut line_number) = self.line_number {
+            *line_number += 1;
+            self.last_line_counted = line_end;
+        }
+    }
+}
+
+#[derive(Debug)]
+struct SearcherMultiLine<'s, M: 's, S> {
+    searcher: &'s Searcher<M>,
+    config: &'s Config,
+    matcher: &'s M,
+    sink: S,
+    slice: &'s [u8],
+    search_pos: usize,
+    last_match: Option<MultiLineMatch>,
+    line_number: Option<u64>,
+    last_line_counted: usize,
+}
+
+#[derive(Clone, Debug)]
+struct MultiLineMatch {
+    line: Range<usize>,
+    line_number: Option<u64>,
+}
+
+impl<'s, M, S> SearcherMultiLine<'s, M, S>
+where M: Matcher,
+      M::Error: fmt::Display,
+      S: Sink
+{
+    fn run(mut self) -> Result<(), S::Error> {
         assert!(self.config.multi_line);
+        while !self.search_buffer().is_empty() {
+            if !self.sink()? {
+                break;
+            }
+        }
+        if let Some(last_match) = self.last_match.take() {
+            self.sink_matched(&last_match)?;
+        }
+        Ok(())
+    }
+
+    fn search_buffer(&self) -> &[u8] {
+        &self.slice[self.search_pos..]
+    }
+
+    fn sink(&mut self) -> Result<bool, S::Error> {
+        if self.config.invert_match {
+            return self.sink_inverted_matches();
+        }
+        let (mat_start, mat_end) = match self.find()? {
+            Some(range) => range,
+            None => {
+                self.search_pos = self.slice.len();
+                return Ok(true);
+            }
+        };
+        let (line_start, line_end) = lines::locate(
+            self.slice,
+            self.config.line_term,
+            mat_start,
+            mat_end,
+        );
+        let keepgoing = match self.last_match.take() {
+            None => true,
+            Some(last_match) => {
+                // If the lines in the previous match overlap with the lines
+                // in this match, then simply grow the match and move on.
+                if last_match.line.end >= line_start {
+                    self.last_match = Some(MultiLineMatch {
+                        line: last_match.line.start..line_end,
+                        line_number: last_match.line_number,
+                    });
+                    self.search_pos = mat_end;
+                    return Ok(true);
+                } else {
+                    self.sink_matched(&last_match)?
+                }
+            }
+        };
+        self.count_lines(line_start);
+        self.last_match = Some(MultiLineMatch {
+            line: line_start..line_end,
+            line_number: self.line_number,
+        });
+        self.search_pos = mat_end;
+        Ok(keepgoing)
+    }
+
+    fn sink_inverted_matches(&mut self) -> Result<bool, S::Error> {
+        assert!(self.config.invert_match);
+
+        let (invert_start, invert_end) = match self.find()? {
+            None => {
+                let start = self.search_pos;
+                self.search_pos = self.slice.len();
+                (start, self.slice.len())
+            }
+            Some((mat_start, mat_end)) => {
+                let (line_start, line_end) = lines::locate(
+                    self.slice,
+                    self.config.line_term,
+                    mat_start,
+                    mat_end,
+                );
+                let start = self.search_pos;
+                self.search_pos = line_end;
+                (start, line_start)
+            }
+        };
+        let mut stepper = LineStep::new(
+            self.config.line_term, invert_start, invert_end);
+        while let Some((s, e)) = stepper.next(self.slice) {
+            self.count_lines(s);
+            let m = MultiLineMatch {
+                line: s..e,
+                line_number: self.line_number,
+            };
+            if !self.sink_matched(&m)? {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    fn sink_matched(&mut self, m: &MultiLineMatch) -> Result<bool, S::Error> {
+        self.sink.matched(
+            self.searcher,
+            &SinkMatch {
+                line_term: self.config.line_term,
+                bytes: &self.slice[m.line.clone()],
+                absolute_byte_offset: m.line.start as u64,
+                line_number: m.line_number,
+            },
+        )
+    }
+
+    fn find(&mut self) -> Result<Option<(usize, usize)>, S::Error> {
         match self.matcher.find(self.search_buffer()) {
             Err(err) => return Err(S::error_message(err)),
             Ok(None) => return Ok(None),
             Ok(Some((start, end))) => {
-                let (line_start, line_end) = lines::locate(
-                    self.buffer(),
-                    self.config.line_term,
-                    self.search_pos + start,
-                    self.search_pos + end,
-                );
-                Ok(Some((line_start, line_end)))
+                Ok(Some((self.search_pos + start, self.search_pos + end)))
             }
         }
     }
+
+    fn count_lines(&mut self, upto: usize) {
+        if let Some(ref mut line_number) = self.line_number {
+            let slice = &self.slice[self.last_line_counted..upto];
+            *line_number += lines::count(slice, self.config.line_term);
+            self.last_line_counted = upto;
+        }
+    }
 }
+
+// BREADCRUMBS:
+//
+// Where to go next? Some thoughts:
+//
+//   1. Do context handling last. (Famous last words.)
+//   2. Binary detectiong for SliceReader. Maybe punt on Convert.
+//   3. Fill out the single-line searcher. Use optimizations. Line-by-line too.
+//   4. Fill out the logic for opening a reader in Searcher.
+//   5. Stop after first match.
+//
+// Massive cleanup. Get things working and then search for simplications.
+// Index heavy code is gross. Context handling will make it much worse.
 
 #[cfg(test)]
 mod tests {
@@ -596,23 +836,163 @@ but Doctor Watson has to have it taken out for him and dusted,
 and exhibited clearly, with a label attached.\
 ";
 
-
-    #[test]
-    fn scratch() {
-        // let pattern = "\
-// For the Doctor Watsons of this world, as opposed to the Sherlock
-// Holmeses, success in the province of detective work must always
-// ";
-        // let pattern = "\n";
-        let pattern = "For the Doctor Watsons of this world, as opposed to the Sherlock\nH";
+    fn search_reader<F>(
+        haystack: &str,
+        pattern: &str,
+        mut build: F,
+    ) -> String
+    where F: FnMut(&mut SearcherBuilder) -> &mut SearcherBuilder
+    {
         let mut sink = KitchenSink::new();
         let matcher = SubstringMatcher::new(pattern);
-        let mut searcher = SearcherBuilder::new()
-            // .binary_detection(BinaryDetection::quit(b'u'))
-            .multi_line(true)
-            .build(matcher)
-            .unwrap();
-        searcher.search_slice(SHERLOCK.as_bytes(), &mut sink).unwrap();
-        println!("{}", String::from_utf8(sink.as_bytes().to_vec()).unwrap());
+        let mut builder = SearcherBuilder::new();
+        build(&mut builder);
+        let mut searcher = builder.build(matcher).unwrap();
+        searcher.search_reader(haystack.as_bytes(), &mut sink).unwrap();
+        String::from_utf8(sink.as_bytes().to_vec()).unwrap()
+    }
+
+    fn search_slice<F>(
+        haystack: &str,
+        pattern: &str,
+        mut build: F,
+    ) -> String
+    where F: FnMut(&mut SearcherBuilder) -> &mut SearcherBuilder
+    {
+        let mut sink = KitchenSink::new();
+        let matcher = SubstringMatcher::new(pattern);
+        let mut builder = SearcherBuilder::new();
+        build(&mut builder);
+        let mut searcher = builder.build(matcher).unwrap();
+        searcher.search_slice(haystack.as_bytes(), &mut sink).unwrap();
+        String::from_utf8(sink.as_bytes().to_vec()).unwrap()
+    }
+
+    /// Executes the given search on all available searchers, and asserts that
+    /// the result of every search is equivalent to the expected result.
+    fn search_assert_all<F>(
+        expected: &str,
+        haystack: &str,
+        pattern: &str,
+        mut build: F,
+    )
+    where F: FnMut(&mut SearcherBuilder) -> &mut SearcherBuilder
+    {
+        let got = search_reader(haystack, pattern, &mut build);
+        assert_eq!(expected, got, "search_reader mismatch");
+
+        let got = search_slice(haystack, pattern, &mut build);
+        assert_eq!(expected, got, "search_slice mismatch");
+    }
+
+    #[test]
+    fn basic1() {
+        let exp = "\
+0:For the Doctor Watsons of this world, as opposed to the Sherlock
+129:be, to a very large extent, the result of luck. Sherlock Holmes
+";
+        search_assert_all(exp, SHERLOCK, "Sherlock", |b| b);
+        search_assert_all(exp, SHERLOCK, "Sherlock", |b| {
+            b.heap_limit(Some(80))
+        });
+        search_assert_all(exp, SHERLOCK, "Sherlock", |b| b.multi_line(true));
+    }
+
+    #[test]
+    fn basic2() {
+        let exp = "";
+        search_assert_all(exp, SHERLOCK, "NADA", |b| b);
+        search_assert_all(exp, SHERLOCK, "NADA", |b| b.heap_limit(Some(80)));
+        search_assert_all(exp, SHERLOCK, "NADA", |b| b.multi_line(true));
+    }
+
+    #[test]
+    fn basic3() {
+        let exp = "\
+0:For the Doctor Watsons of this world, as opposed to the Sherlock
+65:Holmeses, success in the province of detective work must always
+129:be, to a very large extent, the result of luck. Sherlock Holmes
+193:can extract a clew from a wisp of straw or a flake of cigar ash;
+258:but Doctor Watson has to have it taken out for him and dusted,
+321:and exhibited clearly, with a label attached.\
+";
+        search_assert_all(exp, SHERLOCK, "a", |b| b);
+        search_assert_all(exp, SHERLOCK, "a", |b| b.heap_limit(Some(80)));
+        search_assert_all(exp, SHERLOCK, "a", |b| b.multi_line(true));
+    }
+
+    #[test]
+    fn invert1() {
+        let pattern = "Sherlock";
+        let exp = "\
+65:Holmeses, success in the province of detective work must always
+193:can extract a clew from a wisp of straw or a flake of cigar ash;
+258:but Doctor Watson has to have it taken out for him and dusted,
+321:and exhibited clearly, with a label attached.\
+";
+
+        search_assert_all(exp, SHERLOCK, pattern, |b| {
+            b.invert_match(true)
+        });
+        search_assert_all(exp, SHERLOCK, pattern, |b| {
+            b.invert_match(true).heap_limit(Some(80))
+        });
+        search_assert_all(exp, SHERLOCK, pattern, |b| {
+            b.invert_match(true).multi_line(true)
+        });
+    }
+
+    #[test]
+    fn line_number1() {
+        let exp = "\
+1:0:For the Doctor Watsons of this world, as opposed to the Sherlock
+3:129:be, to a very large extent, the result of luck. Sherlock Holmes
+";
+        search_assert_all(exp, SHERLOCK, "Sherlock", |b| {
+            b.line_number(true)
+        });
+        search_assert_all(exp, SHERLOCK, "Sherlock", |b| {
+            b.line_number(true).heap_limit(Some(80))
+        });
+        search_assert_all(exp, SHERLOCK, "Sherlock", |b| {
+            b.line_number(true).multi_line(true)
+        });
+    }
+
+    #[test]
+    fn line_number_invert1() {
+        let exp = "\
+2:65:Holmeses, success in the province of detective work must always
+4:193:can extract a clew from a wisp of straw or a flake of cigar ash;
+5:258:but Doctor Watson has to have it taken out for him and dusted,
+6:321:and exhibited clearly, with a label attached.\
+";
+        search_assert_all(exp, SHERLOCK, "Sherlock", |b| {
+            b.line_number(true).invert_match(true)
+        });
+        search_assert_all(exp, SHERLOCK, "Sherlock", |b| {
+            b.line_number(true).invert_match(true).heap_limit(Some(80))
+        });
+        search_assert_all(exp, SHERLOCK, "Sherlock", |b| {
+            b.line_number(true).multi_line(true).invert_match(true)
+        });
+    }
+
+    #[test]
+    fn multi_line_overlap1() {
+        let haystack = "xxx\nabc\ndefxxxabc\ndefxxx\nxxx";
+        let pattern = "abc\ndef";
+        let exp = "4:abc\n8:defxxxabc\n18:defxxx\n";
+
+        search_assert_all(exp, haystack, pattern, |b| b.multi_line(true));
+    }
+
+    #[test]
+    fn multi_line_overlap2() {
+        let haystack = "xxx\nabc\ndefabc\ndefxxx\nxxx";
+        let pattern = "abc\ndef";
+        let exp = "4:abc\n8:defabc\n15:defxxx\n";
+
+        search_assert_all(exp, haystack, pattern, |b| b.multi_line(true));
     }
 }

@@ -3,6 +3,7 @@ use std::io::{self, Write};
 use std::str;
 
 use matcher::{Matcher, NoCaptures};
+use searcher::Searcher;
 use sink::{Sink, SinkContext, SinkFinish, SinkMatch};
 
 /// A simple substring matcher that requires UTF-8.
@@ -76,16 +77,26 @@ impl Sink for KitchenSink {
         err
     }
 
-    fn matched<M: Matcher>(
+    fn matched<M>(
         &mut self,
-        _matcher: M,
+        _searcher: &Searcher<M>,
         mat: &SinkMatch,
-    ) -> Result<bool, io::Error> {
-        write!(self.0, "{}:", mat.absolute_byte_offset)?;
-        if let Some(line_number) = mat.line_number() {
-            write!(self.0, "{}:", line_number)?;
+    ) -> Result<bool, io::Error>
+    where M: Matcher,
+          M::Error: fmt::Display
+    {
+        let mut line_number = mat.line_number();
+        let mut byte_offset = mat.absolute_byte_offset();
+        for line in mat.lines() {
+            if let Some(ref mut n) = line_number {
+                write!(self.0, "{}:", n)?;
+                *n += 1;
+            }
+
+            write!(self.0, "{}:", byte_offset)?;
+            byte_offset += line.len() as u64;
+            self.0.write_all(line)?;
         }
-        self.0.write_all(mat.bytes())?;
         Ok(true)
     }
 
