@@ -6,6 +6,28 @@ pub fn count(bytes: &[u8], line_term: u8) -> u64 {
     bytecount::count(bytes, line_term) as u64
 }
 
+/// Return the start and end offsets of the lines containing the given range
+/// of bytes.
+///
+/// Line terminators are considered part of the line they terminate.
+pub fn locate(
+    bytes: &[u8],
+    line_term: u8,
+    start: usize,
+    end: usize,
+) -> (usize, usize) {
+    let line_start = memrchr(line_term, &bytes[0..start])
+        .map_or(0, |i| i + 1);
+    let line_end =
+        if end > line_start && bytes[end - 1] == line_term {
+            end
+        } else {
+            memchr(line_term, &bytes[end..])
+            .map_or(bytes.len(), |i| end + i + 1)
+        };
+    (line_start, line_end)
+}
+
 /// An iterator over lines in a particular slice of bytes.
 ///
 /// This iterator avoids borrowing the bytes themselves, and instead requires
@@ -144,12 +166,69 @@ and exhibited clearly, with a label attached.\
         preceding_by_pos(text.as_bytes(), pos, b'\n', count)
     }
 
+    fn loc(text: &str, start: usize, end: usize) -> (usize, usize) {
+        locate(text.as_bytes(), b'\n', start, end)
+    }
+
     #[test]
     fn line_count() {
         assert_eq!(0, count(b"", b'\n'));
         assert_eq!(1, count(b"\n", b'\n'));
         assert_eq!(2, count(b"\n\n", b'\n'));
         assert_eq!(2, count(b"a\nb\nc", b'\n'));
+    }
+
+    #[test]
+    fn line_locate() {
+        let t = SHERLOCK;
+        let lines = line_ranges(t);
+
+        assert_eq!(
+            loc(t, lines[0].start, lines[0].end),
+            (lines[0].start, lines[0].end));
+        assert_eq!(
+            loc(t, lines[0].start + 1, lines[0].end),
+            (lines[0].start, lines[0].end));
+        assert_eq!(
+            loc(t, lines[0].end - 1, lines[0].end),
+            (lines[0].start, lines[0].end));
+        assert_eq!(
+            loc(t, lines[0].end, lines[0].end),
+            (lines[1].start, lines[1].end));
+
+        assert_eq!(
+            loc(t, lines[5].start, lines[5].end),
+            (lines[5].start, lines[5].end));
+        assert_eq!(
+            loc(t, lines[5].start + 1, lines[5].end),
+            (lines[5].start, lines[5].end));
+        assert_eq!(
+            loc(t, lines[5].end - 1, lines[5].end),
+            (lines[5].start, lines[5].end));
+        assert_eq!(
+            loc(t, lines[5].end, lines[5].end),
+            (lines[5].start, lines[5].end));
+    }
+
+    #[test]
+    fn line_locate_weird() {
+        assert_eq!(loc("", 0, 0), (0, 0));
+
+        assert_eq!(loc("\n", 0, 1), (0, 1));
+        assert_eq!(loc("\n", 1, 1), (1, 1));
+
+        assert_eq!(loc("\n\n", 0, 0), (0, 1));
+        assert_eq!(loc("\n\n", 0, 1), (0, 1));
+        assert_eq!(loc("\n\n", 1, 1), (1, 2));
+        assert_eq!(loc("\n\n", 1, 2), (1, 2));
+        assert_eq!(loc("\n\n", 2, 2), (2, 2));
+
+        assert_eq!(loc("a\nb\nc", 0, 1), (0, 2));
+        assert_eq!(loc("a\nb\nc", 1, 2), (0, 2));
+        assert_eq!(loc("a\nb\nc", 2, 3), (2, 4));
+        assert_eq!(loc("a\nb\nc", 3, 4), (2, 4));
+        assert_eq!(loc("a\nb\nc", 4, 5), (4, 5));
+        assert_eq!(loc("a\nb\nc", 5, 5), (4, 5));
     }
 
     #[test]

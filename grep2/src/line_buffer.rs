@@ -4,6 +4,9 @@ use std::ptr;
 
 use memchr::{memchr, memrchr};
 
+/// The default buffer capacity that we use for the line buffer.
+pub(crate) const DEFAULT_BUFFER_CAPACITY: usize = 8 * (1<<10); // 8 KB
+
 /// The behavior of a searcher in the face of long lines and big contexts.
 ///
 /// When searching data incrementally using a fixed size buffer, this controls
@@ -87,7 +90,7 @@ struct Config {
 impl Default for Config {
     fn default() -> Config {
         Config {
-            capacity: 8 * (1<<10), // 8 KB
+            capacity: DEFAULT_BUFFER_CAPACITY,
             lineterm: b'\n',
             buffer_alloc: BufferAllocation::default(),
             binary: BinaryDetection::default(),
@@ -128,10 +131,8 @@ impl LineBufferBuilder {
     ///
     /// This is set to a reasonable default and probably shouldn't be changed
     /// unless there's a specific reason to do so.
-    ///
-    /// If `0` is given, then it is treated as if `1` were provided.
     pub fn capacity(&mut self, capacity: usize) -> &mut LineBufferBuilder {
-        self.config.capacity = cmp::max(1, capacity);
+        self.config.capacity = capacity;
         self
     }
 
@@ -505,11 +506,14 @@ impl LineBuffer {
         if !self.free_buffer().is_empty() {
             return Ok(());
         }
+        // `len` is used for computing the next allocation size. The capacity
+        // is permitted to start at `0`, so we make sure it's at least `1`.
+        let len = cmp::max(1, self.buf.len());
         let additional = match self.config.buffer_alloc {
-            BufferAllocation::Eager => self.buf.len() * 2,
+            BufferAllocation::Eager => len * 2,
             BufferAllocation::Error(limit) => {
                 let used = self.buf.len() - self.config.capacity;
-                let n = cmp::min(self.buf.len() * 2, limit - used);
+                let n = cmp::min(len * 2, limit - used);
                 if n == 0 {
                     let msg = format!(
                         "configured allocation limit ({}) exceeded", limit);
@@ -551,6 +555,15 @@ fn replace_bytes(bytes: &mut [u8], src: u8, replacement: u8) -> Option<usize> {
 mod tests {
     use std::str;
     use super::*;
+
+    const SHERLOCK: &'static str = "\
+For the Doctor Watsons of this world, as opposed to the Sherlock
+Holmeses, success in the province of detective work must always
+be, to a very large extent, the result of luck. Sherlock Holmes
+can extract a clew from a wisp of straw or a flake of cigar ash;
+but Doctor Watson has to have it taken out for him and dusted,
+and exhibited clearly, with a label attached.\
+";
 
     fn s(slice: &str) -> String {
         slice.to_string()
@@ -847,6 +860,28 @@ mod tests {
         assert!(!rdr.fill().unwrap());
         assert_eq!(rdr.absolute_byte_offset(), bytes.len() as u64 - 2);
         assert_eq!(rdr.binary_byte_offset(), Some(bytes.len() as u64 - 2));
+    }
+
+    #[test]
+    fn buffer_binary_quit5() {
+        let mut linebuf = LineBufferBuilder::new()
+            .binary_detection(BinaryDetection::Quit(b'u'))
+            .build();
+        let mut rdr = LineBufferReader::new(SHERLOCK.as_bytes(), &mut linebuf);
+
+        assert!(rdr.buffer().is_empty());
+
+        assert!(rdr.fill().unwrap());
+        assert_eq!(btos(rdr.buffer()), "\
+For the Doctor Watsons of this world, as opposed to the Sherlock
+Holmeses, s\
+");
+        rdr.consume_all();
+
+        assert!(!rdr.fill().unwrap());
+        assert_eq!(rdr.absolute_byte_offset(), 76);
+        assert_eq!(rdr.binary_byte_offset(), Some(76));
+        assert_eq!(SHERLOCK.as_bytes()[76], b'u');
     }
 
     #[test]

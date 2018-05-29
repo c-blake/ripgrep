@@ -1,20 +1,5 @@
 use interpolate::interpolate;
 
-/// The type of match for a line oriented matcher.
-pub enum LineMatchKind {
-    /// A position inside a line that is known to contain a match.
-    ///
-    /// This position can be anywhere in the line. It does not need to point
-    /// at the location of the match.
-    Confirmed(usize),
-    /// A position inside a line that may contain a match, and must be searched
-    /// for verification.
-    ///
-    /// This position can be anywhere in the line. It does not need to point
-    /// at the location of the match.
-    Candidate(usize),
-}
-
 /// A trait that describes implementations of capturing groups.
 ///
 /// When a matcher supports capturing group extraction, then it is the
@@ -113,6 +98,62 @@ impl NoCaptures {
 impl Captures for NoCaptures {
     fn len(&self) -> usize { 0 }
     fn get(&self, _: usize) -> Option<(usize, usize)> { None }
+}
+
+/*
+/// A matcher's line terminator settings.
+///
+/// The line terminator indicates the type of search that the caller intends
+/// to performer with a particular matcher. Broadly speaking, there are two
+/// main types of search: searches that can produce matches spanning multiple
+/// lines and searches that must be limited to producing matches spanning at
+/// most one line.
+///
+/// # Design rationale
+///
+/// The line terminator preference has a dual purpose.
+///
+/// The first purpose is to satisfy the need of an end user. Namely, an end
+/// user may want to see matches only limited to a single line. This can be
+/// important to express as an explicit preference in order to prevent common
+/// patterns such as `\s` from matching line terminators.
+///
+/// The second purpose is for performance. When a matcher knows that it only
+/// needs to find matches limited to a single line, then it can perform
+/// additional optimizations that would otherwise be impossible or hard to do.
+/// This is the purpose of the `NeverInMatch` variant for this type, which
+/// indicates that a line terminator will never appear in a match. This
+/// guarantee allows users of a matcher to avoid parsing out each individual
+/// line.
+#[derive(Clone, Copy, Debug)]
+pub enum LineTerminator {
+    /// No line terminator was requested. This indicates that the matcher may
+    /// produce matches that span multiple lines.
+    None,
+    /// The matcher uses the provided line terminator and *guarantees* that
+    /// the line terminator will never appear in any match produced by the
+    /// matcher.
+    NeverInMatch(u8),
+    /// The matcher uses the provided line terminator, but cannot guarantee
+    /// that the line terminator will never appear in a match.
+    Requested(u8),
+}
+*/
+
+/// The type of match for a line oriented matcher.
+#[derive(Clone, Copy, Debug)]
+pub enum LineMatchKind {
+    /// A position inside a line that is known to contain a match.
+    ///
+    /// This position can be anywhere in the line. It does not need to point
+    /// at the location of the match.
+    Confirmed(usize),
+    /// A position inside a line that may contain a match, and must be searched
+    /// for verification.
+    ///
+    /// This position can be anywhere in the line. It does not need to point
+    /// at the location of the match.
+    Candidate(usize),
 }
 
 pub trait Matcher {
@@ -389,14 +430,14 @@ pub trait Matcher {
     }
 
     /// If this matcher was compiled as a line oriented matcher, then this
-    /// method returns the line terminator. If this wasn't compiled as a line
-    /// oriented matcher, then this must return `None`, which is the default.
+    /// method returns the line terminator if and only if the line terminator
+    /// never appears in any match produced by this matcher. If this wasn't
+    /// compiled as a line oriented matcher, or if the aforementioned guarantee
+    /// cannot be made, then this must return `None`, which is the default.
+    /// It is **never wrong** to return `None`, but returning a line terminator
+    /// when it can appear in a match is unspecified behavior.
     ///
     /// A line terminator is typically `b'\n'`, but can be any single byte.
-    /// The contract of a line terminator is that it must never appear in a
-    /// match reported by this matcher. That is, if you enumerated every
-    /// possible string that was matched by this matcher, then none of them
-    /// would contain the line terminator.
     fn line_terminator(&self) -> Option<u8> {
         None
     }
@@ -410,11 +451,12 @@ pub trait Matcher {
     /// returns a confirmed match or no match at all.
     ///
     /// When a matcher can match spans over multiple lines, then the behavior
-    /// of this method is unspecified. Namely, use of this method only makes
-    /// sense in a context where the caller is looking for the next matching
-    /// line.
+    /// of this method is unspecified. Namely, use of this method only
+    /// makes sense in a context where the caller is looking for the next
+    /// matching line. That is, callers should only use this method when
+    /// `line_terminator` does not return `None`.
     ///
-    /// # Design rational
+    /// # Design rationale
     ///
     /// A line matcher is, fundamentally, a normal matcher with the addition
     /// of one optional method: finding a line. By default, this routine
