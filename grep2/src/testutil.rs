@@ -2,7 +2,8 @@ use std::fmt;
 use std::io::{self, Write};
 use std::str;
 
-use matcher::{Matcher, NoCaptures};
+use lines;
+use matcher::{Matcher, NoCaptures, NoError};
 use searcher::Searcher;
 use sink::{Sink, SinkContext, SinkFinish, SinkMatch};
 
@@ -46,6 +47,81 @@ impl Matcher for SubstringMatcher {
     }
 }
 
+/// A matcher that matches only the empty line and nothing else. An empty line
+/// is defined as a line with at most one byte, where that byte is the line
+/// terminator.
+#[derive(Clone, Debug)]
+pub struct EmptyLineMatcher {
+    line_term: u8,
+}
+
+impl EmptyLineMatcher {
+    /// Create a new empty line matcher.
+    pub fn new(line_term: u8) -> EmptyLineMatcher {
+        EmptyLineMatcher { line_term }
+    }
+
+    fn next_line(&self, haystack: &[u8], at: usize) -> (usize, usize) {
+        let end = haystack[at..]
+            .iter()
+            .position(|&b| b == self.line_term)
+            .map(|i| at + i + 1);
+        match end {
+            None => {
+                lines::locate(
+                    haystack,
+                    self.line_term,
+                    haystack.len(),
+                    haystack.len(),
+                )
+            }
+            Some(end) => {
+                (lines::preceding(&haystack[..end], self.line_term, 0), end)
+            }
+        }
+    }
+
+    fn line_len(&self, line: &[u8]) -> usize {
+        if let Some(&last) = line.last() {
+            if last == self.line_term {
+                line.len() - 1
+            } else {
+                line.len()
+            }
+        } else {
+            0
+        }
+    }
+}
+
+impl Matcher for EmptyLineMatcher {
+    type Captures = NoCaptures;
+    type Error = NoError;
+
+    fn find_at(
+        &self,
+        haystack: &[u8],
+        mut at: usize,
+    ) -> Result<Option<(usize, usize)>, NoError> {
+        loop {
+            let (start, end) = self.next_line(haystack, at);
+            if start >= at {
+                if self.line_len(&haystack[start..end]) == 0 {
+                    return Ok(Some((start, start)));
+                }
+            }
+            if at == haystack.len() {
+                return Ok(None);
+            }
+            at = end;
+        }
+    }
+
+    fn new_captures(&self) -> Result<NoCaptures, NoError> {
+        Ok(NoCaptures::new())
+    }
+}
+
 /// An implementation of Sink that prints all available information.
 ///
 /// This is useful for tests because it lets us easily confirm whether data
@@ -85,6 +161,7 @@ impl Sink for KitchenSink {
     where M: Matcher,
           M::Error: fmt::Display
     {
+        println!("{:?}", mat);
         let mut line_number = mat.line_number();
         let mut byte_offset = mat.absolute_byte_offset();
         for line in mat.lines() {
@@ -121,5 +198,66 @@ impl Sink for KitchenSink {
         writeln!(self.0, "")?;
         writeln!(self.0, "lines matched:{}", sink_finish.lines_matched)?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use matcher::Matcher;
+
+    use super::*;
+
+    #[test]
+    fn empty_line1() {
+        let haystack = b"";
+        let matcher = EmptyLineMatcher::new(b'\n');
+
+        assert_eq!(matcher.find_at(haystack, 0), Ok(Some((0, 0))));
+    }
+
+    #[test]
+    fn empty_line2() {
+        let haystack = b"\n";
+        let matcher = EmptyLineMatcher::new(b'\n');
+
+        assert_eq!(matcher.find_at(haystack, 0), Ok(Some((0, 0))));
+        assert_eq!(matcher.find_at(haystack, 1), Ok(Some((1, 1))));
+    }
+
+    #[test]
+    fn empty_line3() {
+        let haystack = b"\n\n";
+        let matcher = EmptyLineMatcher::new(b'\n');
+
+        assert_eq!(matcher.find_at(haystack, 0), Ok(Some((0, 0))));
+        assert_eq!(matcher.find_at(haystack, 1), Ok(Some((1, 1))));
+        assert_eq!(matcher.find_at(haystack, 2), Ok(Some((2, 2))));
+    }
+
+    #[test]
+    fn empty_line4() {
+        let haystack = b"a\n\nb\n";
+        let matcher = EmptyLineMatcher::new(b'\n');
+
+        assert_eq!(matcher.find_at(haystack, 0), Ok(Some((2, 2))));
+        assert_eq!(matcher.find_at(haystack, 1), Ok(Some((2, 2))));
+        assert_eq!(matcher.find_at(haystack, 2), Ok(Some((2, 2))));
+        assert_eq!(matcher.find_at(haystack, 3), Ok(Some((5, 5))));
+        assert_eq!(matcher.find_at(haystack, 4), Ok(Some((5, 5))));
+        assert_eq!(matcher.find_at(haystack, 5), Ok(Some((5, 5))));
+    }
+
+    #[test]
+    fn empty_line5() {
+        let haystack = b"a\n\nb\nc";
+        let matcher = EmptyLineMatcher::new(b'\n');
+
+        assert_eq!(matcher.find_at(haystack, 0), Ok(Some((2, 2))));
+        assert_eq!(matcher.find_at(haystack, 1), Ok(Some((2, 2))));
+        assert_eq!(matcher.find_at(haystack, 2), Ok(Some((2, 2))));
+        assert_eq!(matcher.find_at(haystack, 3), Ok(None));
+        assert_eq!(matcher.find_at(haystack, 4), Ok(None));
+        assert_eq!(matcher.find_at(haystack, 5), Ok(None));
+        assert_eq!(matcher.find_at(haystack, 6), Ok(None));
     }
 }

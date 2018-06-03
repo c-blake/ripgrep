@@ -548,6 +548,7 @@ where M: Matcher,
 
     fn fill(&mut self) -> Result<bool, S::Error> {
         assert!(self.search_buffer().is_empty());
+
         self.count_remaining_lines();
         self.rdr.consume_all();
         self.search_pos = 0;
@@ -608,6 +609,14 @@ where M: Matcher,
         line_start: usize,
         line_end: usize,
     ) -> Result<bool, S::Error> {
+        if line_start == line_end {
+            // The only way we can produce an empty line for a match is if
+            // we match the position immediately following the last byte that
+            // we search, and where that last byte is also the line terminator.
+            // We never want to report a match, and we know we're done at that
+            // point anyway.
+            return Ok(false);
+        }
         let offset = self.rdr.absolute_byte_offset() + line_start as u64;
         self.sink.matched(
             self.searcher,
@@ -670,12 +679,6 @@ struct SearcherMultiLine<'s, M: 's, S> {
     last_line_counted: usize,
 }
 
-#[derive(Clone, Debug)]
-struct MultiLineMatch {
-    line: Range<usize>,
-    line_number: Option<u64>,
-}
-
 impl<'s, M, S> SearcherMultiLine<'s, M, S>
 where M: Matcher,
       M::Error: fmt::Display,
@@ -720,12 +723,14 @@ where M: Matcher,
             Some(last_match) => {
                 // If the lines in the previous match overlap with the lines
                 // in this match, then simply grow the match and move on.
+                // This happens when the next match begins on the same line
+                // that the last match ends on.
                 if last_match.line.end >= line_start {
                     self.last_match = Some(MultiLineMatch {
                         line: last_match.line.start..line_end,
                         line_number: last_match.line_number,
                     });
-                    self.search_pos = mat_end;
+                    self.advance(mat_start, mat_end);
                     return Ok(true);
                 } else {
                     self.sink_matched(&last_match)?
@@ -737,7 +742,7 @@ where M: Matcher,
             line: line_start..line_end,
             line_number: self.line_number,
         });
-        self.search_pos = mat_end;
+        self.advance(mat_start, mat_end);
         Ok(keepgoing)
     }
 
@@ -778,6 +783,14 @@ where M: Matcher,
     }
 
     fn sink_matched(&mut self, m: &MultiLineMatch) -> Result<bool, S::Error> {
+        if m.is_empty() {
+            // The only way we can produce an empty line for a match is if
+            // we match the position immediately following the last byte that
+            // we search, and where that last byte is also the line terminator.
+            // We never want to report a match, and we know we're done at that
+            // point anyway.
+            return Ok(false);
+        }
         self.sink.matched(
             self.searcher,
             &SinkMatch {
@@ -806,13 +819,43 @@ where M: Matcher,
             self.last_line_counted = upto;
         }
     }
+
+    /// Advance the search position based on the previous match.
+    ///
+    /// If the previous match is zero width, then this advances the search
+    /// position one byte past the end of the match.
+    fn advance(&mut self, mat_start: usize, mat_end: usize) {
+        self.search_pos = mat_end;
+        if mat_start == mat_end && self.search_pos < self.slice.len() {
+            self.search_pos += 1;
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct MultiLineMatch {
+    line: Range<usize>,
+    line_number: Option<u64>,
+}
+
+impl MultiLineMatch {
+    /// Returns the length of this match, in bytes.
+    fn len(&self) -> usize {
+        self.line.end.checked_sub(self.line.start).unwrap()
+    }
+
+    /// Returns true if and only if this match is empty.
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
 }
 
 // BREADCRUMBS:
 //
 // Where to go next? Some thoughts:
 //
-//   1. Do context handling last. (Famous last words.)
+//   1a. Switch to using ops::Range instead of (usize, usize).
+//   1b. Do context handling last. (Famous last words.)
 //   2. Binary detectiong for SliceReader. Maybe punt on Convert.
 //   3. Fill out the single-line searcher. Use optimizations. Line-by-line too.
 //   4. Fill out the logic for opening a reader in Searcher.
@@ -823,7 +866,9 @@ where M: Matcher,
 
 #[cfg(test)]
 mod tests {
-    use testutil::{KitchenSink, SubstringMatcher};
+    use std::fmt;
+
+    use testutil::{EmptyLineMatcher, KitchenSink, SubstringMatcher};
 
     use super::*;
 
@@ -836,15 +881,58 @@ but Doctor Watson has to have it taken out for him and dusted,
 and exhibited clearly, with a label attached.\
 ";
 
-    fn search_reader<F>(
+    /// Executes the given search on all available searchers, and asserts that
+    /// the result of every search is equivalent to the expected result.
+    ///
+    /// This creates a substring matcher from the given pattern.
+    fn search_assert_all<F>(
+        expected: &str,
         haystack: &str,
         pattern: &str,
-        mut build: F,
-    ) -> String
+        build: F,
+    )
     where F: FnMut(&mut SearcherBuilder) -> &mut SearcherBuilder
     {
-        let mut sink = KitchenSink::new();
         let matcher = SubstringMatcher::new(pattern);
+        search_assert_all_matcher(expected, haystack, matcher, build)
+    }
+
+    /// Executes the given search on all available searchers, and asserts that
+    /// the result of every search is equivalent to the expected result.
+    ///
+    /// This uses the matcher provided.
+    fn search_assert_all_matcher<M, F>(
+        expected: &str,
+        haystack: &str,
+        matcher: M,
+        mut build: F,
+    )
+    where M: Matcher,
+          M::Error: fmt::Display,
+          F: FnMut(&mut SearcherBuilder) -> &mut SearcherBuilder
+    {
+        let got = search_reader(haystack, &matcher, &mut build);
+        assert_eq!(expected, got, "search_reader mismatch");
+
+        let got = search_slice(haystack, &matcher, &mut build);
+        assert_eq!(expected, got, "search_slice mismatch");
+
+        let got = search_reader(haystack, &matcher, |b| {
+            build(b).heap_limit(Some(80))
+        });
+        assert_eq!(expected, got, "search_reader with small limit mismatch");
+    }
+
+    fn search_reader<M, F>(
+        haystack: &str,
+        matcher: M,
+        mut build: F,
+    ) -> String
+    where M: Matcher,
+          M::Error: fmt::Display,
+          F: FnMut(&mut SearcherBuilder) -> &mut SearcherBuilder
+    {
+        let mut sink = KitchenSink::new();
         let mut builder = SearcherBuilder::new();
         build(&mut builder);
         let mut searcher = builder.build(matcher).unwrap();
@@ -852,37 +940,21 @@ and exhibited clearly, with a label attached.\
         String::from_utf8(sink.as_bytes().to_vec()).unwrap()
     }
 
-    fn search_slice<F>(
+    fn search_slice<M, F>(
         haystack: &str,
-        pattern: &str,
+        matcher: M,
         mut build: F,
     ) -> String
-    where F: FnMut(&mut SearcherBuilder) -> &mut SearcherBuilder
+    where M: Matcher,
+          M::Error: fmt::Display,
+          F: FnMut(&mut SearcherBuilder) -> &mut SearcherBuilder
     {
         let mut sink = KitchenSink::new();
-        let matcher = SubstringMatcher::new(pattern);
         let mut builder = SearcherBuilder::new();
         build(&mut builder);
         let mut searcher = builder.build(matcher).unwrap();
         searcher.search_slice(haystack.as_bytes(), &mut sink).unwrap();
         String::from_utf8(sink.as_bytes().to_vec()).unwrap()
-    }
-
-    /// Executes the given search on all available searchers, and asserts that
-    /// the result of every search is equivalent to the expected result.
-    fn search_assert_all<F>(
-        expected: &str,
-        haystack: &str,
-        pattern: &str,
-        mut build: F,
-    )
-    where F: FnMut(&mut SearcherBuilder) -> &mut SearcherBuilder
-    {
-        let got = search_reader(haystack, pattern, &mut build);
-        assert_eq!(expected, got, "search_reader mismatch");
-
-        let got = search_slice(haystack, pattern, &mut build);
-        assert_eq!(expected, got, "search_slice mismatch");
     }
 
     #[test]
@@ -892,9 +964,6 @@ and exhibited clearly, with a label attached.\
 129:be, to a very large extent, the result of luck. Sherlock Holmes
 ";
         search_assert_all(exp, SHERLOCK, "Sherlock", |b| b);
-        search_assert_all(exp, SHERLOCK, "Sherlock", |b| {
-            b.heap_limit(Some(80))
-        });
         search_assert_all(exp, SHERLOCK, "Sherlock", |b| b.multi_line(true));
     }
 
@@ -902,7 +971,6 @@ and exhibited clearly, with a label attached.\
     fn basic2() {
         let exp = "";
         search_assert_all(exp, SHERLOCK, "NADA", |b| b);
-        search_assert_all(exp, SHERLOCK, "NADA", |b| b.heap_limit(Some(80)));
         search_assert_all(exp, SHERLOCK, "NADA", |b| b.multi_line(true));
     }
 
@@ -917,7 +985,6 @@ and exhibited clearly, with a label attached.\
 321:and exhibited clearly, with a label attached.\
 ";
         search_assert_all(exp, SHERLOCK, "a", |b| b);
-        search_assert_all(exp, SHERLOCK, "a", |b| b.heap_limit(Some(80)));
         search_assert_all(exp, SHERLOCK, "a", |b| b.multi_line(true));
     }
 
@@ -935,9 +1002,6 @@ and exhibited clearly, with a label attached.\
             b.invert_match(true)
         });
         search_assert_all(exp, SHERLOCK, pattern, |b| {
-            b.invert_match(true).heap_limit(Some(80))
-        });
-        search_assert_all(exp, SHERLOCK, pattern, |b| {
             b.invert_match(true).multi_line(true)
         });
     }
@@ -950,9 +1014,6 @@ and exhibited clearly, with a label attached.\
 ";
         search_assert_all(exp, SHERLOCK, "Sherlock", |b| {
             b.line_number(true)
-        });
-        search_assert_all(exp, SHERLOCK, "Sherlock", |b| {
-            b.line_number(true).heap_limit(Some(80))
         });
         search_assert_all(exp, SHERLOCK, "Sherlock", |b| {
             b.line_number(true).multi_line(true)
@@ -969,9 +1030,6 @@ and exhibited clearly, with a label attached.\
 ";
         search_assert_all(exp, SHERLOCK, "Sherlock", |b| {
             b.line_number(true).invert_match(true)
-        });
-        search_assert_all(exp, SHERLOCK, "Sherlock", |b| {
-            b.line_number(true).invert_match(true).heap_limit(Some(80))
         });
         search_assert_all(exp, SHERLOCK, "Sherlock", |b| {
             b.line_number(true).multi_line(true).invert_match(true)
@@ -994,5 +1052,147 @@ and exhibited clearly, with a label attached.\
         let exp = "4:abc\n8:defabc\n15:defxxx\n";
 
         search_assert_all(exp, haystack, pattern, |b| b.multi_line(true));
+    }
+
+    #[test]
+    fn empty_line1() {
+        let haystack = "";
+        let matcher = EmptyLineMatcher::new(b'\n');
+        let exp = "";
+
+        search_assert_all_matcher(exp, haystack, &matcher, |b| b);
+        search_assert_all_matcher(exp, haystack, &matcher, |b| {
+            b.line_number(true)
+        });
+        search_assert_all_matcher(exp, haystack, &matcher, |b| {
+            b.multi_line(true)
+        });
+        search_assert_all_matcher(exp, haystack, &matcher, |b| {
+            b.multi_line(true).line_number(true)
+        });
+    }
+
+    #[test]
+    fn empty_line2() {
+        let haystack = "\n";
+        let matcher = EmptyLineMatcher::new(b'\n');
+        let exp = "0:\n";
+        let exp_line = "1:0:\n";
+
+        search_assert_all_matcher(exp, haystack, &matcher, |b| b);
+        search_assert_all_matcher(exp_line, haystack, &matcher, |b| {
+            b.line_number(true)
+        });
+        search_assert_all_matcher(exp, haystack, &matcher, |b| {
+            b.multi_line(true)
+        });
+        search_assert_all_matcher(exp_line, haystack, &matcher, |b| {
+            b.multi_line(true).line_number(true)
+        });
+    }
+
+    #[test]
+    fn empty_line3() {
+        let haystack = "\n\n";
+        let matcher = EmptyLineMatcher::new(b'\n');
+        let exp = "0:\n1:\n";
+        let exp_line = "1:0:\n2:1:\n";
+
+        search_assert_all_matcher(exp, haystack, &matcher, |b| b);
+        search_assert_all_matcher(exp_line, haystack, &matcher, |b| {
+            b.line_number(true)
+        });
+        search_assert_all_matcher(exp, haystack, &matcher, |b| {
+            b.multi_line(true)
+        });
+        search_assert_all_matcher(exp_line, haystack, &matcher, |b| {
+            b.multi_line(true).line_number(true)
+        });
+    }
+
+    #[test]
+    fn empty_line4() {
+        // See: https://github.com/BurntSushi/ripgrep/issues/441
+        let haystack = "\
+a
+b
+
+c
+
+
+d
+";
+        let matcher = EmptyLineMatcher::new(b'\n');
+        let exp = "4:\n7:\n8:\n";
+        let exp_line = "3:4:\n5:7:\n6:8:\n";
+
+        search_assert_all_matcher(exp, haystack, &matcher, |b| b);
+        search_assert_all_matcher(exp_line, haystack, &matcher, |b| {
+            b.line_number(true)
+        });
+        search_assert_all_matcher(exp, haystack, &matcher, |b| {
+            b.multi_line(true)
+        });
+        search_assert_all_matcher(exp_line, haystack, &matcher, |b| {
+            b.multi_line(true).line_number(true)
+        });
+    }
+
+    #[test]
+    fn empty_line5() {
+        // See: https://github.com/BurntSushi/ripgrep/issues/441
+        // This is like empty_line4, but lacks the trailing line terminator.
+        let haystack = "\
+a
+b
+
+c
+
+
+d";
+        let matcher = EmptyLineMatcher::new(b'\n');
+        let exp = "4:\n7:\n8:\n";
+        let exp_line = "3:4:\n5:7:\n6:8:\n";
+
+        search_assert_all_matcher(exp, haystack, &matcher, |b| b);
+        search_assert_all_matcher(exp_line, haystack, &matcher, |b| {
+            b.line_number(true)
+        });
+        search_assert_all_matcher(exp, haystack, &matcher, |b| {
+            b.multi_line(true)
+        });
+        search_assert_all_matcher(exp_line, haystack, &matcher, |b| {
+            b.multi_line(true).line_number(true)
+        });
+    }
+
+    #[test]
+    fn empty_line6() {
+        // See: https://github.com/BurntSushi/ripgrep/issues/441
+        // This is like empty_line4, but includes an empty line at the end.
+        let haystack = "\
+a
+b
+
+c
+
+
+d
+
+";
+        let matcher = EmptyLineMatcher::new(b'\n');
+        let exp = "4:\n7:\n8:\n11:\n";
+        let exp_line = "3:4:\n5:7:\n6:8:\n8:11:\n";
+
+        search_assert_all_matcher(exp, haystack, &matcher, |b| b);
+        search_assert_all_matcher(exp_line, haystack, &matcher, |b| {
+            b.line_number(true)
+        });
+        search_assert_all_matcher(exp, haystack, &matcher, |b| {
+            b.multi_line(true)
+        });
+        search_assert_all_matcher(exp_line, haystack, &matcher, |b| {
+            b.multi_line(true).line_number(true)
+        });
     }
 }

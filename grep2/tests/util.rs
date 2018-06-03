@@ -2,10 +2,9 @@ use std::collections::HashMap;
 use std::fmt;
 use std::result;
 
-use failure::Fail;
 use regex::bytes::{Locations, Regex};
 
-use grep2::{Captures, Matcher, NoCaptures};
+use grep2::{Captures, Matcher, NoCaptures, NoError};
 
 #[derive(Debug)]
 pub struct RegexMatcher {
@@ -95,17 +94,6 @@ impl Matcher for RegexMatcherNoCaps {
 
     fn new_captures(&self) -> Result<NoCaptures> {
         Ok(NoCaptures::new())
-    }
-}
-
-#[derive(Debug)]
-pub struct NoError(());
-
-impl Fail for NoError {}
-
-impl fmt::Display for NoError {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "BUG for NoError: an impossible error occurred")
     }
 }
 

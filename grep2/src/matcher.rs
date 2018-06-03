@@ -1,3 +1,5 @@
+use std::fmt;
+
 use interpolate::interpolate;
 
 /// A trait that describes implementations of capturing groups.
@@ -100,6 +102,23 @@ impl Captures for NoCaptures {
     fn get(&self, _: usize) -> Option<(usize, usize)> { None }
 }
 
+/// NoError provides an error type for matchers that never produce errors.
+///
+/// This error type implements the `std::error::Error` and `fmt::Display`
+/// traits for use in matcher implementations that can never produce errors.
+///
+/// The `fmt::Display` impl for this type panics.
+#[derive(Debug, Eq, PartialEq)]
+pub struct NoError(());
+
+impl ::std::error::Error for NoError {}
+
+impl fmt::Display for NoError {
+    fn fmt(&self, _: &mut fmt::Formatter) -> fmt::Result {
+        panic!("BUG for NoError: an impossible error occurred")
+    }
+}
+
 /*
 /// A matcher's line terminator settings.
 ///
@@ -166,10 +185,9 @@ pub trait Matcher {
     /// The error type used by this matcher.
     ///
     /// For matchers in which an error is not possible, they are encouraged to
-    /// define a new type with a trivial implementation for `failure::Fail`
-    /// (or `std::error::Error` if you aren't using the `failure` crate). In
-    /// the future, when the "never" (spelled `!`) type is stabilized, then it
-    /// should be used instead.
+    /// use the `NoError` type in this crate. In the future, when the "never"
+    /// (spelled `!`) type is stabilized, then it should probably be used
+    /// instead.
     type Error;
 
     /// Returns the start and end byte range of the first match in `haystack`
