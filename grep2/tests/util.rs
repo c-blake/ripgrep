@@ -4,7 +4,7 @@ use std::result;
 
 use regex::bytes::{Locations, Regex};
 
-use grep2::{Captures, Matcher, NoCaptures, NoError};
+use grep2::{Captures, Match, Matcher, NoCaptures, NoError};
 
 #[derive(Debug)]
 pub struct RegexMatcher {
@@ -37,10 +37,12 @@ impl Matcher for RegexMatcher {
         &self,
         haystack: &[u8],
         at: usize,
-    ) -> Result<Option<(usize, usize)>> {
+    ) -> Result<Option<Match>> {
         // TODO: This relies on an undocumented part of the regex API.
         // It is simple enough that we should probably just expose it.
-        Ok(self.re.find_at(haystack, at).map(|m| (m.start(), m.end())))
+        Ok(self.re
+            .find_at(haystack, at)
+            .map(|m| Match::new(m.start(), m.end())))
     }
 
     fn new_captures(&self) -> Result<RegexCaptures> {
@@ -88,8 +90,10 @@ impl Matcher for RegexMatcherNoCaps {
         &self,
         haystack: &[u8],
         at: usize,
-    ) -> Result<Option<(usize, usize)>> {
-        Ok(self.0.find_at(haystack, at).map(|m| (m.start(), m.end())))
+    ) -> Result<Option<Match>> {
+        Ok(self.0
+            .find_at(haystack, at)
+            .map(|m| Match::new(m.start(), m.end())))
     }
 
     fn new_captures(&self) -> Result<NoCaptures> {
@@ -104,8 +108,8 @@ impl Captures for RegexCaptures {
         self.0.len()
     }
 
-    fn get(&self, i: usize) -> Option<(usize, usize)> {
-        self.0.pos(i)
+    fn get(&self, i: usize) -> Option<Match> {
+        self.0.pos(i).map(|(s, e)| Match::new(s, e))
     }
 }
 

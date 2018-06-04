@@ -3,7 +3,7 @@ use std::io::{self, Write};
 use std::str;
 
 use lines;
-use matcher::{Matcher, NoCaptures, NoError};
+use matcher::{Match, Matcher, NoCaptures, NoError};
 use searcher::Searcher;
 use sink::{Sink, SinkContext, SinkFinish, SinkMatch};
 
@@ -35,10 +35,10 @@ impl Matcher for SubstringMatcher {
         &self,
         haystack: &[u8],
         at: usize,
-    ) -> Result<Option<(usize, usize)>, str::Utf8Error> {
+    ) -> Result<Option<Match>, str::Utf8Error> {
         let slice = str::from_utf8(haystack)?;
         Ok(slice[at..].find(&self.pattern).map(|i| {
-            (at + i, at + i + self.pattern.len())
+            Match::new(at + i, at + i + self.pattern.len())
         }))
     }
 
@@ -61,7 +61,7 @@ impl EmptyLineMatcher {
         EmptyLineMatcher { line_term }
     }
 
-    fn next_line(&self, haystack: &[u8], at: usize) -> (usize, usize) {
+    fn next_line(&self, haystack: &[u8], at: usize) -> Match {
         let end = haystack[at..]
             .iter()
             .position(|&b| b == self.line_term)
@@ -71,12 +71,13 @@ impl EmptyLineMatcher {
                 lines::locate(
                     haystack,
                     self.line_term,
-                    haystack.len(),
-                    haystack.len(),
+                    Match::zero(haystack.len()),
                 )
             }
             Some(end) => {
-                (lines::preceding(&haystack[..end], self.line_term, 0), end)
+                let start = lines::preceding(
+                    &haystack[..end], self.line_term, 0);
+                Match::new(start, end)
             }
         }
     }
@@ -102,18 +103,18 @@ impl Matcher for EmptyLineMatcher {
         &self,
         haystack: &[u8],
         mut at: usize,
-    ) -> Result<Option<(usize, usize)>, NoError> {
+    ) -> Result<Option<Match>, NoError> {
         loop {
-            let (start, end) = self.next_line(haystack, at);
-            if start >= at {
-                if self.line_len(&haystack[start..end]) == 0 {
-                    return Ok(Some((start, start)));
+            let line = self.next_line(haystack, at);
+            if line.start() >= at {
+                if self.line_len(&haystack[line]) == 0 {
+                    return Ok(Some(Match::zero(line.start())));
                 }
             }
             if at == haystack.len() {
                 return Ok(None);
             }
-            at = end;
+            at = line.end();
         }
     }
 
@@ -203,16 +204,20 @@ impl Sink for KitchenSink {
 
 #[cfg(test)]
 mod tests {
-    use matcher::Matcher;
+    use matcher::{Match, Matcher};
 
     use super::*;
+
+    fn m(start: usize, end: usize) -> Match {
+        Match::new(start, end)
+    }
 
     #[test]
     fn empty_line1() {
         let haystack = b"";
         let matcher = EmptyLineMatcher::new(b'\n');
 
-        assert_eq!(matcher.find_at(haystack, 0), Ok(Some((0, 0))));
+        assert_eq!(matcher.find_at(haystack, 0), Ok(Some(m(0, 0))));
     }
 
     #[test]
@@ -220,8 +225,8 @@ mod tests {
         let haystack = b"\n";
         let matcher = EmptyLineMatcher::new(b'\n');
 
-        assert_eq!(matcher.find_at(haystack, 0), Ok(Some((0, 0))));
-        assert_eq!(matcher.find_at(haystack, 1), Ok(Some((1, 1))));
+        assert_eq!(matcher.find_at(haystack, 0), Ok(Some(m(0, 0))));
+        assert_eq!(matcher.find_at(haystack, 1), Ok(Some(m(1, 1))));
     }
 
     #[test]
@@ -229,9 +234,9 @@ mod tests {
         let haystack = b"\n\n";
         let matcher = EmptyLineMatcher::new(b'\n');
 
-        assert_eq!(matcher.find_at(haystack, 0), Ok(Some((0, 0))));
-        assert_eq!(matcher.find_at(haystack, 1), Ok(Some((1, 1))));
-        assert_eq!(matcher.find_at(haystack, 2), Ok(Some((2, 2))));
+        assert_eq!(matcher.find_at(haystack, 0), Ok(Some(m(0, 0))));
+        assert_eq!(matcher.find_at(haystack, 1), Ok(Some(m(1, 1))));
+        assert_eq!(matcher.find_at(haystack, 2), Ok(Some(m(2, 2))));
     }
 
     #[test]
@@ -239,12 +244,12 @@ mod tests {
         let haystack = b"a\n\nb\n";
         let matcher = EmptyLineMatcher::new(b'\n');
 
-        assert_eq!(matcher.find_at(haystack, 0), Ok(Some((2, 2))));
-        assert_eq!(matcher.find_at(haystack, 1), Ok(Some((2, 2))));
-        assert_eq!(matcher.find_at(haystack, 2), Ok(Some((2, 2))));
-        assert_eq!(matcher.find_at(haystack, 3), Ok(Some((5, 5))));
-        assert_eq!(matcher.find_at(haystack, 4), Ok(Some((5, 5))));
-        assert_eq!(matcher.find_at(haystack, 5), Ok(Some((5, 5))));
+        assert_eq!(matcher.find_at(haystack, 0), Ok(Some(m(2, 2))));
+        assert_eq!(matcher.find_at(haystack, 1), Ok(Some(m(2, 2))));
+        assert_eq!(matcher.find_at(haystack, 2), Ok(Some(m(2, 2))));
+        assert_eq!(matcher.find_at(haystack, 3), Ok(Some(m(5, 5))));
+        assert_eq!(matcher.find_at(haystack, 4), Ok(Some(m(5, 5))));
+        assert_eq!(matcher.find_at(haystack, 5), Ok(Some(m(5, 5))));
     }
 
     #[test]
@@ -252,9 +257,9 @@ mod tests {
         let haystack = b"a\n\nb\nc";
         let matcher = EmptyLineMatcher::new(b'\n');
 
-        assert_eq!(matcher.find_at(haystack, 0), Ok(Some((2, 2))));
-        assert_eq!(matcher.find_at(haystack, 1), Ok(Some((2, 2))));
-        assert_eq!(matcher.find_at(haystack, 2), Ok(Some((2, 2))));
+        assert_eq!(matcher.find_at(haystack, 0), Ok(Some(m(2, 2))));
+        assert_eq!(matcher.find_at(haystack, 1), Ok(Some(m(2, 2))));
+        assert_eq!(matcher.find_at(haystack, 2), Ok(Some(m(2, 2))));
         assert_eq!(matcher.find_at(haystack, 3), Ok(None));
         assert_eq!(matcher.find_at(haystack, 4), Ok(None));
         assert_eq!(matcher.find_at(haystack, 5), Ok(None));

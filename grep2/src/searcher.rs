@@ -8,7 +8,7 @@ use line_buffer::{
     self, BufferAllocation, LineBuffer, LineBufferBuilder, LineBufferReader,
     DEFAULT_BUFFER_CAPACITY,
 };
-use matcher::Matcher;
+use matcher::{Match, Matcher};
 use sink::{Sink, SinkMatch};
 
 /// The behavior of binary detection while searching.
@@ -504,6 +504,12 @@ impl<'b> Reader for SliceReader<'b> {
     }
 }
 
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+struct LineMatch {
+    line: Match,
+    line_number: Option<u64>,
+}
+
 #[derive(Debug)]
 struct SearcherByLine<'s, M: 's, R, S> {
     searcher: &'s Searcher<M>,
@@ -566,10 +572,10 @@ where M: Matcher,
     fn sink(&mut self) -> Result<bool, S::Error> {
         if self.config.invert_match {
             self.sink_inverted_matches()
-        } else if let Some((line_start, line_end)) = self.find()? {
-            self.count_lines(line_start);
-            let keepgoing = self.sink_matched(line_start, line_end)?;
-            self.search_pos = line_end;
+        } else if let Some(line) = self.find()? {
+            self.count_lines(line.start());
+            let keepgoing = self.sink_matched(&line)?;
+            self.search_pos = line.end();
             Ok(keepgoing)
         } else {
             self.search_pos = self.buffer().len();
@@ -580,36 +586,31 @@ where M: Matcher,
     fn sink_inverted_matches(&mut self) -> Result<bool, S::Error> {
         assert!(self.config.invert_match);
 
-        let (invert_start, invert_end) = match self.find()? {
+        let invert_match = match self.find()? {
             None => {
-                let start = self.search_pos;
-                self.search_pos = self.buffer().len();
-                (start, self.buffer().len())
+                let m = Match::new(self.search_pos, self.buffer().len());
+                self.search_pos = m.end();
+                m
             }
-            Some((mat_start, mat_end)) => {
-                let start = self.search_pos;
-                self.search_pos = mat_end;
-                (start, mat_start)
+            Some(line) => {
+                let m = Match::new(self.search_pos, line.start());
+                self.search_pos = line.end();
+                m
             }
         };
-        self.count_lines(invert_start);
-        let mut stepper = LineStep::new(
-            self.config.line_term, invert_start, invert_end);
-        while let Some((s, e)) = stepper.next(self.buffer()) {
-            if !self.sink_matched(s, e)? {
+        self.count_lines(invert_match.start());
+        let mut stepper = LineStep::new(self.config.line_term, invert_match);
+        while let Some(line) = stepper.next(self.buffer()) {
+            if !self.sink_matched(&line)? {
                 return Ok(false);
             }
-            self.add_one_line(e);
+            self.add_one_line(line.end());
         }
         Ok(true)
     }
 
-    fn sink_matched(
-        &mut self,
-        line_start: usize,
-        line_end: usize,
-    ) -> Result<bool, S::Error> {
-        if line_start == line_end {
+    fn sink_matched(&mut self, line: &Match) -> Result<bool, S::Error> {
+        if line.is_empty() {
             // The only way we can produce an empty line for a match is if
             // we match the position immediately following the last byte that
             // we search, and where that last byte is also the line terminator.
@@ -617,30 +618,28 @@ where M: Matcher,
             // point anyway.
             return Ok(false);
         }
-        let offset = self.rdr.absolute_byte_offset() + line_start as u64;
+        let offset = self.rdr.absolute_byte_offset() + line.start() as u64;
         self.sink.matched(
             self.searcher,
             &SinkMatch {
                 line_term: self.config.line_term,
-                bytes: &self.rdr.buffer()[line_start..line_end],
+                bytes: &self.rdr.buffer()[*line],
                 absolute_byte_offset: offset,
                 line_number: self.line_number,
             },
         )
     }
 
-    fn find(&mut self) -> Result<Option<(usize, usize)>, S::Error> {
+    fn find(&mut self) -> Result<Option<Match>, S::Error> {
         match self.matcher.find(self.search_buffer()) {
-            Err(err) => return Err(S::error_message(err)),
-            Ok(None) => return Ok(None),
-            Ok(Some((start, end))) => {
-                let (line_start, line_end) = lines::locate(
+            Err(err) => Err(S::error_message(err)),
+            Ok(None) => Ok(None),
+            Ok(Some(m)) => {
+                Ok(Some(lines::locate(
                     self.buffer(),
                     self.config.line_term,
-                    self.search_pos + start,
-                    self.search_pos + end,
-                );
-                Ok(Some((line_start, line_end)))
+                    m.offset(self.search_pos),
+                )))
             }
         }
     }
@@ -674,7 +673,7 @@ struct SearcherMultiLine<'s, M: 's, S> {
     sink: S,
     slice: &'s [u8],
     search_pos: usize,
-    last_match: Option<MultiLineMatch>,
+    last_match: Option<LineMatch>,
     line_number: Option<u64>,
     last_line_counted: usize,
 }
@@ -705,19 +704,14 @@ where M: Matcher,
         if self.config.invert_match {
             return self.sink_inverted_matches();
         }
-        let (mat_start, mat_end) = match self.find()? {
+        let mat = match self.find()? {
             Some(range) => range,
             None => {
                 self.search_pos = self.slice.len();
                 return Ok(true);
             }
         };
-        let (line_start, line_end) = lines::locate(
-            self.slice,
-            self.config.line_term,
-            mat_start,
-            mat_end,
-        );
+        let line = lines::locate(self.slice, self.config.line_term, mat);
         let keepgoing = match self.last_match.take() {
             None => true,
             Some(last_match) => {
@@ -725,54 +719,49 @@ where M: Matcher,
                 // in this match, then simply grow the match and move on.
                 // This happens when the next match begins on the same line
                 // that the last match ends on.
-                if last_match.line.end >= line_start {
-                    self.last_match = Some(MultiLineMatch {
-                        line: last_match.line.start..line_end,
+                if last_match.line.end() >= line.start() {
+                    self.last_match = Some(LineMatch {
+                        line: last_match.line.with_end(line.end()),
                         line_number: last_match.line_number,
                     });
-                    self.advance(mat_start, mat_end);
+                    self.advance(&mat);
                     return Ok(true);
                 } else {
                     self.sink_matched(&last_match)?
                 }
             }
         };
-        self.count_lines(line_start);
-        self.last_match = Some(MultiLineMatch {
-            line: line_start..line_end,
+        self.count_lines(line.start());
+        self.last_match = Some(LineMatch {
+            line: line,
             line_number: self.line_number,
         });
-        self.advance(mat_start, mat_end);
+        self.advance(&mat);
         Ok(keepgoing)
     }
 
     fn sink_inverted_matches(&mut self) -> Result<bool, S::Error> {
         assert!(self.config.invert_match);
 
-        let (invert_start, invert_end) = match self.find()? {
+        let invert_match = match self.find()? {
             None => {
-                let start = self.search_pos;
-                self.search_pos = self.slice.len();
-                (start, self.slice.len())
+                let m = Match::new(self.search_pos, self.slice.len());
+                self.search_pos = m.end();
+                m
             }
-            Some((mat_start, mat_end)) => {
-                let (line_start, line_end) = lines::locate(
-                    self.slice,
-                    self.config.line_term,
-                    mat_start,
-                    mat_end,
-                );
-                let start = self.search_pos;
-                self.search_pos = line_end;
-                (start, line_start)
+            Some(mat) => {
+                let line = lines::locate(
+                    self.slice, self.config.line_term, mat);
+                let m = Match::new(self.search_pos, line.start());
+                self.search_pos = line.end();
+                m
             }
         };
-        let mut stepper = LineStep::new(
-            self.config.line_term, invert_start, invert_end);
-        while let Some((s, e)) = stepper.next(self.slice) {
-            self.count_lines(s);
-            let m = MultiLineMatch {
-                line: s..e,
+        let mut stepper = LineStep::new(self.config.line_term, invert_match);
+        while let Some(line) = stepper.next(self.slice) {
+            self.count_lines(line.start());
+            let m = LineMatch {
+                line: line,
                 line_number: self.line_number,
             };
             if !self.sink_matched(&m)? {
@@ -782,8 +771,8 @@ where M: Matcher,
         Ok(true)
     }
 
-    fn sink_matched(&mut self, m: &MultiLineMatch) -> Result<bool, S::Error> {
-        if m.is_empty() {
+    fn sink_matched(&mut self, m: &LineMatch) -> Result<bool, S::Error> {
+        if m.line.is_empty() {
             // The only way we can produce an empty line for a match is if
             // we match the position immediately following the last byte that
             // we search, and where that last byte is also the line terminator.
@@ -795,20 +784,18 @@ where M: Matcher,
             self.searcher,
             &SinkMatch {
                 line_term: self.config.line_term,
-                bytes: &self.slice[m.line.clone()],
-                absolute_byte_offset: m.line.start as u64,
+                bytes: &self.slice[m.line],
+                absolute_byte_offset: m.line.start() as u64,
                 line_number: m.line_number,
             },
         )
     }
 
-    fn find(&mut self) -> Result<Option<(usize, usize)>, S::Error> {
+    fn find(&mut self) -> Result<Option<Match>, S::Error> {
         match self.matcher.find(self.search_buffer()) {
-            Err(err) => return Err(S::error_message(err)),
-            Ok(None) => return Ok(None),
-            Ok(Some((start, end))) => {
-                Ok(Some((self.search_pos + start, self.search_pos + end)))
-            }
+            Err(err) => Err(S::error_message(err)),
+            Ok(None) => Ok(None),
+            Ok(Some(m)) => Ok(Some(m.offset(self.search_pos))),
         }
     }
 
@@ -824,9 +811,9 @@ where M: Matcher,
     ///
     /// If the previous match is zero width, then this advances the search
     /// position one byte past the end of the match.
-    fn advance(&mut self, mat_start: usize, mat_end: usize) {
-        self.search_pos = mat_end;
-        if mat_start == mat_end && self.search_pos < self.slice.len() {
+    fn advance(&mut self, m: &Match) {
+        self.search_pos = m.end();
+        if m.is_empty() && self.search_pos < self.slice.len() {
             self.search_pos += 1;
         }
     }
@@ -854,8 +841,7 @@ impl MultiLineMatch {
 //
 // Where to go next? Some thoughts:
 //
-//   1a. Switch to using ops::Range instead of (usize, usize).
-//   1b. Do context handling last. (Famous last words.)
+//   1. Do context handling last. (Famous last words.)
 //   2. Binary detectiong for SliceReader. Maybe punt on Convert.
 //   3. Fill out the single-line searcher. Use optimizations. Line-by-line too.
 //   4. Fill out the logic for opening a reader in Searcher.

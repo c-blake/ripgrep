@@ -6,7 +6,7 @@ extern crate memchr;
 
 pub use lines::LineIter;
 pub use matcher::{
-    Captures, LineMatchKind, Matcher, NoCaptures, NoError,
+    Captures, LineMatchKind, Match, Matcher, NoCaptures, NoError,
 };
 pub use searcher::{
     BinaryDetection, ConfigError, MmapChoice,

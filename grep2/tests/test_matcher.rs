@@ -1,4 +1,4 @@
-use grep2::{Captures, Matcher};
+use grep2::{Captures, Match, Matcher};
 use regex::bytes::Regex;
 
 use util::{RegexMatcher, RegexMatcherNoCaps};
@@ -11,29 +11,33 @@ fn matcher_no_caps(pattern: &str) -> RegexMatcherNoCaps {
     RegexMatcherNoCaps(Regex::new(pattern).unwrap())
 }
 
+fn m(start: usize, end: usize) -> Match {
+    Match::new(start, end)
+}
+
 #[test]
 fn find() {
     let matcher = matcher(r"(\w+)\s+(\w+)");
-    assert_eq!(matcher.find(b" homer simpson ").unwrap(), Some((1, 14)));
+    assert_eq!(matcher.find(b" homer simpson ").unwrap(), Some(m(1, 14)));
 }
 
 #[test]
 fn find_iter() {
     let matcher = matcher(r"(\w+)\s+(\w+)");
     let mut matches = vec![];
-    matcher.find_iter(b"aa bb cc dd", |s, e| {
-        matches.push((s, e));
+    matcher.find_iter(b"aa bb cc dd", |m| {
+        matches.push(m);
         true
     }).unwrap();
-    assert_eq!(matches, vec![(0, 5), (6, 11)]);
+    assert_eq!(matches, vec![m(0, 5), m(6, 11)]);
 
     // Test that find_iter respects short circuiting.
     matches.clear();
-    matcher.find_iter(b"aa bb cc dd", |s, e| {
-        matches.push((s, e));
+    matcher.find_iter(b"aa bb cc dd", |m| {
+        matches.push(m);
         false
     }).unwrap();
-    assert_eq!(matches, vec![(0, 5)]);
+    assert_eq!(matches, vec![m(0, 5)]);
 }
 
 #[test]
@@ -56,9 +60,9 @@ fn captures() {
 
     let mut caps = matcher.new_captures().unwrap();
     assert!(matcher.captures(b" homer simpson ", &mut caps).unwrap());
-    assert_eq!(caps.get(0), Some((1, 14)));
-    assert_eq!(caps.get(1), Some((1, 6)));
-    assert_eq!(caps.get(2), Some((7, 14)));
+    assert_eq!(caps.get(0), Some(m(1, 14)));
+    assert_eq!(caps.get(1), Some(m(1, 6)));
+    assert_eq!(caps.get(2), Some(m(7, 14)));
 }
 
 #[test]
@@ -73,8 +77,8 @@ fn captures_iter() {
         true
     }).unwrap();
     assert_eq!(matches, vec![
-        (0, 5), (0, 2), (3, 5),
-        (6, 11), (6, 8), (9, 11),
+        m(0, 5), m(0, 2), m(3, 5),
+        m(6, 11), m(6, 8), m(9, 11),
     ]);
 
     // Test that captures_iter respects short circuiting.
@@ -86,7 +90,7 @@ fn captures_iter() {
         false
     }).unwrap();
     assert_eq!(matches, vec![
-        (0, 5), (0, 2), (3, 5),
+        m(0, 5), m(0, 2), m(3, 5),
     ]);
 }
 
@@ -116,7 +120,7 @@ fn no_captures() {
 fn replace() {
     let matcher = matcher(r"(\w+)\s+(\w+)");
     let mut dst = vec![];
-    matcher.replace(b"aa bb cc dd", &mut dst, |_, _, dst| {
+    matcher.replace(b"aa bb cc dd", &mut dst, |_, dst| {
         dst.push(b'z');
         true
     }).unwrap();
@@ -124,7 +128,7 @@ fn replace() {
 
     // Test that replacements respect short circuiting.
     dst.clear();
-    matcher.replace(b"aa bb cc dd", &mut dst, |_, _, dst| {
+    matcher.replace(b"aa bb cc dd", &mut dst, |_, dst| {
         dst.push(b'z');
         false
     }).unwrap();

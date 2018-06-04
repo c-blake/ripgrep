@@ -1,6 +1,106 @@
 use std::fmt;
+use std::ops;
 
 use interpolate::interpolate;
+
+/// The type of a match.
+///
+/// The type of a match is a possibly empty range pointing to a contiguous
+/// block of addressable memory.
+///
+/// Every `Match` is guaranteed to satisfy the invariant that `start <= end`.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct Match {
+    start: usize,
+    end: usize,
+}
+
+impl Match {
+    /// Create a new match.
+    ///
+    /// # Panics
+    ///
+    /// This function panics if `start > end`.
+    pub fn new(start: usize, end: usize) -> Match {
+        assert!(start <= end);
+        Match { start, end }
+    }
+
+    /// Creates a zero width match at the given offset.
+    pub fn zero(offset: usize) -> Match {
+        Match { start: offset, end: offset }
+    }
+
+    /// Return the start offset of this match.
+    pub fn start(&self) -> usize {
+        self.start
+    }
+
+    /// Return the end offset of this match.
+    pub fn end(&self) -> usize {
+        self.end
+    }
+
+    /// Return a new match with the start offset replaced with the given
+    /// value.
+    pub fn with_start(&self, start: usize) -> Match {
+        Match { start, ..*self }
+    }
+
+    /// Return a new match with the end offset replaced with the given
+    /// value.
+    pub fn with_end(&self, end: usize) -> Match {
+        Match { end, ..*self }
+    }
+
+    /// Offset this match by the given amount and return a new match.
+    ///
+    /// This adds the given offset to the start and end of this match, and
+    /// returns the resulting match.
+    ///
+    /// # Panics
+    ///
+    /// This panics if adding the given amount to either the start or end
+    /// offset would result in an overflow.
+    pub fn offset(&self, amount: usize) -> Match {
+        Match {
+            start: self.start.checked_add(amount).unwrap(),
+            end: self.end.checked_add(amount).unwrap(),
+        }
+    }
+
+    /// Returns the number of bytes in this match.
+    pub fn len(&self) -> usize {
+        self.end - self.start
+    }
+
+    /// Returns true if and only if this match is empty.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+impl ops::Index<Match> for [u8] {
+    type Output = [u8];
+
+    fn index(&self, index: Match) -> &[u8] {
+        &self[index.start..index.end]
+    }
+}
+
+impl ops::IndexMut<Match> for [u8] {
+    fn index_mut(&mut self, index: Match) -> &mut [u8] {
+        &mut self[index.start..index.end]
+    }
+}
+
+impl ops::Index<Match> for str {
+    type Output = str;
+
+    fn index(&self, index: Match) -> &str {
+        &self[index.start..index.end]
+    }
+}
 
 /// A trait that describes implementations of capturing groups.
 ///
@@ -28,7 +128,7 @@ pub trait Captures {
     /// When a matcher reports a match with capturing groups, then the first
     /// capturing group (at index `0`) must always correspond to the offsets
     /// for the overall match.
-    fn get(&self, i: usize) -> Option<(usize, usize)>;
+    fn get(&self, i: usize) -> Option<Match>;
 
     /// Returns true if and only if these captures are empty. This occurs
     /// when `len` is `0`.
@@ -75,8 +175,8 @@ pub trait Captures {
         interpolate(
             replacement,
             |i, dst| {
-                if let Some((s, e)) = self.get(i) {
-                    dst.extend(&haystack[s..e]);
+                if let Some(range) = self.get(i) {
+                    dst.extend(&haystack[range]);
                 }
             },
             name_to_index,
@@ -99,7 +199,7 @@ impl NoCaptures {
 
 impl Captures for NoCaptures {
     fn len(&self) -> usize { 0 }
-    fn get(&self, _: usize) -> Option<(usize, usize)> { None }
+    fn get(&self, _: usize) -> Option<Match> { None }
 }
 
 /// NoError provides an error type for matchers that never produce errors.
@@ -204,7 +304,7 @@ pub trait Matcher {
         &self,
         haystack: &[u8],
         at: usize,
-    ) -> Result<Option<(usize, usize)>, Self::Error>;
+    ) -> Result<Option<Match>, Self::Error>;
 
     /// Creates an empty group of captures suitable for use with the capturing
     /// APIs of this trait.
@@ -278,7 +378,7 @@ pub trait Matcher {
     fn find(
         &self,
         haystack: &[u8],
-    ) -> Result<Option<(usize, usize)>, Self::Error> {
+    ) -> Result<Option<Match>, Self::Error> {
         self.find_at(haystack, 0)
     }
 
@@ -290,7 +390,7 @@ pub trait Matcher {
         haystack: &[u8],
         mut matched: F,
     ) -> Result<(), Self::Error>
-    where F: FnMut(usize, usize) -> bool
+    where F: FnMut(Match) -> bool
     {
         let mut last_end = 0;
         let mut last_match = None;
@@ -299,25 +399,25 @@ pub trait Matcher {
             if last_end > haystack.len() {
                 return Ok(());
             }
-            let (s, e) = match self.find_at(haystack, last_end)? {
+            let m = match self.find_at(haystack, last_end)? {
                 None => return Ok(()),
-                Some((s, e)) => (s, e),
+                Some(m) => m,
             };
-            if s == e {
+            if m.start == m.end {
                 // This is an empty match. To ensure we make progress, start
                 // the next search at the smallest possible starting position
                 // of the next match following this one.
-                last_end = e + 1;
+                last_end = m.end + 1;
                 // Don't accept empty matches immediately following a match.
                 // Just move on to the next match.
-                if Some(e) == last_match {
+                if Some(m.end) == last_match {
                     continue;
                 }
             } else {
-                last_end = e;
+                last_end = m.end;
             }
-            last_match = Some(e);
-            if !matched(s, e) {
+            last_match = Some(m.end);
+            if !matched(m) {
                 return Ok(());
             }
         }
@@ -358,21 +458,21 @@ pub trait Matcher {
             if !self.captures_at(haystack, last_end, caps)? {
                 return Ok(());
             }
-            let (s, e) = caps.get(0).unwrap();
-            if s == e {
+            let m = caps.get(0).unwrap();
+            if m.start == m.end {
                 // This is an empty match. To ensure we make progress, start
                 // the next search at the smallest possible starting position
                 // of the next match following this one.
-                last_end = e + 1;
+                last_end = m.end + 1;
                 // Don't accept empty matches immediately following a match.
                 // Just move on to the next match.
-                if Some(e) == last_match {
+                if Some(m.end) == last_match {
                     continue;
                 }
             } else {
-                last_end = e;
+                last_end = m.end;
             }
-            last_match = Some(e);
+            last_match = Some(m.end);
             if !matched(caps) {
                 return Ok(());
             }
@@ -390,13 +490,13 @@ pub trait Matcher {
         dst: &mut Vec<u8>,
         mut append: F,
     ) -> Result<(), Self::Error>
-    where F: FnMut(usize, usize, &mut Vec<u8>) -> bool
+    where F: FnMut(Match, &mut Vec<u8>) -> bool
     {
         let mut last_match = 0;
-        self.find_iter(haystack, |start, end| {
-            dst.extend(&haystack[last_match..start]);
-            last_match = end;
-            append(start, end, dst)
+        self.find_iter(haystack, |m| {
+            dst.extend(&haystack[last_match..m.start]);
+            last_match = m.end;
+            append(m, dst)
         })?;
         dst.extend(&haystack[last_match..]);
         Ok(())
@@ -417,9 +517,9 @@ pub trait Matcher {
     {
         let mut last_match = 0;
         self.captures_iter(haystack, caps, |caps| {
-            let (start, end) = caps.get(0).unwrap();
-            dst.extend(&haystack[last_match..start]);
-            last_match = end;
+            let m = caps.get(0).unwrap();
+            dst.extend(&haystack[last_match..m.start]);
+            last_match = m.end;
             append(caps, dst)
         })?;
         dst.extend(&haystack[last_match..]);
@@ -444,7 +544,7 @@ pub trait Matcher {
         &self,
         haystack: &[u8],
     ) -> Result<Option<usize>, Self::Error> {
-        Ok(self.find(haystack)?.map(|(_, end)| end))
+        Ok(self.find(haystack)?.map(|m| m.end))
     }
 
     /// If this matcher was compiled as a line oriented matcher, then this
@@ -514,7 +614,7 @@ impl<'a, M: Matcher> Matcher for &'a M {
         &self,
         haystack: &[u8],
         at: usize,
-    ) -> Result<Option<(usize, usize)>, Self::Error> {
+    ) -> Result<Option<Match>, Self::Error> {
         (*self).find_at(haystack, at)
     }
 
@@ -542,7 +642,7 @@ impl<'a, M: Matcher> Matcher for &'a M {
     fn find(
         &self,
         haystack: &[u8]
-    ) -> Result<Option<(usize, usize)>, Self::Error> {
+    ) -> Result<Option<Match>, Self::Error> {
         (*self).find(haystack)
     }
 
@@ -551,7 +651,7 @@ impl<'a, M: Matcher> Matcher for &'a M {
         haystack: &[u8],
         matched: F,
     ) -> Result<(), Self::Error>
-    where F: FnMut(usize, usize) -> bool
+    where F: FnMut(Match) -> bool
     {
         (*self).find_iter(haystack, matched)
     }
@@ -581,7 +681,7 @@ impl<'a, M: Matcher> Matcher for &'a M {
         dst: &mut Vec<u8>,
         append: F,
     ) -> Result<(), Self::Error>
-    where F: FnMut(usize, usize, &mut Vec<u8>) -> bool
+    where F: FnMut(Match, &mut Vec<u8>) -> bool
     {
         (*self).replace(haystack, dst, append)
     }

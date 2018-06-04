@@ -5,6 +5,8 @@ A collection of routines for performing operations on lines.
 use bytecount;
 use memchr::{memchr, memrchr};
 
+use matcher::Match;
+
 /// Count the number of occurrences of `line_term` in `bytes`.
 pub fn count(bytes: &[u8], line_term: u8) -> u64 {
     bytecount::count(bytes, line_term) as u64
@@ -17,19 +19,18 @@ pub fn count(bytes: &[u8], line_term: u8) -> u64 {
 pub fn locate(
     bytes: &[u8],
     line_term: u8,
-    start: usize,
-    end: usize,
-) -> (usize, usize) {
-    let line_start = memrchr(line_term, &bytes[0..start])
+    range: Match,
+) -> Match {
+    let line_start = memrchr(line_term, &bytes[0..range.start()])
         .map_or(0, |i| i + 1);
     let line_end =
-        if end > line_start && bytes[end - 1] == line_term {
-            end
+        if range.end() > line_start && bytes[range.end() - 1] == line_term {
+            range.end()
         } else {
-            memchr(line_term, &bytes[end..])
-            .map_or(bytes.len(), |i| end + i + 1)
+            memchr(line_term, &bytes[range.end()..])
+            .map_or(bytes.len(), |i| range.end() + i + 1)
         };
-    (line_start, line_end)
+    Match::new(line_start, line_end)
 }
 
 /// An iterator over lines in a particular slice of bytes.
@@ -49,7 +50,7 @@ impl<'b> LineIter<'b> {
     pub(crate) fn new(line_term: u8, bytes: &'b [u8]) -> LineIter<'b> {
         LineIter {
             bytes: bytes,
-            stepper: LineStep::new(line_term, 0, bytes.len()),
+            stepper: LineStep::new(line_term, Match::new(0, bytes.len())),
         }
     }
 }
@@ -58,7 +59,7 @@ impl<'b> Iterator for LineIter<'b> {
     type Item = &'b [u8];
 
     fn next(&mut self) -> Option<&'b [u8]> {
-        self.stepper.next(self.bytes).map(|(s, e)| &self.bytes[s..e])
+        self.stepper.next(self.bytes).map(|m| &self.bytes[m])
     }
 }
 
@@ -83,9 +84,8 @@ impl LineStep {
     /// same slice must be provided to each call.
     ///
     /// This panics if `start` is not less than or equal to `end`.
-    pub fn new(line_term: u8, start: usize, end: usize) -> LineStep {
-        assert!(start <= end);
-        LineStep { line_term, pos: start, end }
+    pub fn new(line_term: u8, range: Match) -> LineStep {
+        LineStep { line_term, pos: range.start(), end: range.end() }
     }
 
     /// Return the start and end position of the next line in the given bytes.
@@ -94,22 +94,22 @@ impl LineStep {
     /// `next`.
     ///
     /// The range returned includes the line terminator.
-    pub fn next(&mut self, mut bytes: &[u8]) -> Option<(usize, usize)> {
+    pub fn next(&mut self, mut bytes: &[u8]) -> Option<Match> {
         bytes = &bytes[..self.end];
         match memchr(self.line_term, &bytes[self.pos..]) {
             None => {
                 if self.pos < bytes.len() {
-                    let start = self.pos;
-                    self.pos = bytes.len();
-                    Some((start, bytes.len()))
+                    let m = Match::new(self.pos, bytes.len());
+                    self.pos = m.end();
+                    Some(m)
                 } else {
                     None
                 }
             }
             Some(line_end) => {
-                let (start, end) = (self.pos, self.pos + line_end + 1);
-                self.pos = end;
-                Some((start, end))
+                let m = Match::new(self.pos, self.pos + line_end + 1);
+                self.pos = m.end();
+                Some(m)
             }
         }
     }
@@ -169,6 +169,7 @@ fn preceding_by_pos(
 mod tests {
     use std::ops::Range;
     use std::str;
+    use matcher::Match;
     use super::*;
 
     const SHERLOCK: &'static str = "\
@@ -180,20 +181,24 @@ but Doctor Watson has to have it taken out for him and dusted,
 and exhibited clearly, with a label attached.\
 ";
 
+    fn m(start: usize, end: usize) -> Match {
+        Match::new(start, end)
+    }
+
     fn lines(text: &str) -> Vec<&str> {
         let mut results = vec![];
-        let mut it = LineStep::new(b'\n', 0, text.len());
-        while let Some((start, end)) = it.next(text.as_bytes()) {
-            results.push(&text[start..end]);
+        let mut it = LineStep::new(b'\n', m(0, text.len()));
+        while let Some(m) = it.next(text.as_bytes()) {
+            results.push(&text[m]);
         }
         results
     }
 
     fn line_ranges(text: &str) -> Vec<Range<usize>> {
         let mut results = vec![];
-        let mut it = LineStep::new(b'\n', 0, text.len());
-        while let Some((start, end)) = it.next(text.as_bytes()) {
-            results.push(Range { start, end });
+        let mut it = LineStep::new(b'\n', m(0, text.len()));
+        while let Some(m) = it.next(text.as_bytes()) {
+            results.push(m.start()..m.end());
         }
         results
     }
@@ -202,8 +207,8 @@ and exhibited clearly, with a label attached.\
         preceding_by_pos(text.as_bytes(), pos, b'\n', count)
     }
 
-    fn loc(text: &str, start: usize, end: usize) -> (usize, usize) {
-        locate(text.as_bytes(), b'\n', start, end)
+    fn loc(text: &str, start: usize, end: usize) -> Match {
+        locate(text.as_bytes(), b'\n', Match::new(start, end))
     }
 
     #[test]
@@ -221,50 +226,50 @@ and exhibited clearly, with a label attached.\
 
         assert_eq!(
             loc(t, lines[0].start, lines[0].end),
-            (lines[0].start, lines[0].end));
+            m(lines[0].start, lines[0].end));
         assert_eq!(
             loc(t, lines[0].start + 1, lines[0].end),
-            (lines[0].start, lines[0].end));
+            m(lines[0].start, lines[0].end));
         assert_eq!(
             loc(t, lines[0].end - 1, lines[0].end),
-            (lines[0].start, lines[0].end));
+            m(lines[0].start, lines[0].end));
         assert_eq!(
             loc(t, lines[0].end, lines[0].end),
-            (lines[1].start, lines[1].end));
+            m(lines[1].start, lines[1].end));
 
         assert_eq!(
             loc(t, lines[5].start, lines[5].end),
-            (lines[5].start, lines[5].end));
+            m(lines[5].start, lines[5].end));
         assert_eq!(
             loc(t, lines[5].start + 1, lines[5].end),
-            (lines[5].start, lines[5].end));
+            m(lines[5].start, lines[5].end));
         assert_eq!(
             loc(t, lines[5].end - 1, lines[5].end),
-            (lines[5].start, lines[5].end));
+            m(lines[5].start, lines[5].end));
         assert_eq!(
             loc(t, lines[5].end, lines[5].end),
-            (lines[5].start, lines[5].end));
+            m(lines[5].start, lines[5].end));
     }
 
     #[test]
     fn line_locate_weird() {
-        assert_eq!(loc("", 0, 0), (0, 0));
+        assert_eq!(loc("", 0, 0), m(0, 0));
 
-        assert_eq!(loc("\n", 0, 1), (0, 1));
-        assert_eq!(loc("\n", 1, 1), (1, 1));
+        assert_eq!(loc("\n", 0, 1), m(0, 1));
+        assert_eq!(loc("\n", 1, 1), m(1, 1));
 
-        assert_eq!(loc("\n\n", 0, 0), (0, 1));
-        assert_eq!(loc("\n\n", 0, 1), (0, 1));
-        assert_eq!(loc("\n\n", 1, 1), (1, 2));
-        assert_eq!(loc("\n\n", 1, 2), (1, 2));
-        assert_eq!(loc("\n\n", 2, 2), (2, 2));
+        assert_eq!(loc("\n\n", 0, 0), m(0, 1));
+        assert_eq!(loc("\n\n", 0, 1), m(0, 1));
+        assert_eq!(loc("\n\n", 1, 1), m(1, 2));
+        assert_eq!(loc("\n\n", 1, 2), m(1, 2));
+        assert_eq!(loc("\n\n", 2, 2), m(2, 2));
 
-        assert_eq!(loc("a\nb\nc", 0, 1), (0, 2));
-        assert_eq!(loc("a\nb\nc", 1, 2), (0, 2));
-        assert_eq!(loc("a\nb\nc", 2, 3), (2, 4));
-        assert_eq!(loc("a\nb\nc", 3, 4), (2, 4));
-        assert_eq!(loc("a\nb\nc", 4, 5), (4, 5));
-        assert_eq!(loc("a\nb\nc", 5, 5), (4, 5));
+        assert_eq!(loc("a\nb\nc", 0, 1), m(0, 2));
+        assert_eq!(loc("a\nb\nc", 1, 2), m(0, 2));
+        assert_eq!(loc("a\nb\nc", 2, 3), m(2, 4));
+        assert_eq!(loc("a\nb\nc", 3, 4), m(2, 4));
+        assert_eq!(loc("a\nb\nc", 4, 5), m(4, 5));
+        assert_eq!(loc("a\nb\nc", 5, 5), m(4, 5));
     }
 
     #[test]
@@ -287,7 +292,7 @@ and exhibited clearly, with a label attached.\
 
     #[test]
     fn line_iter_empty() {
-        let mut it = LineStep::new(b'\n', 0, 0);
+        let mut it = LineStep::new(b'\n', m(0, 0));
         assert_eq!(it.next(b"abc"), None);
     }
 
