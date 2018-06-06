@@ -3,7 +3,6 @@ use std::cmp;
 use std::fmt;
 use std::fs::File;
 use std::io::{self, Read};
-use std::ops::Range;
 
 use memchr::memchr;
 
@@ -1045,24 +1044,6 @@ where M: Matcher,
             return true;
         }
         false
-    }
-}
-
-#[derive(Clone, Debug)]
-struct MultiLineMatch {
-    line: Range<usize>,
-    line_number: Option<u64>,
-}
-
-impl MultiLineMatch {
-    /// Returns the length of this match, in bytes.
-    fn len(&self) -> usize {
-        self.line.end.checked_sub(self.line.start).unwrap()
-    }
-
-    /// Returns true if and only if this match is empty.
-    fn is_empty(&self) -> bool {
-        self.len() == 0
     }
 }
 
