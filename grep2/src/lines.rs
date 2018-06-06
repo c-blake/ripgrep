@@ -12,6 +12,16 @@ pub fn count(bytes: &[u8], line_term: u8) -> u64 {
     bytecount::count(bytes, line_term) as u64
 }
 
+/// Given a line that possibly ends with a terminator, return that line without
+/// the terminator.
+pub fn without_terminator(bytes: &[u8], line_term: u8) -> &[u8] {
+    if !bytes.is_empty() && bytes[bytes.len() - 1] == line_term {
+        &bytes[..bytes.len() - 1]
+    } else {
+        bytes
+    }
+}
+
 /// Return the start and end offsets of the lines containing the given range
 /// of bytes.
 ///
@@ -69,6 +79,8 @@ impl<'b> Iterator for LineIter<'b> {
 /// callers to explicitly provide the bytes when moving through the iterator.
 /// While not idiomatic, this provides a simple way of iterating over lines
 /// that doesn't require borrowing the slice itself, which can be convenient.
+///
+/// Lines yielded by this iterator are never empty.
 #[derive(Debug)]
 pub struct LineStep {
     line_term: u8,

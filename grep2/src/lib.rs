@@ -1,7 +1,6 @@
 #![allow(dead_code)]
 
 extern crate bytecount;
-extern crate failure;
 extern crate memchr;
 
 pub use lines::LineIter;

@@ -2,8 +2,10 @@ use std::fmt;
 use std::io::{self, Write};
 use std::str;
 
+use memchr::memchr;
+
 use lines;
-use matcher::{Match, Matcher, NoCaptures, NoError};
+use matcher::{LineMatchKind, Match, Matcher, NoCaptures, NoError};
 use searcher::Searcher;
 use sink::{Sink, SinkContext, SinkFinish, SinkMatch};
 
@@ -15,6 +17,7 @@ use sink::{Sink, SinkContext, SinkFinish, SinkMatch};
 pub struct SubstringMatcher {
     pattern: String,
     line_term: Option<u8>,
+    every_line_is_candidate: bool,
 }
 
 impl SubstringMatcher {
@@ -22,8 +25,37 @@ impl SubstringMatcher {
     pub fn new(pattern: &str) -> SubstringMatcher {
         SubstringMatcher {
             pattern: pattern.to_string(),
-            line_term: if pattern.contains('\n') { Some(b'\n') } else { None },
+            line_term: None,
+            every_line_is_candidate: false,
         }
+    }
+
+    /// Forcefully set the line terminator of this matcher.
+    ///
+    /// By default, this matcher has no line terminator set.
+    ///
+    /// This panics if the pattern string contains the given line terminator.
+    pub fn set_line_term(
+        &mut self,
+        line_term: Option<u8>,
+    ) -> &mut SubstringMatcher {
+        if let Some(b) = line_term {
+            let bytes = self.pattern.as_bytes();
+            assert!(bytes.iter().position(|&x| x == b).is_none());
+        }
+        self.line_term = line_term;
+        self
+    }
+
+    /// Whether to return every line as a candidate or not.
+    ///
+    /// This forces searchers to handle the case of reporting a false positive.
+    pub fn every_line_is_candidate(
+        &mut self,
+        yes: bool,
+    ) -> &mut SubstringMatcher {
+        self.every_line_is_candidate = yes;
+        self
     }
 }
 
@@ -44,6 +76,30 @@ impl Matcher for SubstringMatcher {
 
     fn new_captures(&self) -> Result<NoCaptures, str::Utf8Error> {
         Ok(NoCaptures::new())
+    }
+
+    fn line_terminator(&self) -> Option<u8> {
+        self.line_term
+    }
+
+    fn find_candidate_line(
+        &self,
+        haystack: &[u8],
+    ) -> Result<Option<LineMatchKind>, str::Utf8Error> {
+        if self.every_line_is_candidate {
+            assert!(self.line_term.is_some());
+            if haystack.is_empty() {
+                return Ok(None);
+            }
+            // Make it interesting and return the last byte in the current
+            // line.
+            let i = memchr(self.line_term.unwrap(), haystack)
+                .map(|i| i)
+                .unwrap_or(haystack.len() - 1);
+            Ok(Some(LineMatchKind::Candidate(i)))
+        } else {
+            Ok(self.shortest_match(haystack)?.map(LineMatchKind::Confirmed))
+        }
     }
 }
 

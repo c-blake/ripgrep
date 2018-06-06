@@ -555,7 +555,7 @@ pub trait Matcher {
     /// It is **never wrong** to return `None`, but returning a line terminator
     /// when it can appear in a match is unspecified behavior.
     ///
-    /// A line terminator is typically `b'\n'`, but can be any single byte.
+    /// The line terminator is typically `b'\n'`, but can be any single byte.
     fn line_terminator(&self) -> Option<u8> {
         None
     }

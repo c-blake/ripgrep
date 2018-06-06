@@ -12,7 +12,7 @@ use line_buffer::{
     self, BufferAllocation, LineBuffer, LineBufferBuilder, LineBufferReader,
     DEFAULT_BUFFER_CAPACITY, alloc_error,
 };
-use matcher::{Match, Matcher};
+use matcher::{LineMatchKind, Match, Matcher};
 use sink::{Sink, SinkFinish, SinkMatch};
 
 /// The behavior of binary detection while searching.
@@ -753,17 +753,66 @@ where M: Matcher,
     }
 
     fn find(&mut self) -> Result<Option<Match>, S::Error> {
-        match self.matcher.find(self.search_buffer()) {
-            Err(err) => Err(S::error_message(err)),
-            Ok(None) => Ok(None),
-            Ok(Some(m)) => {
-                Ok(Some(lines::locate(
-                    self.buffer(),
-                    self.config.line_term,
-                    m.offset(self.search_pos),
-                )))
+        if let Some(line_term) = self.matcher.line_terminator() {
+            // This is checked by the search builder.
+            assert_eq!(line_term, self.config.line_term);
+            self.find_fast()
+        } else {
+            self.find_by_line()
+        }
+    }
+
+    fn find_fast(&mut self) -> Result<Option<Match>, S::Error> {
+        let buf = &self.rdr.buffer();
+        let mut pos = self.search_pos;
+        while !buf[pos..].is_empty() {
+            match self.matcher.find_candidate_line(&buf[pos..]) {
+                Err(err) => return Err(S::error_message(err)),
+                Ok(None) => return Ok(None),
+                Ok(Some(LineMatchKind::Confirmed(i))) => {
+                    return Ok(Some(lines::locate(
+                        self.buffer(),
+                        self.config.line_term,
+                        Match::zero(i).offset(pos),
+                    )));
+                }
+                Ok(Some(LineMatchKind::Candidate(i))) => {
+                    let line = lines::locate(
+                        self.rdr.buffer(),
+                        self.config.line_term,
+                        Match::zero(i).offset(pos),
+                    );
+                    let slice = lines::without_terminator(
+                        &buf[line],
+                        self.config.line_term,
+                    );
+                    match self.matcher.shortest_match(slice) {
+                        Err(err) => return Err(S::error_message(err)),
+                        Ok(Some(_)) => return Ok(Some(line)),
+                        Ok(None) => {
+                            pos = line.end();
+                            continue;
+                        }
+                    }
+                }
             }
         }
+        Ok(None)
+    }
+
+    fn find_by_line(&mut self) -> Result<Option<Match>, S::Error> {
+        let range = Match::new(0, self.search_buffer().len());
+        let mut stepper = LineStep::new(self.config.line_term, range);
+        while let Some(line) = stepper.next(self.search_buffer()) {
+            let slice = lines::without_terminator(
+                &self.search_buffer()[line], self.config.line_term);
+            match self.matcher.shortest_match(slice) {
+                Err(err) => return Err(S::error_message(err)),
+                Ok(Some(_)) => return Ok(Some(line.offset(self.search_pos))),
+                Ok(None) => continue,
+            }
+        }
+        Ok(None)
     }
 
     fn count_remaining_lines(&mut self) {
@@ -1004,7 +1053,10 @@ impl MultiLineMatch {
 // Where to go next? Some thoughts:
 //
 //   1. Do context handling last. (Famous last words.)
-//   2. Fill out the single-line searcher. Use optimizations. Line-by-line too.
+//   2. The find_by_line implementation is a little weird. We might want a
+//      completely different searcher for that case.
+//      2. The find_by_line implementation is a little weird. We might want a
+//         completely different searcher for that case.
 //   3. Fill out the logic for opening a reader in Searcher.
 //
 // Massive cleanup. Get things working and then search for simplications.
@@ -1035,12 +1087,28 @@ and exhibited clearly, with a label attached.\
         expected: &str,
         haystack: &str,
         pattern: &str,
-        build: F,
+        mut build: F,
     )
     where F: FnMut(&mut SearcherBuilder) -> &mut SearcherBuilder
     {
-        let matcher = SubstringMatcher::new(pattern);
-        search_assert_all_matcher(expected, haystack, matcher, build)
+        let mut matcher = SubstringMatcher::new(pattern);
+        search_assert_all_matcher(expected, haystack, &matcher, &mut build);
+
+        // If we're testing single line search, then set the line terminator
+        // to force the searcher to use the fast path. This doesn't matter for
+        // multi line search (and multi line search tests usually include the
+        // line terminator in the pattern).
+        if !build(&mut SearcherBuilder::new()).config.multi_line {
+            matcher.set_line_term(Some(b'\n'));
+            search_assert_all_matcher(
+                expected, haystack, &matcher, &mut build);
+
+            // Also, exercise the line oriented optimization by forcing the
+            // matcher to report every single line as a candidate match.
+            matcher.every_line_is_candidate(true);
+            search_assert_all_matcher(
+                expected, haystack, &matcher, &mut build);
+        }
     }
 
     /// Executes the given search on all available searchers, and asserts that
