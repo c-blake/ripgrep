@@ -3,7 +3,7 @@ use std::io;
 
 use lines::LineIter;
 use matcher::Matcher;
-use searcher::{ConfigError, Searcher};
+use searcher_builder::{ConfigError, Searcher};
 
 pub trait Sink {
     type Error;

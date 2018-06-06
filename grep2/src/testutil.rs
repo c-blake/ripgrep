@@ -6,7 +6,7 @@ use memchr::memchr;
 
 use lines;
 use matcher::{LineMatchKind, Match, Matcher, NoCaptures, NoError};
-use searcher::Searcher;
+use searcher_builder::Searcher;
 use sink::{Sink, SinkContext, SinkFinish, SinkMatch};
 
 /// A simple substring matcher that requires UTF-8.
