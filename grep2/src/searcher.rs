@@ -1,15 +1,19 @@
 use std::cell::RefCell;
+use std::cmp;
 use std::fmt;
-use std::io;
+use std::fs::File;
+use std::io::{self, Read};
 use std::ops::Range;
+
+use memchr::memchr;
 
 use lines::{self, LineStep};
 use line_buffer::{
     self, BufferAllocation, LineBuffer, LineBufferBuilder, LineBufferReader,
-    DEFAULT_BUFFER_CAPACITY,
+    DEFAULT_BUFFER_CAPACITY, alloc_error,
 };
 use matcher::{Match, Matcher};
-use sink::{Sink, SinkMatch};
+use sink::{Sink, SinkFinish, SinkMatch};
 
 /// The behavior of binary detection while searching.
 ///
@@ -113,8 +117,6 @@ struct Config {
     line_term: u8,
     /// Whether to invert matching.
     invert_match: bool,
-    /// Whether to quit searching after a match is found.
-    stop_after_first_match: bool,
     /// The number of lines after a match to include.
     after_context: usize,
     /// The number of lines before a match to include.
@@ -139,7 +141,6 @@ impl Default for Config {
         Config {
             line_term: b'\n',
             invert_match: false,
-            stop_after_first_match: false,
             after_context: 0,
             before_context: 0,
             line_number: false,
@@ -261,6 +262,7 @@ impl SearcherBuilder {
             config: self.config.clone(),
             matcher: matcher,
             line_buffer: RefCell::new(self.config.line_buffer()),
+            multi_line_buffer: vec![],
         })
     }
 
@@ -271,14 +273,6 @@ impl SearcherBuilder {
 
     pub fn invert_match(&mut self, yes: bool) -> &mut SearcherBuilder {
         self.config.invert_match = yes;
-        self
-    }
-
-    pub fn stop_after_first_match(
-        &mut self,
-        yes: bool,
-    ) -> &mut SearcherBuilder {
-        self.config.stop_after_first_match = yes;
         self
     }
 
@@ -344,6 +338,13 @@ pub struct Searcher<M> {
     /// we statically prevent callers from causing RefCell to panic at runtime
     /// due to a borrowing violation.
     line_buffer: RefCell<LineBuffer>,
+    /// A buffer in which to store the contents of a reader when performing a
+    /// multi line search. In particular, multi line searches cannot be
+    /// performed incrementally, and need the entire haystack in memory at
+    /// once.
+    ///
+    /// This is a RefCell for the same reason that line_buffer is a RefCell.
+    multi_line_buffer: Vec<u8>,
 }
 
 impl<M> Searcher<M>
@@ -352,19 +353,17 @@ where M: Matcher,
 {
     pub fn search_reader<R: io::Read, S: Sink>(
         &mut self,
-        mut read_from: R,
+        read_from: R,
         write_to: S,
     ) -> Result<(), S::Error> {
         if self.config.multi_line {
-            let mut bytes = vec![];
-            if let Err(err) = read_from.read_to_end(&mut bytes) {
-                return Err(S::error_io(err));
-            }
-            return self.search_slice(&bytes, write_to);
+            self.fill_multi_line_buffer_from_reader::<R, S>(read_from)?;
+            self.search_multi_line(&self.multi_line_buffer, write_to)
+        } else {
+            let mut line_buffer = self.line_buffer.borrow_mut();
+            let rdr = LineBufferReader::new(read_from, &mut *line_buffer);
+            self.search_by_line(rdr, write_to)
         }
-        let mut line_buffer = self.line_buffer.borrow_mut();
-        let rdr = LineBufferReader::new(read_from, &mut *line_buffer);
-        self.search(rdr, write_to)
     }
 
     pub fn search_slice<S: Sink>(
@@ -373,28 +372,19 @@ where M: Matcher,
         write_to: S,
     ) -> Result<(), S::Error> {
         if self.config.multi_line {
-            SearcherMultiLine {
-                searcher: self,
-                config: &self.config,
-                matcher: &self.matcher,
-                sink: write_to,
-                slice: slice,
-                search_pos: 0,
-                last_match: None,
-                line_number:
-                    if self.config.line_number { Some(1) } else { None },
-                last_line_counted: 0,
-            }.run()
+            self.search_multi_line(slice, write_to)
         } else {
-            self.search(SliceReader::new(slice), write_to)
+            self.search_by_line(SliceReader::new(slice), write_to)
         }
     }
 
-    fn search<R: Reader, S: Sink>(
+    fn search_by_line<R: Reader, S: Sink>(
         &self,
         read_from: R,
         write_to: S,
     ) -> Result<(), S::Error> {
+        assert!(!self.config.multi_line);
+
         SearcherByLine {
             searcher: self,
             config: &self.config,
@@ -405,6 +395,106 @@ where M: Matcher,
             line_number: if self.config.line_number { Some(1) } else { None },
             last_line_counted: 0,
         }.run()
+    }
+
+    fn search_multi_line<S: Sink>(
+        &self,
+        slice: &[u8],
+        write_to: S,
+    ) -> Result<(), S::Error> {
+        assert!(self.config.multi_line);
+
+        SearcherMultiLine {
+            searcher: self,
+            config: &self.config,
+            matcher: &self.matcher,
+            sink: write_to,
+            slice: slice,
+            search_pos: 0,
+            binary_byte_offset: None,
+            last_match: None,
+            line_number: if self.config.line_number { Some(1) } else { None },
+            last_line_counted: 0,
+        }.run()
+    }
+
+    /// Fill the buffer for use with multi-line searching from the given file.
+    /// This reads from the file until EOF or until an error occurs. If the
+    /// contents exceed the configured heap limit, then an error is returned.
+    fn fill_multi_line_buffer_from_file<S: Sink>(
+        &mut self,
+        mut read_from: &File,
+    ) -> Result<(), S::Error> {
+        assert!(self.config.multi_line);
+
+        if self.config.heap_limit.is_none() {
+            let buf = &mut self.multi_line_buffer;
+            buf.clear();
+            let cap = read_from
+                .metadata()
+                .map(|m| m.len() as usize + 1)
+                .unwrap_or(0);
+            buf.reserve(cap);
+            read_from.read_to_end(buf).map_err(S::error_io)?;
+        }
+        self.fill_multi_line_buffer_from_reader::<&File, S>(read_from)
+    }
+
+    /// Fill the buffer for use with multi-line searching from the given
+    /// reader. This reads from the reader until EOF or until an error occurs.
+    /// If the contents exceed the configured heap limit, then an error is
+    /// returned.
+    fn fill_multi_line_buffer_from_reader<R: io::Read, S: Sink>(
+        &mut self,
+        mut read_from: R,
+    ) -> Result<(), S::Error> {
+        assert!(self.config.multi_line);
+
+        let buf = &mut self.multi_line_buffer;
+        buf.clear();
+
+        // If we don't have a heap limit, then we can defer to std's
+        // read_to_end implementation...
+        let heap_limit = match self.config.heap_limit {
+            Some(heap_limit) => heap_limit,
+            None => {
+                read_from.read_to_end(buf).map_err(S::error_io)?;
+                return Ok(());
+            }
+        };
+        if heap_limit == 0 {
+            return Err(S::error_io(alloc_error(heap_limit)));
+        }
+
+        // ... otherwise we need to roll our own. This is likely quite a bit
+        // slower than what is optimal, but we avoid `unsafe` until there's a
+        // compelling reason to speed this up.
+        buf.resize(cmp::min(DEFAULT_BUFFER_CAPACITY, heap_limit), 0);
+        let mut pos = 0;
+        loop {
+            let nread = match read_from.read(&mut buf[pos..]) {
+                Ok(nread) => nread,
+                Err(ref err) if err.kind() == io::ErrorKind::Interrupted => {
+                    continue;
+                }
+                Err(err) => return Err(S::error_io(err)),
+            };
+            if nread == 0 {
+                buf.resize(pos, 0);
+                return Ok(());
+            }
+
+            pos += nread;
+            if buf[pos..].is_empty() {
+                let additional = heap_limit - buf.len();
+                if additional == 0 {
+                    return Err(S::error_io(alloc_error(heap_limit)));
+                }
+                let limit = buf.len() + additional;
+                let doubled = 2 * buf.len();
+                buf.resize(cmp::min(doubled, limit), 0);
+            }
+        }
     }
 }
 
@@ -424,6 +514,7 @@ trait Reader {
     fn buffer(&self) -> &[u8];
     fn consume(&mut self, amt: usize);
     fn consume_all(&mut self);
+    fn has_binary(&mut self, binary_byte: u8, range: &Match) -> bool;
 }
 
 impl<'b, R: io::Read> Reader for LineBufferReader<'b, R> {
@@ -450,6 +541,11 @@ impl<'b, R: io::Read> Reader for LineBufferReader<'b, R> {
     fn consume_all(&mut self) {
         LineBufferReader::consume_all(self)
     }
+
+    fn has_binary(&mut self, _binary_byte: u8, _range: &Match) -> bool {
+        // The InputBuffer does its own binary detection logic.
+        false
+    }
 }
 
 /// SliceReader is a way of making a slice behave as a LineBuffer. Initially,
@@ -458,12 +554,13 @@ impl<'b, R: io::Read> Reader for LineBufferReader<'b, R> {
 /// until the entire buffer is consumed.
 struct SliceReader<'b> {
     slice: &'b [u8],
+    binary_byte_offset: Option<u64>,
     filled: bool,
 }
 
 impl<'b> SliceReader<'b> {
     fn new(slice: &'b [u8]) -> SliceReader<'b> {
-        SliceReader { slice, filled: false }
+        SliceReader { slice, binary_byte_offset: None, filled: false }
     }
 }
 
@@ -473,7 +570,7 @@ impl<'b> Reader for SliceReader<'b> {
     }
 
     fn binary_byte_offset(&self) -> Option<u64> {
-        None
+        self.binary_byte_offset
     }
 
     fn fill(&mut self) -> Result<bool, io::Error> {
@@ -501,6 +598,18 @@ impl<'b> Reader for SliceReader<'b> {
     fn consume_all(&mut self) {
         let amt = self.slice.len();
         self.consume(amt);
+    }
+
+    fn has_binary(&mut self, binary_byte: u8, range: &Match) -> bool {
+        if !self.filled {
+            return false;
+        }
+        if self.binary_byte_offset.is_some() {
+            return true;
+        }
+        self.binary_byte_offset = memchr(binary_byte, &self.slice[*range])
+            .map(|o| (range.start() + o) as u64);
+        self.binary_byte_offset.is_some()
     }
 }
 
@@ -530,10 +639,18 @@ where M: Matcher,
 {
     fn run(mut self) -> Result<(), S::Error> {
         assert!(!self.config.multi_line);
+
     'LOOP:
         loop {
             if !self.fill()? {
                 break;
+            }
+            let binary_upto = cmp::min(
+                self.search_buffer().len(),
+                DEFAULT_BUFFER_CAPACITY,
+            );
+            if self.has_binary(&Match::new(0, binary_upto)) {
+                break 'LOOP;
             }
             while !self.search_buffer().is_empty() {
                 if !self.sink()? {
@@ -541,7 +658,9 @@ where M: Matcher,
                 }
             }
         }
-        Ok(())
+        self.sink.finish(&SinkFinish {
+            binary_byte_offset: self.rdr.binary_byte_offset(),
+        })
     }
 
     fn buffer(&self) -> &[u8] {
@@ -563,7 +682,7 @@ where M: Matcher,
             Err(err) => return Err(S::error_io(err)),
             Ok(didread) => didread,
         };
-        if !didread {
+        if !didread || self.rdr.binary_byte_offset().is_some() {
             return Ok(false);
         }
         Ok(true)
@@ -612,10 +731,13 @@ where M: Matcher,
     fn sink_matched(&mut self, line: &Match) -> Result<bool, S::Error> {
         if line.is_empty() {
             // The only way we can produce an empty line for a match is if
-            // we match the position immediately following the last byte that
-            // we search, and where that last byte is also the line terminator.
-            // We never want to report a match, and we know we're done at that
-            // point anyway.
+            // we match the position immediately following the last byte in
+            // a buffer, and where that last byte is also the line terminator.
+            // We never want to report a match beyond the end of a line, so
+            // skip it.
+            return Ok(true);
+        }
+        if self.has_binary(line) {
             return Ok(false);
         }
         let offset = self.rdr.absolute_byte_offset() + line.start() as u64;
@@ -663,6 +785,14 @@ where M: Matcher,
             self.last_line_counted = line_end;
         }
     }
+
+    fn has_binary(&mut self, range: &Match) -> bool {
+        let binary_byte = match self.config.binary.0 {
+            line_buffer::BinaryDetection::Quit(b) => b,
+            _ => return false,
+        };
+        self.rdr.has_binary(binary_byte, range)
+    }
 }
 
 #[derive(Debug)]
@@ -673,6 +803,7 @@ struct SearcherMultiLine<'s, M: 's, S> {
     sink: S,
     slice: &'s [u8],
     search_pos: usize,
+    binary_byte_offset: Option<u64>,
     last_match: Option<LineMatch>,
     line_number: Option<u64>,
     last_line_counted: usize,
@@ -685,15 +816,21 @@ where M: Matcher,
 {
     fn run(mut self) -> Result<(), S::Error> {
         assert!(self.config.multi_line);
-        while !self.search_buffer().is_empty() {
-            if !self.sink()? {
-                break;
+
+        let binary_upto = cmp::min(self.slice.len(), DEFAULT_BUFFER_CAPACITY);
+        if !self.has_binary(&Match::new(0, binary_upto)) {
+            while !self.search_buffer().is_empty() {
+                if !self.sink()? {
+                    break;
+                }
             }
         }
         if let Some(last_match) = self.last_match.take() {
             self.sink_matched(&last_match)?;
         }
-        Ok(())
+        self.sink.finish(&SinkFinish {
+            binary_byte_offset: self.binary_byte_offset,
+        })
     }
 
     fn search_buffer(&self) -> &[u8] {
@@ -712,6 +849,10 @@ where M: Matcher,
             }
         };
         let line = lines::locate(self.slice, self.config.line_term, mat);
+        // We delay sinking the match to make sure we group adjacent matches
+        // together in a single sink. Adjacent matches are distinct matches
+        // that start and end on the same line, respectively. This guarantees
+        // that a single line is never sinked more than once.
         let keepgoing = match self.last_match.take() {
             None => true,
             Some(last_match) => {
@@ -719,7 +860,7 @@ where M: Matcher,
                 // in this match, then simply grow the match and move on.
                 // This happens when the next match begins on the same line
                 // that the last match ends on.
-                if last_match.line.end() >= line.start() {
+                if last_match.line.end() > line.start() {
                     self.last_match = Some(LineMatch {
                         line: last_match.line.with_end(line.end()),
                         line_number: last_match.line_number,
@@ -773,11 +914,14 @@ where M: Matcher,
 
     fn sink_matched(&mut self, m: &LineMatch) -> Result<bool, S::Error> {
         if m.line.is_empty() {
-            // The only way we can produce an empty line for a match is if
-            // we match the position immediately following the last byte that
-            // we search, and where that last byte is also the line terminator.
-            // We never want to report a match, and we know we're done at that
+            // The only way we can produce an empty line for a match is if we
+            // match the position immediately following the last byte that we
+            // search, and where that last byte is also the line terminator. We
+            // never want to report that match, and we know we're done at that
             // point anyway.
+            return Ok(false);
+        }
+        if self.has_binary(&m.line) {
             return Ok(false);
         }
         self.sink.matched(
@@ -817,6 +961,24 @@ where M: Matcher,
             self.search_pos += 1;
         }
     }
+
+    /// Return true if and only if binary detection is enabled and the given
+    /// range contains binary data. When this returns true, the binary offset
+    /// is updated.
+    fn has_binary(&mut self, range: &Match) -> bool {
+        if self.binary_byte_offset.is_some() {
+            return true;
+        }
+        let binary_byte = match self.config.binary.0 {
+            line_buffer::BinaryDetection::Quit(b) => b,
+            _ => return false,
+        };
+        if let Some(i) = memchr(binary_byte, &self.slice[*range]) {
+            self.binary_byte_offset = Some((range.start() + i) as u64);
+            return true;
+        }
+        false
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -842,10 +1004,8 @@ impl MultiLineMatch {
 // Where to go next? Some thoughts:
 //
 //   1. Do context handling last. (Famous last words.)
-//   2. Binary detectiong for SliceReader. Maybe punt on Convert.
-//   3. Fill out the single-line searcher. Use optimizations. Line-by-line too.
-//   4. Fill out the logic for opening a reader in Searcher.
-//   5. Stop after first match.
+//   2. Fill out the single-line searcher. Use optimizations. Line-by-line too.
+//   3. Fill out the logic for opening a reader in Searcher.
 //
 // Massive cleanup. Get things working and then search for simplications.
 // Index heavy code is gross. Context handling will make it much worse.
@@ -898,15 +1058,31 @@ and exhibited clearly, with a label attached.\
           F: FnMut(&mut SearcherBuilder) -> &mut SearcherBuilder
     {
         let got = search_reader(haystack, &matcher, &mut build);
-        assert_eq!(expected, got, "search_reader mismatch");
+        assert_eq!(expected, got, "\nsearch_reader mismatch");
 
         let got = search_slice(haystack, &matcher, &mut build);
-        assert_eq!(expected, got, "search_slice mismatch");
+        assert_eq!(expected, got, "\nsearch_slice mismatch");
 
-        let got = search_reader(haystack, &matcher, |b| {
-            build(b).heap_limit(Some(80))
-        });
-        assert_eq!(expected, got, "search_reader with small limit mismatch");
+        // If we are executing a multi_line search, then test a heap limit that
+        // is equal to the haystack (plus 1), since multi-line search needs to
+        // read the entire buffer at once. The plus 1 is necessary since we
+        // need space for 1 remaining byte to detect EOF.
+        //
+        // For line oriented search, test with a heap limit equivalent to the
+        // longest line.
+        let got =
+            if build(&mut SearcherBuilder::new()).config.multi_line {
+                search_reader(haystack, &matcher, |b| {
+                    build(b).heap_limit(Some(haystack.len() + 1))
+                })
+            } else {
+                let lim = haystack.lines().map(|s| s.len()).max().unwrap_or(0);
+                search_reader(haystack, &matcher, |b| {
+                    // str::lines doesn't return the line terminator, so add 1.
+                    build(b).heap_limit(Some(lim + 1))
+                })
+            };
+        assert_eq!(expected, got, "\nsearch_reader with small limit mismatch");
     }
 
     fn search_reader<M, F>(
@@ -1179,6 +1355,127 @@ d
         });
         search_assert_all_matcher(exp_line, haystack, &matcher, |b| {
             b.multi_line(true).line_number(true)
+        });
+    }
+
+    #[test]
+    fn big1() {
+        let mut haystack = String::new();
+        haystack.push_str("a\n");
+        // Pick an arbitrary number above the capacity.
+        for _ in 0..(4 * (DEFAULT_BUFFER_CAPACITY + 7)) {
+            haystack.push_str("zzz\n");
+        }
+        haystack.push_str("a\n");
+
+        let exp = "0:a\n131186:a\n";
+        let got = search_reader(&haystack, SubstringMatcher::new("a"), |b| {
+            b.heap_limit(Some(4))
+        });
+        assert_eq!(exp, got, "\nsearch_reader mismatch");
+
+        let exp = "0:a\n131186:a\n";
+        let got = search_reader(&haystack, SubstringMatcher::new("a"), |b| {
+            b.multi_line(true).heap_limit(Some(haystack.len() + 1))
+        });
+        assert_eq!(exp, got, "\nsearch_reader mismatch");
+    }
+
+    #[test]
+    fn big_error_one_line() {
+        let mut haystack = String::new();
+        haystack.push_str("a\n");
+        // Pick an arbitrary number above the capacity.
+        for _ in 0..(4 * (DEFAULT_BUFFER_CAPACITY + 7)) {
+            haystack.push_str("zzz\n");
+        }
+        haystack.push_str("a\n");
+
+        let mut sink = KitchenSink::new();
+        let mut searcher = SearcherBuilder::new()
+            .heap_limit(Some(3)) // max line length is 4, one byte short
+            .build(SubstringMatcher::new("a"))
+            .unwrap();
+        let result = searcher.search_reader(haystack.as_bytes(), &mut sink);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn big_error_multi_line() {
+        let mut haystack = String::new();
+        haystack.push_str("a\n");
+        // Pick an arbitrary number above the capacity.
+        for _ in 0..(4 * (DEFAULT_BUFFER_CAPACITY + 7)) {
+            haystack.push_str("zzz\n");
+        }
+        haystack.push_str("a\n");
+
+        let mut sink = KitchenSink::new();
+        let mut searcher = SearcherBuilder::new()
+            .multi_line(true)
+            .heap_limit(Some(haystack.len())) // actually need one more byte
+            .build(SubstringMatcher::new("a"))
+            .unwrap();
+        let result = searcher.search_reader(haystack.as_bytes(), &mut sink);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn binary1() {
+        let haystack = "\x00a";
+        let exp = "\nbinary offset:0\n";
+        search_assert_all(exp, haystack, "a", |b| {
+            b.binary_detection(BinaryDetection::quit(0))
+        });
+        search_assert_all(exp, haystack, "a", |b| {
+            b.multi_line(true).binary_detection(BinaryDetection::quit(0))
+        });
+    }
+
+    #[test]
+    fn binary2() {
+        let haystack = "a\x00";
+        let exp = "\nbinary offset:1\n";
+        search_assert_all(exp, haystack, "a", |b| {
+            b.binary_detection(BinaryDetection::quit(0))
+        });
+        search_assert_all(exp, haystack, "a", |b| {
+            b.multi_line(true).binary_detection(BinaryDetection::quit(0))
+        });
+    }
+
+    #[test]
+    fn binary3() {
+        let mut haystack = String::new();
+        haystack.push_str("a\n");
+        for _ in 0..DEFAULT_BUFFER_CAPACITY {
+            haystack.push_str("zzz\n");
+        }
+        haystack.push_str("a\n");
+        haystack.push_str("a\x00a\n");
+        haystack.push_str("a\n");
+
+        // The line buffered searcher has slightly different semantics here.
+        // Namely, it will *always* detect binary data in the current buffer
+        // before searching it.
+        let exp = "0:a\n\nbinary offset:32773\n";
+        let got = search_reader(&haystack, SubstringMatcher::new("a"), |b| {
+            b.binary_detection(BinaryDetection::quit(0))
+        });
+        assert_eq!(exp, got, "\nsearch_reader mismatch");
+
+        // In contrast, the slice readers (for multi line as well) will only
+        // look for binary data in the initial chunk of bytes. After that
+        // point, it only looks for binary data in matches.
+        let exp = "0:a\n32770:a\n\nbinary offset:32773\n";
+        let got = search_slice(&haystack, SubstringMatcher::new("a"), |b| {
+            b.binary_detection(BinaryDetection::quit(0))
+        });
+        assert_eq!(exp, got, "\nsearch_slice mismatch");
+
+        let exp = "0:a\n32770:a\n\nbinary offset:32773\n";
+        search_assert_all(exp, &haystack, "a", |b| {
+            b.multi_line(true).binary_detection(BinaryDetection::quit(0))
         });
     }
 }

@@ -13,6 +13,8 @@ pub(crate) const DEFAULT_BUFFER_CAPACITY: usize = 8 * (1<<10); // 8 KB
 /// the amount of *additional* memory to allocate beyond the size of the buffer
 /// to accommodate lines (which may include the lines in a context window, when
 /// enabled) that do not fit in the buffer.
+///
+/// The default is to eagerly allocate without a limit.
 #[derive(Clone, Copy, Debug)]
 pub enum BufferAllocation {
     /// Attempt to expand the size of the buffer until either at least the next
@@ -30,6 +32,13 @@ impl Default for BufferAllocation {
     fn default() -> BufferAllocation {
         BufferAllocation::Eager
     }
+}
+
+/// Create a new error to be used when a configured allocation limit has been
+/// reached.
+pub fn alloc_error(limit: usize) -> io::Error {
+    let msg = format!("configured allocation limit ({}) exceeded", limit);
+    io::Error::new(io::ErrorKind::Other, msg)
 }
 
 /// The behavior of binary detection in the line buffer.
@@ -515,9 +524,7 @@ impl LineBuffer {
                 let used = self.buf.len() - self.config.capacity;
                 let n = cmp::min(len * 2, limit - used);
                 if n == 0 {
-                    let msg = format!(
-                        "configured allocation limit ({}) exceeded", limit);
-                    return Err(io::Error::new(io::ErrorKind::Other, msg));
+                    return Err(alloc_error(limit));
                 }
                 n
             }

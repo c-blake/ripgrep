@@ -85,13 +85,18 @@ impl<'a, S: Sink> Sink for &'a mut S {
 
 #[derive(Clone, Debug)]
 pub struct SinkFinish {
-    pub(crate) lines_matched: u64,
+    pub(crate) binary_byte_offset: Option<u64>,
 }
 
 impl SinkFinish {
-    /// Returns the total number of lines matched.
-    pub fn lines_matched(&self) -> u64 {
-        self.lines_matched
+    /// If binary detection is enabled and if binary data was found, then this
+    /// returns the absolute byte offset of the first detected byte of binary
+    /// data.
+    ///
+    /// Note that since this is an absolute byte offset, it cannot be relied
+    /// upon to index into any addressable memory.
+    pub fn binary_byte_offset(&self) -> Option<u64> {
+        self.binary_byte_offset
     }
 }
 

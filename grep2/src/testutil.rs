@@ -162,7 +162,6 @@ impl Sink for KitchenSink {
     where M: Matcher,
           M::Error: fmt::Display
     {
-        println!("{:?}", mat);
         let mut line_number = mat.line_number();
         let mut byte_offset = mat.absolute_byte_offset();
         for line in mat.lines() {
@@ -196,8 +195,10 @@ impl Sink for KitchenSink {
     }
 
     fn finish(&mut self, sink_finish: &SinkFinish) -> Result<(), io::Error> {
-        writeln!(self.0, "")?;
-        writeln!(self.0, "lines matched:{}", sink_finish.lines_matched)?;
+        if let Some(offset) = sink_finish.binary_byte_offset() {
+            writeln!(self.0, "")?;
+            writeln!(self.0, "binary offset:{}", offset)?;
+        }
         Ok(())
     }
 }
