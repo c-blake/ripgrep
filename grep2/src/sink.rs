@@ -85,10 +85,16 @@ impl<'a, S: Sink> Sink for &'a mut S {
 
 #[derive(Clone, Debug)]
 pub struct SinkFinish {
+    pub(crate) byte_count: u64,
     pub(crate) binary_byte_offset: Option<u64>,
 }
 
 impl SinkFinish {
+    /// Return the total number of bytes searched.
+    pub fn byte_count(&self) -> u64 {
+        self.byte_count
+    }
+
     /// If binary detection is enabled and if binary data was found, then this
     /// returns the absolute byte offset of the first detected byte of binary
     /// data.

@@ -251,8 +251,9 @@ impl Sink for KitchenSink {
     }
 
     fn finish(&mut self, sink_finish: &SinkFinish) -> Result<(), io::Error> {
+        writeln!(self.0, "")?;
+        writeln!(self.0, "byte count:{}", sink_finish.byte_count())?;
         if let Some(offset) = sink_finish.binary_byte_offset() {
-            writeln!(self.0, "")?;
             writeln!(self.0, "binary offset:{}", offset)?;
         }
         Ok(())

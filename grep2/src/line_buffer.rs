@@ -236,7 +236,8 @@ impl<'b, R: io::Read> LineBufferReader<'b, R> {
     /// of the data returned by `buffer` relative to the beginning of the
     /// underlying reader's contents. As such, this offset does not generally
     /// correspond to an offset in memory. It is typically used for reporting
-    /// purposes, particularly in error messages.
+    /// purposes. It can also be used for counting the number of bytes that
+    /// have been searched.
     pub fn absolute_byte_offset(&self) -> u64 {
         self.line_buffer.absolute_byte_offset()
     }
@@ -313,7 +314,8 @@ pub struct LineBuffer {
     /// construction or since the last time `clear` was called).
     ///
     /// When the line buffer reaches EOF, this is set to the position just
-    /// after the last byte read from the underlying reader.
+    /// after the last byte read from the underlying reader. That is, it
+    /// becomes the total count of bytes that have been read.
     absolute_byte_offset: u64,
     /// If binary data was found, this records the absolute byte offset at
     /// which it was first detected.

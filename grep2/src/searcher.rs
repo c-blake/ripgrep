@@ -554,19 +554,25 @@ impl<'b, R: io::Read> Reader for LineBufferReader<'b, R> {
 /// until the entire buffer is consumed.
 struct SliceReader<'b> {
     slice: &'b [u8],
+    absolute_byte_offset: u64,
     binary_byte_offset: Option<u64>,
     filled: bool,
 }
 
 impl<'b> SliceReader<'b> {
     fn new(slice: &'b [u8]) -> SliceReader<'b> {
-        SliceReader { slice, binary_byte_offset: None, filled: false }
+        SliceReader {
+            slice,
+            absolute_byte_offset: 0,
+            binary_byte_offset: None,
+            filled: false,
+        }
     }
 }
 
 impl<'b> Reader for SliceReader<'b> {
     fn absolute_byte_offset(&self) -> u64 {
-        0
+        self.absolute_byte_offset
     }
 
     fn binary_byte_offset(&self) -> Option<u64> {
@@ -593,6 +599,7 @@ impl<'b> Reader for SliceReader<'b> {
             return;
         }
         self.slice = &self.slice[amt..];
+        self.absolute_byte_offset += amt as u64;
     }
 
     fn consume_all(&mut self) {
@@ -659,6 +666,7 @@ where M: Matcher,
             }
         }
         self.sink.finish(&SinkFinish {
+            byte_count: self.rdr.absolute_byte_offset(),
             binary_byte_offset: self.rdr.binary_byte_offset(),
         })
     }
@@ -738,6 +746,7 @@ where M: Matcher,
             return Ok(true);
         }
         if self.has_binary(line) {
+            self.rdr.consume(line.start());
             return Ok(false);
         }
         let offset = self.rdr.absolute_byte_offset() + line.start() as u64;
@@ -878,6 +887,7 @@ where M: Matcher,
             self.sink_matched(&last_match)?;
         }
         self.sink.finish(&SinkFinish {
+            byte_count: self.slice.len() as u64,
             binary_byte_offset: self.binary_byte_offset,
         })
     }
@@ -1023,7 +1033,15 @@ where M: Matcher,
             _ => return false,
         };
         if let Some(i) = memchr(binary_byte, &self.slice[*range]) {
-            self.binary_byte_offset = Some((range.start() + i) as u64);
+            let offset = range.start() + i;
+            self.binary_byte_offset = Some(offset as u64);
+            // If this is the beginning, then we haven't searched anything,
+            // so null out the slice.
+            if range.start() == 0 {
+                self.slice = &[];
+            } else {
+                self.slice = &self.slice[..offset];
+            }
             return true;
         }
         false
@@ -1192,6 +1210,8 @@ and exhibited clearly, with a label attached.\
         let exp = "\
 0:For the Doctor Watsons of this world, as opposed to the Sherlock
 129:be, to a very large extent, the result of luck. Sherlock Holmes
+
+byte count:366
 ";
         search_assert_all(exp, SHERLOCK, "Sherlock", |b| b);
         search_assert_all(exp, SHERLOCK, "Sherlock", |b| b.multi_line(true));
@@ -1199,7 +1219,7 @@ and exhibited clearly, with a label attached.\
 
     #[test]
     fn basic2() {
-        let exp = "";
+        let exp = "\nbyte count:366\n";
         search_assert_all(exp, SHERLOCK, "NADA", |b| b);
         search_assert_all(exp, SHERLOCK, "NADA", |b| b.multi_line(true));
     }
@@ -1212,7 +1232,8 @@ and exhibited clearly, with a label attached.\
 129:be, to a very large extent, the result of luck. Sherlock Holmes
 193:can extract a clew from a wisp of straw or a flake of cigar ash;
 258:but Doctor Watson has to have it taken out for him and dusted,
-321:and exhibited clearly, with a label attached.\
+321:and exhibited clearly, with a label attached.
+byte count:366
 ";
         search_assert_all(exp, SHERLOCK, "a", |b| b);
         search_assert_all(exp, SHERLOCK, "a", |b| b.multi_line(true));
@@ -1225,7 +1246,8 @@ and exhibited clearly, with a label attached.\
 65:Holmeses, success in the province of detective work must always
 193:can extract a clew from a wisp of straw or a flake of cigar ash;
 258:but Doctor Watson has to have it taken out for him and dusted,
-321:and exhibited clearly, with a label attached.\
+321:and exhibited clearly, with a label attached.
+byte count:366
 ";
 
         search_assert_all(exp, SHERLOCK, pattern, |b| {
@@ -1241,6 +1263,8 @@ and exhibited clearly, with a label attached.\
         let exp = "\
 1:0:For the Doctor Watsons of this world, as opposed to the Sherlock
 3:129:be, to a very large extent, the result of luck. Sherlock Holmes
+
+byte count:366
 ";
         search_assert_all(exp, SHERLOCK, "Sherlock", |b| {
             b.line_number(true)
@@ -1256,7 +1280,8 @@ and exhibited clearly, with a label attached.\
 2:65:Holmeses, success in the province of detective work must always
 4:193:can extract a clew from a wisp of straw or a flake of cigar ash;
 5:258:but Doctor Watson has to have it taken out for him and dusted,
-6:321:and exhibited clearly, with a label attached.\
+6:321:and exhibited clearly, with a label attached.
+byte count:366
 ";
         search_assert_all(exp, SHERLOCK, "Sherlock", |b| {
             b.line_number(true).invert_match(true)
@@ -1269,26 +1294,32 @@ and exhibited clearly, with a label attached.\
     #[test]
     fn multi_line_overlap1() {
         let haystack = "xxx\nabc\ndefxxxabc\ndefxxx\nxxx";
+        let byte_count = haystack.len();
         let pattern = "abc\ndef";
-        let exp = "4:abc\n8:defxxxabc\n18:defxxx\n";
+        let exp = format!(
+            "4:abc\n8:defxxxabc\n18:defxxx\n\nbyte count:{}\n",
+            byte_count);
 
-        search_assert_all(exp, haystack, pattern, |b| b.multi_line(true));
+        search_assert_all(&exp, haystack, pattern, |b| b.multi_line(true));
     }
 
     #[test]
     fn multi_line_overlap2() {
         let haystack = "xxx\nabc\ndefabc\ndefxxx\nxxx";
+        let byte_count = haystack.len();
         let pattern = "abc\ndef";
-        let exp = "4:abc\n8:defabc\n15:defxxx\n";
+        let exp = format!(
+            "4:abc\n8:defabc\n15:defxxx\n\nbyte count:{}\n",
+            byte_count);
 
-        search_assert_all(exp, haystack, pattern, |b| b.multi_line(true));
+        search_assert_all(&exp, haystack, pattern, |b| b.multi_line(true));
     }
 
     #[test]
     fn empty_line1() {
         let haystack = "";
         let matcher = EmptyLineMatcher::new(b'\n');
-        let exp = "";
+        let exp = "\nbyte count:0\n";
 
         search_assert_all_matcher(exp, haystack, &matcher, |b| b);
         search_assert_all_matcher(exp, haystack, &matcher, |b| {
@@ -1306,8 +1337,8 @@ and exhibited clearly, with a label attached.\
     fn empty_line2() {
         let haystack = "\n";
         let matcher = EmptyLineMatcher::new(b'\n');
-        let exp = "0:\n";
-        let exp_line = "1:0:\n";
+        let exp = "0:\n\nbyte count:1\n";
+        let exp_line = "1:0:\n\nbyte count:1\n";
 
         search_assert_all_matcher(exp, haystack, &matcher, |b| b);
         search_assert_all_matcher(exp_line, haystack, &matcher, |b| {
@@ -1325,8 +1356,8 @@ and exhibited clearly, with a label attached.\
     fn empty_line3() {
         let haystack = "\n\n";
         let matcher = EmptyLineMatcher::new(b'\n');
-        let exp = "0:\n1:\n";
-        let exp_line = "1:0:\n2:1:\n";
+        let exp = "0:\n1:\n\nbyte count:2\n";
+        let exp_line = "1:0:\n2:1:\n\nbyte count:2\n";
 
         search_assert_all_matcher(exp, haystack, &matcher, |b| b);
         search_assert_all_matcher(exp_line, haystack, &matcher, |b| {
@@ -1352,18 +1383,21 @@ c
 
 d
 ";
+        let byte_count = haystack.len();
         let matcher = EmptyLineMatcher::new(b'\n');
-        let exp = "4:\n7:\n8:\n";
-        let exp_line = "3:4:\n5:7:\n6:8:\n";
+        let exp = format!("4:\n7:\n8:\n\nbyte count:{}\n", byte_count);
+        let exp_line = format!(
+            "3:4:\n5:7:\n6:8:\n\nbyte count:{}\n",
+            byte_count);
 
-        search_assert_all_matcher(exp, haystack, &matcher, |b| b);
-        search_assert_all_matcher(exp_line, haystack, &matcher, |b| {
+        search_assert_all_matcher(&exp, haystack, &matcher, |b| b);
+        search_assert_all_matcher(&exp_line, haystack, &matcher, |b| {
             b.line_number(true)
         });
-        search_assert_all_matcher(exp, haystack, &matcher, |b| {
+        search_assert_all_matcher(&exp, haystack, &matcher, |b| {
             b.multi_line(true)
         });
-        search_assert_all_matcher(exp_line, haystack, &matcher, |b| {
+        search_assert_all_matcher(&exp_line, haystack, &matcher, |b| {
             b.multi_line(true).line_number(true)
         });
     }
@@ -1380,18 +1414,21 @@ c
 
 
 d";
+        let byte_count = haystack.len();
         let matcher = EmptyLineMatcher::new(b'\n');
-        let exp = "4:\n7:\n8:\n";
-        let exp_line = "3:4:\n5:7:\n6:8:\n";
+        let exp = format!("4:\n7:\n8:\n\nbyte count:{}\n", byte_count);
+        let exp_line = format!(
+            "3:4:\n5:7:\n6:8:\n\nbyte count:{}\n",
+            byte_count);
 
-        search_assert_all_matcher(exp, haystack, &matcher, |b| b);
-        search_assert_all_matcher(exp_line, haystack, &matcher, |b| {
+        search_assert_all_matcher(&exp, haystack, &matcher, |b| b);
+        search_assert_all_matcher(&exp_line, haystack, &matcher, |b| {
             b.line_number(true)
         });
-        search_assert_all_matcher(exp, haystack, &matcher, |b| {
+        search_assert_all_matcher(&exp, haystack, &matcher, |b| {
             b.multi_line(true)
         });
-        search_assert_all_matcher(exp_line, haystack, &matcher, |b| {
+        search_assert_all_matcher(&exp_line, haystack, &matcher, |b| {
             b.multi_line(true).line_number(true)
         });
     }
@@ -1410,18 +1447,23 @@ c
 d
 
 ";
+        let byte_count = haystack.len();
         let matcher = EmptyLineMatcher::new(b'\n');
-        let exp = "4:\n7:\n8:\n11:\n";
-        let exp_line = "3:4:\n5:7:\n6:8:\n8:11:\n";
+        let exp = format!(
+            "4:\n7:\n8:\n11:\n\nbyte count:{}\n",
+            byte_count);
+        let exp_line = format!(
+            "3:4:\n5:7:\n6:8:\n8:11:\n\nbyte count:{}\n",
+            byte_count);
 
-        search_assert_all_matcher(exp, haystack, &matcher, |b| b);
-        search_assert_all_matcher(exp_line, haystack, &matcher, |b| {
+        search_assert_all_matcher(&exp, haystack, &matcher, |b| b);
+        search_assert_all_matcher(&exp_line, haystack, &matcher, |b| {
             b.line_number(true)
         });
-        search_assert_all_matcher(exp, haystack, &matcher, |b| {
+        search_assert_all_matcher(&exp, haystack, &matcher, |b| {
             b.multi_line(true)
         });
-        search_assert_all_matcher(exp_line, haystack, &matcher, |b| {
+        search_assert_all_matcher(&exp_line, haystack, &matcher, |b| {
             b.multi_line(true).line_number(true)
         });
     }
@@ -1436,13 +1478,14 @@ d
         }
         haystack.push_str("a\n");
 
-        let exp = "0:a\n131186:a\n";
+        let byte_count = haystack.len();
+        let exp = format!("0:a\n131186:a\n\nbyte count:{}\n", byte_count);
         let got = search_reader(&haystack, SubstringMatcher::new("a"), |b| {
             b.heap_limit(Some(4))
         });
         assert_eq!(exp, got, "\nsearch_reader mismatch");
 
-        let exp = "0:a\n131186:a\n";
+        let exp = format!("0:a\n131186:a\n\nbyte count:{}\n", byte_count);
         let got = search_reader(&haystack, SubstringMatcher::new("a"), |b| {
             b.multi_line(true).heap_limit(Some(haystack.len() + 1))
         });
@@ -1491,7 +1534,7 @@ d
     #[test]
     fn binary1() {
         let haystack = "\x00a";
-        let exp = "\nbinary offset:0\n";
+        let exp = "\nbyte count:0\nbinary offset:0\n";
         search_assert_all(exp, haystack, "a", |b| {
             b.binary_detection(BinaryDetection::quit(0))
         });
@@ -1503,7 +1546,8 @@ d
     #[test]
     fn binary2() {
         let haystack = "a\x00";
-        let exp = "\nbinary offset:1\n";
+
+        let exp = "\nbyte count:0\nbinary offset:1\n";
         search_assert_all(exp, haystack, "a", |b| {
             b.binary_detection(BinaryDetection::quit(0))
         });
@@ -1526,7 +1570,7 @@ d
         // The line buffered searcher has slightly different semantics here.
         // Namely, it will *always* detect binary data in the current buffer
         // before searching it.
-        let exp = "0:a\n\nbinary offset:32773\n";
+        let exp = "0:a\n\nbyte count:32766\nbinary offset:32773\n";
         let got = search_reader(&haystack, SubstringMatcher::new("a"), |b| {
             b.binary_detection(BinaryDetection::quit(0))
         });
@@ -1534,15 +1578,16 @@ d
 
         // In contrast, the slice readers (for multi line as well) will only
         // look for binary data in the initial chunk of bytes. After that
-        // point, it only looks for binary data in matches.
-        let exp = "0:a\n32770:a\n\nbinary offset:32773\n";
+        // point, it only looks for binary data in matches. This is also why
+        // the total byte count is slightly different.
+        let exp = "0:a\n32770:a\n\nbyte count:32772\nbinary offset:32773\n";
         let got = search_slice(&haystack, SubstringMatcher::new("a"), |b| {
             b.binary_detection(BinaryDetection::quit(0))
         });
         assert_eq!(exp, got, "\nsearch_slice mismatch");
 
-        let exp = "0:a\n32770:a\n\nbinary offset:32773\n";
-        search_assert_all(exp, &haystack, "a", |b| {
+        let exp = "0:a\n32770:a\n\nbyte count:32773\nbinary offset:32773\n";
+        search_assert_all(&exp, &haystack, "a", |b| {
             b.multi_line(true).binary_detection(BinaryDetection::quit(0))
         });
     }
