@@ -1,3 +1,4 @@
+use std::cell::Cell;
 use std::cmp;
 use std::fmt;
 use std::io;
@@ -133,12 +134,6 @@ impl<'b> Reader for SliceReader<'b> {
             .map(|o| (range.start() + o) as u64);
         self.binary_byte_offset.is_some()
     }
-}
-
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
-struct LineMatch {
-    line: Match,
-    line_number: Option<u64>,
 }
 
 #[derive(Debug)]
@@ -394,17 +389,290 @@ where M: Matcher,
 }
 
 #[derive(Debug)]
-pub struct SearcherMultiLine<'s, M: 's, S> {
-    searcher: &'s Searcher<M>,
+pub struct SearcherReadByLineFast<'s, M: 's, R, S> {
     config: &'s Config,
+    core: SearcherCore<'s, M>,
+    sink: S,
+    rdr: LineBufferReader<'s, R>,
+}
+
+impl<'s, M, R, S> SearcherReadByLineFast<'s, M, R, S>
+where M: Matcher,
+      M::Error: fmt::Display,
+      R: io::Read,
+      S: Sink
+{
+    pub fn new(
+        searcher: &'s Searcher<M>,
+        read_from: LineBufferReader<'s, R>,
+        write_to: S,
+    ) -> SearcherReadByLineFast<'s, M, R, S> {
+        assert!(!searcher.config.multi_line);
+
+        SearcherReadByLineFast {
+            config: &searcher.config,
+            core: SearcherCore::new(searcher),
+            sink: write_to,
+            rdr: read_from,
+        }
+    }
+
+    pub fn run(mut self) -> Result<(), S::Error> {
+        assert!(!self.config.multi_line);
+
+    'LOOP:
+        loop {
+            if !self.fill()? {
+                break;
+            }
+            while !self.rdr.buffer()[self.core.pos()..].is_empty() {
+                if !self.sink()? {
+                    break 'LOOP;
+                }
+            }
+        }
+        self.sink.finish(&SinkFinish {
+            byte_count: self.rdr.absolute_byte_offset(),
+            binary_byte_offset: self.rdr.binary_byte_offset(),
+        })
+    }
+
+    fn fill(&mut self) -> Result<bool, S::Error> {
+        assert!(self.rdr.buffer()[self.core.pos()..].is_empty());
+
+        self.core.roll(self.rdr.buffer());
+        self.rdr.consume_all();
+        let didread = match self.rdr.fill() {
+            Err(err) => return Err(S::error_io(err)),
+            Ok(didread) => didread,
+        };
+        if !didread || self.rdr.binary_byte_offset().is_some() {
+            return Ok(false);
+        }
+        Ok(true)
+    }
+
+    fn sink(&mut self) -> Result<bool, S::Error> {
+        if self.config.invert_match {
+            self.sink_matched_inverted()
+        } else if let Some(line) = self.find()? {
+            self.count_lines(line.start());
+            let keepgoing = self.sink_matched(&line)?;
+            self.core.set_pos(line.end());
+            Ok(keepgoing)
+        } else {
+            self.core.set_pos(self.rdr.buffer().len());
+            Ok(true)
+        }
+    }
+
+    fn sink_matched(&mut self, line: &Match) -> Result<bool, S::Error> {
+        if line.is_empty() {
+            // The only way we can produce an empty line for a match is if
+            // we match the position immediately following the last byte in
+            // a buffer, and where that last byte is also the line terminator.
+            // We never want to report a match beyond the end of a line, so
+            // skip it.
+            return Ok(true);
+        }
+        let offset = self.rdr.absolute_byte_offset() + line.start() as u64;
+        self.sink.matched(
+            self.core.searcher,
+            &SinkMatch {
+                line_term: self.config.line_term,
+                bytes: &self.rdr.buffer()[*line],
+                absolute_byte_offset: offset,
+                line_number: self.core.line_number(),
+            },
+        )
+    }
+
+    fn sink_matched_inverted(&mut self) -> Result<bool, S::Error> {
+        assert!(self.config.invert_match);
+
+        let invert_match = match self.find()? {
+            None => {
+                let m = Match::new(self.core.pos(), self.rdr.buffer().len());
+                self.core.set_pos(m.end());
+                m
+            }
+            Some(line) => {
+                let m = Match::new(self.core.pos(), line.start());
+                self.core.set_pos(line.end());
+                m
+            }
+        };
+        self.count_lines(invert_match.start());
+        let mut stepper = LineStep::new(self.config.line_term, invert_match);
+        while let Some(line) = stepper.next(self.rdr.buffer()) {
+            if !self.sink_matched(&line)? {
+                return Ok(false);
+            }
+            self.core.add_one_line(line.end());
+        }
+        Ok(true)
+    }
+
+    fn find(&self) -> Result<Option<Match>, S::Error> {
+        self.core.find_fast(self.rdr.buffer()).map_err(S::error_message)
+    }
+
+    fn count_lines(&self, upto: usize) {
+        self.core.count_lines(self.rdr.buffer(), upto);
+    }
+}
+
+#[derive(Debug)]
+struct SearcherCore<'s, M: 's> {
+    config: &'s Config,
+    matcher: &'s M,
+    searcher: &'s Searcher<M>,
+    pos: Cell<usize>,
+    line_number: Option<Cell<u64>>,
+    last_line_counted: Cell<usize>,
+    binary_byte_offset: Cell<Option<usize>>,
+}
+
+impl<'s, M> SearcherCore<'s, M>
+where M: Matcher,
+      M::Error: fmt::Display
+{
+    fn new(searcher: &'s Searcher<M>) -> SearcherCore<'s, M> {
+        let line_number =
+            if searcher.config.line_number {
+                Some(Cell::new(1))
+            } else {
+                None
+            };
+        SearcherCore {
+            config: &searcher.config,
+            matcher: &searcher.matcher,
+            searcher: searcher,
+            pos: Cell::new(0),
+            line_number: line_number,
+            last_line_counted: Cell::new(0),
+            binary_byte_offset: Cell::new(None),
+        }
+    }
+
+    fn roll(&self, buf: &[u8]) {
+        self.count_remaining_lines(buf);
+        self.pos.set(0);
+        self.last_line_counted.set(0);
+    }
+
+    fn pos(&self) -> usize {
+        self.pos.get()
+    }
+
+    fn set_pos(&self, pos: usize) {
+        self.pos.set(pos);
+    }
+
+    fn line_number(&self) -> Option<u64> {
+        self.line_number.as_ref().map(|cell| cell.get())
+    }
+
+    fn count_remaining_lines(&self, buf: &[u8]) {
+        self.count_lines(buf, buf.len());
+    }
+
+    fn count_lines(&self, buf: &[u8], upto: usize) {
+        if let Some(ref line_number) = self.line_number {
+            let slice = &buf[self.last_line_counted.get()..upto];
+            let count = lines::count(slice, self.config.line_term);
+            line_number.set(line_number.get() + count);
+            self.last_line_counted.set(upto);
+        }
+    }
+
+    fn add_one_line(&self, line_end: usize) {
+        if let Some(ref line_number) = self.line_number {
+            line_number.set(line_number.get() + 1);
+            self.last_line_counted.set(line_end);
+        }
+    }
+
+    fn binary_byte_offset(&self) -> Option<u64> {
+        self.binary_byte_offset.get().map(|offset| offset as u64)
+    }
+
+    fn detect_binary(&self, buf: &[u8], range: &Match) -> bool {
+        if self.binary_byte_offset.get().is_some() {
+            return true;
+        }
+        let binary_byte = match self.config.binary.0 {
+            line_buffer::BinaryDetection::Quit(b) => b,
+            _ => return false,
+        };
+        if let Some(i) = memchr(binary_byte, &buf[*range]) {
+            let offset = Some(range.start() + i);
+            self.binary_byte_offset.set(offset);
+            true
+        } else {
+            false
+        }
+    }
+
+    fn find_fast(&self, buf: &[u8]) -> Result<Option<Match>, M::Error> {
+        assert!(!self.config.multi_line);
+        assert_eq!(
+            self.matcher.line_terminator().unwrap(),
+            self.config.line_term,
+            "find_fast requires a matcher's line terminator to match config",
+        );
+
+        let mut pos = self.pos.get();
+        while !buf[pos..].is_empty() {
+            match self.matcher.find_candidate_line(&buf[pos..]) {
+                Err(err) => return Err(err),
+                Ok(None) => return Ok(None),
+                Ok(Some(LineMatchKind::Confirmed(i))) => {
+                    return Ok(Some(lines::locate(
+                        buf,
+                        self.config.line_term,
+                        Match::zero(i).offset(pos),
+                    )));
+                }
+                Ok(Some(LineMatchKind::Candidate(i))) => {
+                    let line = lines::locate(
+                        buf,
+                        self.config.line_term,
+                        Match::zero(i).offset(pos),
+                    );
+                    let slice = lines::without_terminator(
+                        &buf[line],
+                        self.config.line_term,
+                    );
+                    match self.matcher.shortest_match(slice) {
+                        Err(err) => return Err(err),
+                        Ok(Some(_)) => return Ok(Some(line)),
+                        Ok(None) => {
+                            pos = line.end();
+                            continue;
+                        }
+                    }
+                }
+            }
+        }
+        Ok(None)
+    }
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+struct LineMatch {
+    line: Match,
+    line_number: Option<u64>,
+}
+
+#[derive(Debug)]
+pub struct SearcherMultiLine<'s, M: 's, S> {
+    config: &'s Config,
+    core: SearcherCore<'s, M>,
     matcher: &'s M,
     sink: S,
     slice: &'s [u8],
-    search_pos: usize,
-    binary_byte_offset: Option<u64>,
     last_match: Option<LineMatch>,
-    line_number: Option<u64>,
-    last_line_counted: usize,
 }
 
 impl<'s, M, S> SearcherMultiLine<'s, M, S>
@@ -419,23 +687,13 @@ where M: Matcher,
     ) -> SearcherMultiLine<'s, M, S> {
         assert!(searcher.config.multi_line);
 
-        let line_number =
-            if searcher.config.line_number {
-                Some(1)
-            } else {
-                None
-            };
         SearcherMultiLine {
-            searcher: searcher,
             config: &searcher.config,
+            core: SearcherCore::new(searcher),
             matcher: &searcher.matcher,
             sink: write_to,
             slice: slice,
-            search_pos: 0,
-            binary_byte_offset: None,
             last_match: None,
-            line_number: line_number,
-            last_line_counted: 0,
         }
     }
 
@@ -443,34 +701,31 @@ where M: Matcher,
         assert!(self.config.multi_line);
 
         let binary_upto = cmp::min(self.slice.len(), DEFAULT_BUFFER_CAPACITY);
-        if !self.has_binary(&Match::new(0, binary_upto)) {
-            while !self.search_buffer().is_empty() {
+        if !self.core.detect_binary(self.slice, &Match::new(0, binary_upto)) {
+            while !self.slice[self.core.pos()..].is_empty() {
                 if !self.sink()? {
                     break;
                 }
             }
+            if let Some(last_match) = self.last_match.take() {
+                self.sink_matched(&last_match)?;
+            }
         }
-        if let Some(last_match) = self.last_match.take() {
-            self.sink_matched(&last_match)?;
-        }
+        let byte_count = self.byte_count();
         self.sink.finish(&SinkFinish {
-            byte_count: self.slice.len() as u64,
-            binary_byte_offset: self.binary_byte_offset,
+            byte_count: byte_count,
+            binary_byte_offset: self.core.binary_byte_offset(),
         })
-    }
-
-    fn search_buffer(&self) -> &[u8] {
-        &self.slice[self.search_pos..]
     }
 
     fn sink(&mut self) -> Result<bool, S::Error> {
         if self.config.invert_match {
-            return self.sink_inverted_matches();
+            return self.sink_matched_inverted();
         }
         let mat = match self.find()? {
             Some(range) => range,
             None => {
-                self.search_pos = self.slice.len();
+                self.core.set_pos(self.slice.len());
                 return Ok(true);
             }
         };
@@ -498,38 +753,38 @@ where M: Matcher,
                 }
             }
         };
-        self.count_lines(line.start());
+        self.core.count_lines(self.slice, line.start());
         self.last_match = Some(LineMatch {
             line: line,
-            line_number: self.line_number,
+            line_number: self.core.line_number(),
         });
         self.advance(&mat);
         Ok(keepgoing)
     }
 
-    fn sink_inverted_matches(&mut self) -> Result<bool, S::Error> {
+    fn sink_matched_inverted(&mut self) -> Result<bool, S::Error> {
         assert!(self.config.invert_match);
 
         let invert_match = match self.find()? {
             None => {
-                let m = Match::new(self.search_pos, self.slice.len());
-                self.search_pos = m.end();
+                let m = Match::new(self.core.pos(), self.slice.len());
+                self.core.set_pos(m.end());
                 m
             }
             Some(mat) => {
                 let line = lines::locate(
                     self.slice, self.config.line_term, mat);
-                let m = Match::new(self.search_pos, line.start());
-                self.search_pos = line.end();
+                let m = Match::new(self.core.pos(), line.start());
+                self.advance(&line);
                 m
             }
         };
         let mut stepper = LineStep::new(self.config.line_term, invert_match);
         while let Some(line) = stepper.next(self.slice) {
-            self.count_lines(line.start());
+            self.core.count_lines(self.slice, line.start());
             let m = LineMatch {
                 line: line,
-                line_number: self.line_number,
+                line_number: self.core.line_number(),
             };
             if !self.sink_matched(&m)? {
                 return Ok(false);
@@ -545,13 +800,13 @@ where M: Matcher,
             // search, and where that last byte is also the line terminator. We
             // never want to report that match, and we know we're done at that
             // point anyway.
-            return Ok(false);
+            return Ok(true);
         }
-        if self.has_binary(&m.line) {
+        if self.core.detect_binary(self.slice, &m.line) {
             return Ok(false);
         }
         self.sink.matched(
-            self.searcher,
+            self.core.searcher,
             &SinkMatch {
                 line_term: self.config.line_term,
                 bytes: &self.slice[m.line],
@@ -561,19 +816,11 @@ where M: Matcher,
         )
     }
 
-    fn find(&mut self) -> Result<Option<Match>, S::Error> {
-        match self.matcher.find(self.search_buffer()) {
+    fn find(&self) -> Result<Option<Match>, S::Error> {
+        match self.matcher.find(&self.slice[self.core.pos()..]) {
             Err(err) => Err(S::error_message(err)),
             Ok(None) => Ok(None),
-            Ok(Some(m)) => Ok(Some(m.offset(self.search_pos))),
-        }
-    }
-
-    fn count_lines(&mut self, upto: usize) {
-        if let Some(ref mut line_number) = self.line_number {
-            let slice = &self.slice[self.last_line_counted..upto];
-            *line_number += lines::count(slice, self.config.line_term);
-            self.last_line_counted = upto;
+            Ok(Some(m)) => Ok(Some(m.offset(self.core.pos()))),
         }
     }
 
@@ -581,37 +828,18 @@ where M: Matcher,
     ///
     /// If the previous match is zero width, then this advances the search
     /// position one byte past the end of the match.
-    fn advance(&mut self, m: &Match) {
-        self.search_pos = m.end();
-        if m.is_empty() && self.search_pos < self.slice.len() {
-            self.search_pos += 1;
+    fn advance(&self, m: &Match) {
+        self.core.set_pos(m.end());
+        if m.is_empty() && self.core.pos() < self.slice.len() {
+            self.core.set_pos(self.core.pos() + 1);
         }
     }
 
-    /// Return true if and only if binary detection is enabled and the given
-    /// range contains binary data. When this returns true, the binary offset
-    /// is updated.
-    fn has_binary(&mut self, range: &Match) -> bool {
-        if self.binary_byte_offset.is_some() {
-            return true;
+    fn byte_count(&self) -> u64 {
+        match self.core.binary_byte_offset() {
+            Some(offset) if offset < self.core.pos() as u64 => offset,
+            _ => self.core.pos() as u64,
         }
-        let binary_byte = match self.config.binary.0 {
-            line_buffer::BinaryDetection::Quit(b) => b,
-            _ => return false,
-        };
-        if let Some(i) = memchr(binary_byte, &self.slice[*range]) {
-            let offset = range.start() + i;
-            self.binary_byte_offset = Some(offset as u64);
-            // If this is the beginning, then we haven't searched anything,
-            // so null out the slice.
-            if range.start() == 0 {
-                self.slice = &[];
-            } else {
-                self.slice = &self.slice[..offset];
-            }
-            return true;
-        }
-        false
     }
 }
 
@@ -622,8 +850,6 @@ where M: Matcher,
 //   1. Do context handling last. (Famous last words.)
 //   2. The find_by_line implementation is a little weird. We might want a
 //      completely different searcher for that case.
-//      2. The find_by_line implementation is a little weird. We might want a
-//         completely different searcher for that case.
 //   3. Fill out the logic for opening a reader in Searcher.
 //
 // Massive cleanup. Get things working and then search for simplications.

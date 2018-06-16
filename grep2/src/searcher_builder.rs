@@ -11,7 +11,8 @@ use line_buffer::{
 use matcher::Matcher;
 use searcher_exec::{
     Reader, SliceReader,
-    SearcherByLine, SearcherMultiLine,
+    SearcherByLine,
+    SearcherReadByLineFast, SearcherMultiLine,
 };
 use sink::Sink;
 
@@ -362,7 +363,11 @@ where M: Matcher,
         } else {
             let mut line_buffer = self.line_buffer.borrow_mut();
             let rdr = LineBufferReader::new(read_from, &mut *line_buffer);
-            self.search_by_line(rdr, write_to)
+            if self.is_line_by_line_fast() {
+                SearcherReadByLineFast::new(self, rdr, write_to).run()
+            } else {
+                self.search_by_line(rdr, write_to)
+            }
         }
     }
 
@@ -470,6 +475,13 @@ where M: Matcher,
                 let doubled = 2 * buf.len();
                 buf.resize(cmp::min(doubled, limit), 0);
             }
+        }
+    }
+
+    fn is_line_by_line_fast(&self) -> bool {
+        match self.matcher.line_terminator() {
+            None => false,
+            Some(line_term) => line_term == self.config.line_term,
         }
     }
 }
