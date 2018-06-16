@@ -45,7 +45,8 @@ pub fn locate(
 
 /// An iterator over lines in a particular slice of bytes.
 ///
-/// Line terminators are considered part of the line they terminate.
+/// Line terminators are considered part of the line they terminate. All lines
+/// yielded by the iterator are guaranteed to be non-empty.
 ///
 /// `'b` refers to the lifetime of the underlying bytes.
 #[derive(Debug)]
@@ -105,13 +106,16 @@ impl LineStep {
     /// The caller must past exactly the same slice of bytes for each call to
     /// `next`.
     ///
-    /// The range returned includes the line terminator.
+    /// The range returned includes the line terminator. Ranges are always
+    /// non-empty.
     pub fn next(&mut self, mut bytes: &[u8]) -> Option<Match> {
         bytes = &bytes[..self.end];
         match memchr(self.line_term, &bytes[self.pos..]) {
             None => {
                 if self.pos < bytes.len() {
                     let m = Match::new(self.pos, bytes.len());
+                    assert!(!m.is_empty());
+
                     self.pos = m.end();
                     Some(m)
                 } else {
@@ -120,6 +124,8 @@ impl LineStep {
             }
             Some(line_end) => {
                 let m = Match::new(self.pos, self.pos + line_end + 1);
+                assert!(!m.is_empty());
+
                 self.pos = m.end();
                 Some(m)
             }

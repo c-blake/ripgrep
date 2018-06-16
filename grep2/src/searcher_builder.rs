@@ -12,7 +12,8 @@ use matcher::Matcher;
 use searcher_exec::{
     Reader, SliceReader,
     SearcherByLine,
-    SearcherReadByLineFast, SearcherMultiLine,
+    SearcherReadByLine,
+    SearcherMultiLine,
 };
 use sink::Sink;
 
@@ -352,6 +353,10 @@ impl<M> Searcher<M>
 where M: Matcher,
       M::Error: fmt::Display
 {
+    pub fn multi_line(&self) -> bool {
+        self.config.multi_line
+    }
+
     pub fn search_reader<R: io::Read, S: Sink>(
         &mut self,
         read_from: R,
@@ -363,11 +368,7 @@ where M: Matcher,
         } else {
             let mut line_buffer = self.line_buffer.borrow_mut();
             let rdr = LineBufferReader::new(read_from, &mut *line_buffer);
-            if self.is_line_by_line_fast() {
-                SearcherReadByLineFast::new(self, rdr, write_to).run()
-            } else {
-                self.search_by_line(rdr, write_to)
-            }
+            SearcherReadByLine::new(self, rdr, write_to).run()
         }
     }
 
@@ -408,6 +409,10 @@ where M: Matcher,
     ) -> Result<(), S::Error> {
         assert!(self.config.multi_line);
 
+        // If we don't have a heap limit, then we can defer to std's
+        // read_to_end implementation. fill_multi_line_buffer_from_reader will
+        // do this too, but since we have a File, we can be a bit smarter about
+        // pre-allocating here.
         if self.config.heap_limit.is_none() {
             let buf = &mut self.multi_line_buffer;
             buf.clear();

@@ -526,6 +526,13 @@ pub trait Matcher {
         Ok(())
     }
 
+    /// Returns true if and only if the matcher matches the given haystack.
+    ///
+    /// By default, this method is implemented by calling `shortest_match`.
+    fn is_match(&self, haystack: &[u8]) -> Result<bool, Self::Error> {
+        Ok(self.shortest_match(haystack)?.is_some())
+    }
+
     /// Returns an end location of the first match in `haystack`. If no match
     /// exists, then `None` is returned.
     ///
@@ -698,6 +705,10 @@ impl<'a, M: Matcher> Matcher for &'a M {
         (*self).replace_with_captures(haystack, caps, dst, append)
     }
 
+    fn is_match(&self, haystack: &[u8]) -> Result<bool, Self::Error> {
+        (*self).is_match(haystack)
+    }
+
     fn shortest_match(
         &self,
         haystack: &[u8],
@@ -808,6 +819,10 @@ impl<M: Matcher> Matcher for Arc<M> {
     where F: FnMut(&Self::Captures, &mut Vec<u8>) -> bool
     {
         (**self).replace_with_captures(haystack, caps, dst, append)
+    }
+
+    fn is_match(&self, haystack: &[u8]) -> Result<bool, Self::Error> {
+        (**self).is_match(haystack)
     }
 
     fn shortest_match(

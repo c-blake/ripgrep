@@ -3,11 +3,105 @@ use std::io::{self, Write};
 use std::str;
 
 use memchr::memchr;
+use regex::bytes::{Regex, RegexBuilder};
 
-use lines;
 use matcher::{LineMatchKind, Match, Matcher, NoCaptures, NoError};
 use searcher_builder::Searcher;
 use sink::{Sink, SinkContext, SinkFinish, SinkMatch};
+
+/// A simple regex matcher.
+///
+/// This supports setting the matcher's line terminator configuration directly,
+/// which we use for testing purposes. That is, the caller explicitly
+/// determines whether the line terminator optimization is enabled. (In reality
+/// this optimization is detected automatically by inspecting and possibly
+/// modifying the regex itself.)
+#[derive(Clone, Debug)]
+pub struct RegexMatcher {
+    regex: Regex,
+    line_term: Option<u8>,
+    every_line_is_candidate: bool,
+}
+
+impl RegexMatcher {
+    /// Create a new regex matcher.
+    pub fn new(pattern: &str) -> RegexMatcher {
+        let regex = RegexBuilder::new(pattern)
+            .multi_line(true) // permits ^ and $ to match at \n boundaries
+            .build()
+            .unwrap();
+        RegexMatcher {
+            regex: regex,
+            line_term: None,
+            every_line_is_candidate: false,
+        }
+    }
+
+    /// Forcefully set the line terminator of this matcher.
+    ///
+    /// By default, this matcher has no line terminator set.
+    pub fn set_line_term(
+        &mut self,
+        line_term: Option<u8>,
+    ) -> &mut RegexMatcher {
+        self.line_term = line_term;
+        self
+    }
+
+    /// Whether to return every line as a candidate or not.
+    ///
+    /// This forces searchers to handle the case of reporting a false positive.
+    pub fn every_line_is_candidate(
+        &mut self,
+        yes: bool,
+    ) -> &mut RegexMatcher {
+        self.every_line_is_candidate = yes;
+        self
+    }
+}
+
+impl Matcher for RegexMatcher {
+    type Captures = NoCaptures;
+    type Error = NoError;
+
+    fn find_at(
+        &self,
+        haystack: &[u8],
+        at: usize,
+    ) -> Result<Option<Match>, NoError> {
+        Ok(self.regex
+           .find_at(haystack, at)
+           .map(|m| Match::new(m.start(), m.end())))
+    }
+
+    fn new_captures(&self) -> Result<NoCaptures, NoError> {
+        Ok(NoCaptures::new())
+    }
+
+    fn line_terminator(&self) -> Option<u8> {
+        self.line_term
+    }
+
+    fn find_candidate_line(
+        &self,
+        haystack: &[u8],
+    ) -> Result<Option<LineMatchKind>, NoError> {
+        if self.every_line_is_candidate {
+            assert!(self.line_term.is_some());
+            if haystack.is_empty() {
+                return Ok(None);
+            }
+            // Make it interesting and return the last byte in the current
+            // line.
+            let i = memchr(self.line_term.unwrap(), haystack)
+                .map(|i| i)
+                .unwrap_or(haystack.len() - 1);
+            Ok(Some(LineMatchKind::Candidate(i)))
+        } else {
+            Ok(self.shortest_match(haystack)?.map(LineMatchKind::Confirmed))
+        }
+    }
+}
 
 /// A simple substring matcher that requires UTF-8.
 ///
@@ -108,46 +202,41 @@ impl Matcher for SubstringMatcher {
 /// terminator.
 #[derive(Clone, Debug)]
 pub struct EmptyLineMatcher {
-    line_term: u8,
+    regex: Regex,
+    line_term: Option<u8>,
+    every_line_is_candidate: bool,
 }
 
 impl EmptyLineMatcher {
     /// Create a new empty line matcher.
-    pub fn new(line_term: u8) -> EmptyLineMatcher {
-        EmptyLineMatcher { line_term }
-    }
-
-    fn next_line(&self, haystack: &[u8], at: usize) -> Match {
-        let end = haystack[at..]
-            .iter()
-            .position(|&b| b == self.line_term)
-            .map(|i| at + i + 1);
-        match end {
-            None => {
-                lines::locate(
-                    haystack,
-                    self.line_term,
-                    Match::zero(haystack.len()),
-                )
-            }
-            Some(end) => {
-                let start = lines::preceding(
-                    &haystack[..end], self.line_term, 0);
-                Match::new(start, end)
-            }
+    pub fn new() -> EmptyLineMatcher {
+        EmptyLineMatcher {
+            regex: Regex::new(r"(?m)^$").unwrap(),
+            line_term: None,
+            every_line_is_candidate: false,
         }
     }
 
-    fn line_len(&self, line: &[u8]) -> usize {
-        if let Some(&last) = line.last() {
-            if last == self.line_term {
-                line.len() - 1
-            } else {
-                line.len()
-            }
-        } else {
-            0
-        }
+    /// Set the line terminator that is reported by the Matcher implementation.
+    ///
+    /// This is useful for exercising different paths through the searcher.
+    pub fn set_line_term(
+        &mut self,
+        line_term: Option<u8>,
+    ) -> &mut EmptyLineMatcher {
+        self.line_term = line_term;
+        self
+    }
+
+    /// Whether to return every line as a candidate or not.
+    ///
+    /// This forces searchers to handle the case of reporting a false positive.
+    pub fn every_line_is_candidate(
+        &mut self,
+        yes: bool,
+    ) -> &mut EmptyLineMatcher {
+        self.every_line_is_candidate = yes;
+        self
     }
 }
 
@@ -158,24 +247,40 @@ impl Matcher for EmptyLineMatcher {
     fn find_at(
         &self,
         haystack: &[u8],
-        mut at: usize,
+        at: usize,
     ) -> Result<Option<Match>, NoError> {
-        loop {
-            let line = self.next_line(haystack, at);
-            if line.start() >= at {
-                if self.line_len(&haystack[line]) == 0 {
-                    return Ok(Some(Match::zero(line.start())));
-                }
-            }
-            if at == haystack.len() {
-                return Ok(None);
-            }
-            at = line.end();
-        }
+        Ok(self.regex
+           .find_at(haystack, at)
+           .map(|m| Match::new(m.start(), m.end())))
     }
 
     fn new_captures(&self) -> Result<NoCaptures, NoError> {
         Ok(NoCaptures::new())
+    }
+
+    fn line_terminator(&self) -> Option<u8> {
+        self.line_term
+    }
+
+    fn find_candidate_line(
+        &self,
+        haystack: &[u8],
+    ) -> Result<Option<LineMatchKind>, NoError> {
+        if self.every_line_is_candidate {
+            assert!(self.line_term.is_some());
+
+            if haystack.is_empty() {
+                return Ok(None);
+            }
+            // Make it interesting and return the last byte in the current
+            // line.
+            let i = memchr(self.line_term.unwrap(), haystack)
+                .map(|i| i)
+                .unwrap_or(haystack.len());
+            Ok(Some(LineMatchKind::Candidate(i)))
+        } else {
+            Ok(self.shortest_match(haystack)?.map(LineMatchKind::Confirmed))
+        }
     }
 }
 
@@ -218,6 +323,9 @@ impl Sink for KitchenSink {
     where M: Matcher,
           M::Error: fmt::Display
     {
+        assert!(!mat.bytes().is_empty());
+        assert!(mat.lines().count() >= 1);
+
         let mut line_number = mat.line_number();
         let mut byte_offset = mat.absolute_byte_offset();
         for line in mat.lines() {
@@ -273,7 +381,7 @@ mod tests {
     #[test]
     fn empty_line1() {
         let haystack = b"";
-        let matcher = EmptyLineMatcher::new(b'\n');
+        let matcher = EmptyLineMatcher::new();
 
         assert_eq!(matcher.find_at(haystack, 0), Ok(Some(m(0, 0))));
     }
@@ -281,7 +389,7 @@ mod tests {
     #[test]
     fn empty_line2() {
         let haystack = b"\n";
-        let matcher = EmptyLineMatcher::new(b'\n');
+        let matcher = EmptyLineMatcher::new();
 
         assert_eq!(matcher.find_at(haystack, 0), Ok(Some(m(0, 0))));
         assert_eq!(matcher.find_at(haystack, 1), Ok(Some(m(1, 1))));
@@ -290,7 +398,7 @@ mod tests {
     #[test]
     fn empty_line3() {
         let haystack = b"\n\n";
-        let matcher = EmptyLineMatcher::new(b'\n');
+        let matcher = EmptyLineMatcher::new();
 
         assert_eq!(matcher.find_at(haystack, 0), Ok(Some(m(0, 0))));
         assert_eq!(matcher.find_at(haystack, 1), Ok(Some(m(1, 1))));
@@ -300,7 +408,7 @@ mod tests {
     #[test]
     fn empty_line4() {
         let haystack = b"a\n\nb\n";
-        let matcher = EmptyLineMatcher::new(b'\n');
+        let matcher = EmptyLineMatcher::new();
 
         assert_eq!(matcher.find_at(haystack, 0), Ok(Some(m(2, 2))));
         assert_eq!(matcher.find_at(haystack, 1), Ok(Some(m(2, 2))));
@@ -313,7 +421,7 @@ mod tests {
     #[test]
     fn empty_line5() {
         let haystack = b"a\n\nb\nc";
-        let matcher = EmptyLineMatcher::new(b'\n');
+        let matcher = EmptyLineMatcher::new();
 
         assert_eq!(matcher.find_at(haystack, 0), Ok(Some(m(2, 2))));
         assert_eq!(matcher.find_at(haystack, 1), Ok(Some(m(2, 2))));
@@ -322,5 +430,15 @@ mod tests {
         assert_eq!(matcher.find_at(haystack, 4), Ok(None));
         assert_eq!(matcher.find_at(haystack, 5), Ok(None));
         assert_eq!(matcher.find_at(haystack, 6), Ok(None));
+    }
+
+    #[test]
+    fn empty_line6() {
+        let haystack = b"a\n";
+        let matcher = EmptyLineMatcher::new();
+
+        assert_eq!(matcher.find_at(haystack, 0), Ok(Some(m(2, 2))));
+        assert_eq!(matcher.find_at(haystack, 1), Ok(Some(m(2, 2))));
+        assert_eq!(matcher.find_at(haystack, 2), Ok(Some(m(2, 2))));
     }
 }

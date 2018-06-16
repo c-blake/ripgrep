@@ -2,6 +2,8 @@
 
 extern crate bytecount;
 extern crate memchr;
+#[cfg(test)]
+extern crate regex;
 
 pub use lines::LineIter;
 pub use matcher::{

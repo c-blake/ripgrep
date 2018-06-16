@@ -2,6 +2,7 @@ use std::cell::Cell;
 use std::cmp;
 use std::fmt;
 use std::io;
+use std::marker::PhantomData;
 
 use memchr::memchr;
 
@@ -389,14 +390,14 @@ where M: Matcher,
 }
 
 #[derive(Debug)]
-pub struct SearcherReadByLineFast<'s, M: 's, R, S> {
+pub struct SearcherReadByLine<'s, M: 's, R, S> {
     config: &'s Config,
-    core: SearcherCore<'s, M>,
+    core: SearcherCore<'s, M, S>,
     sink: S,
     rdr: LineBufferReader<'s, R>,
 }
 
-impl<'s, M, R, S> SearcherReadByLineFast<'s, M, R, S>
+impl<'s, M, R, S> SearcherReadByLine<'s, M, R, S>
 where M: Matcher,
       M::Error: fmt::Display,
       R: io::Read,
@@ -406,10 +407,10 @@ where M: Matcher,
         searcher: &'s Searcher<M>,
         read_from: LineBufferReader<'s, R>,
         write_to: S,
-    ) -> SearcherReadByLineFast<'s, M, R, S> {
+    ) -> SearcherReadByLine<'s, M, R, S> {
         assert!(!searcher.config.multi_line);
 
-        SearcherReadByLineFast {
+        SearcherReadByLine {
             config: &searcher.config,
             core: SearcherCore::new(searcher),
             sink: write_to,
@@ -420,17 +421,7 @@ where M: Matcher,
     pub fn run(mut self) -> Result<(), S::Error> {
         assert!(!self.config.multi_line);
 
-    'LOOP:
-        loop {
-            if !self.fill()? {
-                break;
-            }
-            while !self.rdr.buffer()[self.core.pos()..].is_empty() {
-                if !self.sink()? {
-                    break 'LOOP;
-                }
-            }
-        }
+        while self.fill()? && self.sink()? {}
         self.sink.finish(&SinkFinish {
             byte_count: self.rdr.absolute_byte_offset(),
             binary_byte_offset: self.rdr.binary_byte_offset(),
@@ -453,77 +444,27 @@ where M: Matcher,
     }
 
     fn sink(&mut self) -> Result<bool, S::Error> {
-        if self.config.invert_match {
-            self.sink_matched_inverted()
-        } else if let Some(line) = self.find()? {
-            self.count_lines(line.start());
-            let keepgoing = self.sink_matched(&line)?;
-            self.core.set_pos(line.end());
-            Ok(keepgoing)
-        } else {
-            self.core.set_pos(self.rdr.buffer().len());
-            Ok(true)
-        }
-    }
-
-    fn sink_matched(&mut self, line: &Match) -> Result<bool, S::Error> {
-        if line.is_empty() {
-            // The only way we can produce an empty line for a match is if
-            // we match the position immediately following the last byte in
-            // a buffer, and where that last byte is also the line terminator.
-            // We never want to report a match beyond the end of a line, so
-            // skip it.
-            return Ok(true);
-        }
-        let offset = self.rdr.absolute_byte_offset() + line.start() as u64;
-        self.sink.matched(
-            self.core.searcher,
-            &SinkMatch {
-                line_term: self.config.line_term,
-                bytes: &self.rdr.buffer()[*line],
-                absolute_byte_offset: offset,
-                line_number: self.core.line_number(),
-            },
-        )
-    }
-
-    fn sink_matched_inverted(&mut self) -> Result<bool, S::Error> {
-        assert!(self.config.invert_match);
-
-        let invert_match = match self.find()? {
-            None => {
-                let m = Match::new(self.core.pos(), self.rdr.buffer().len());
-                self.core.set_pos(m.end());
-                m
-            }
-            Some(line) => {
-                let m = Match::new(self.core.pos(), line.start());
-                self.core.set_pos(line.end());
-                m
-            }
-        };
-        self.count_lines(invert_match.start());
-        let mut stepper = LineStep::new(self.config.line_term, invert_match);
-        while let Some(line) = stepper.next(self.rdr.buffer()) {
-            if !self.sink_matched(&line)? {
-                return Ok(false);
-            }
-            self.core.add_one_line(line.end());
-        }
-        Ok(true)
-    }
-
-    fn find(&self) -> Result<Option<Match>, S::Error> {
-        self.core.find_fast(self.rdr.buffer()).map_err(S::error_message)
-    }
-
-    fn count_lines(&self, upto: usize) {
-        self.core.count_lines(self.rdr.buffer(), upto);
+        let absolute_byte_offset = self.rdr.absolute_byte_offset();
+        let buf = self.rdr.buffer();
+        let sink = &mut self.sink;
+        self.core.match_by_line(buf, |core, line| {
+            let offset = absolute_byte_offset + line.start() as u64;
+            sink.matched(
+                &core.searcher,
+                &SinkMatch {
+                    line_term: core.config().line_term,
+                    bytes: &buf[*line],
+                    absolute_byte_offset: offset,
+                    line_number: core.line_number(),
+                },
+            )
+        })
     }
 }
 
 #[derive(Debug)]
-struct SearcherCore<'s, M: 's> {
+struct SearcherCore<'s, M: 's, S> {
+    _sink_type: PhantomData<S>,
     config: &'s Config,
     matcher: &'s M,
     searcher: &'s Searcher<M>,
@@ -533,11 +474,12 @@ struct SearcherCore<'s, M: 's> {
     binary_byte_offset: Cell<Option<usize>>,
 }
 
-impl<'s, M> SearcherCore<'s, M>
+impl<'s, M, S> SearcherCore<'s, M, S>
 where M: Matcher,
-      M::Error: fmt::Display
+      M::Error: fmt::Display,
+      S: Sink
 {
-    fn new(searcher: &'s Searcher<M>) -> SearcherCore<'s, M> {
+    fn new(searcher: &'s Searcher<M>) -> SearcherCore<'s, M, S> {
         let line_number =
             if searcher.config.line_number {
                 Some(Cell::new(1))
@@ -545,6 +487,7 @@ where M: Matcher,
                 None
             };
         SearcherCore {
+            _sink_type: PhantomData,
             config: &searcher.config,
             matcher: &searcher.matcher,
             searcher: searcher,
@@ -559,6 +502,19 @@ where M: Matcher,
         self.count_remaining_lines(buf);
         self.pos.set(0);
         self.last_line_counted.set(0);
+    }
+
+    fn config(&self) -> &Config {
+        &self.config
+    }
+
+    fn is_line_by_line_fast(&self) -> bool {
+        assert!(!self.config.multi_line);
+
+        match self.matcher.line_terminator() {
+            None => false,
+            Some(line_term) => line_term == self.config.line_term,
+        }
     }
 
     fn pos(&self) -> usize {
@@ -614,25 +570,142 @@ where M: Matcher,
         }
     }
 
-    fn find_fast(&self, buf: &[u8]) -> Result<Option<Match>, M::Error> {
+    fn match_by_line<F>(
+        &self,
+        buf: &[u8],
+        on_match: F,
+    ) -> Result<bool, S::Error>
+    where F: FnMut(&Self, &Match) -> Result<bool, S::Error>
+    {
+        if self.is_line_by_line_fast() {
+            self.match_by_line_fast(buf, on_match)
+        } else {
+            self.match_by_line_slow(buf, on_match)
+        }
+    }
+
+    fn match_by_line_slow<F>(
+        &self,
+        buf: &[u8],
+        mut on_match: F,
+    ) -> Result<bool, S::Error>
+    where F: FnMut(&Self, &Match) -> Result<bool, S::Error>
+    {
+        assert!(!self.config.multi_line);
+
+        let range = Match::new(self.pos(), buf.len());
+        let mut stepper = LineStep::new(self.config.line_term, range);
+        while let Some(line) = stepper.next(buf) {
+            let matched = {
+                // Stripping the line terminator is necessary to prevent some
+                // classes of regexes from matching the empty position *after*
+                // the end of the line. For example, `(?m)^$` will match at
+                // position (2, 2) in the string `a\n`.
+                let slice = lines::without_terminator(
+                    &buf[line],
+                    self.config.line_term,
+                );
+                match self.matcher.shortest_match(slice) {
+                    Err(err) => return Err(S::error_message(err)),
+                    Ok(result) => result.is_some(),
+                }
+            };
+            if matched != self.config.invert_match {
+                if !on_match(self, &line)? {
+                    return Ok(false);
+                }
+            }
+            self.add_one_line(line.end());
+        }
+        self.set_pos(buf.len());
+        Ok(true)
+    }
+
+    fn match_by_line_fast<F>(
+        &self,
+        buf: &[u8],
+        mut on_match: F,
+    ) -> Result<bool, S::Error>
+    where F: FnMut(&Self, &Match) -> Result<bool, S::Error> {
+        while !buf[self.pos()..].is_empty() {
+            if self.config.invert_match {
+                if !self.match_by_line_fast_invert(buf, &mut on_match)? {
+                    return Ok(false);
+                }
+            } else if let Some(line) = self.find_by_line_fast(buf)? {
+                self.count_lines(buf, line.start());
+                let keepgoing = on_match(self, &line)?;
+                self.set_pos(line.end());
+                if !keepgoing {
+                    return Ok(false);
+                }
+            } else {
+                self.set_pos(buf.len());
+            }
+        }
+        Ok(true)
+    }
+
+    fn match_by_line_fast_invert<F>(
+        &self,
+        buf: &[u8],
+        mut on_match: F,
+    ) -> Result<bool, S::Error>
+    where F: FnMut(&Self, &Match) -> Result<bool, S::Error> {
+        assert!(self.config.invert_match);
+
+        let invert_match = match self.find_by_line_fast(buf)? {
+            None => {
+                let m = Match::new(self.pos(), buf.len());
+                self.set_pos(m.end());
+                m
+            }
+            Some(line) => {
+                let m = Match::new(self.pos(), line.start());
+                self.set_pos(line.end());
+                m
+            }
+        };
+        self.count_lines(buf, invert_match.start());
+        let mut stepper = LineStep::new(self.config.line_term, invert_match);
+        while let Some(line) = stepper.next(buf) {
+            if !on_match(self, &line)? {
+                return Ok(false);
+            }
+            self.add_one_line(line.end());
+        }
+        Ok(true)
+    }
+
+    fn find_by_line_fast(
+        &self,
+        buf: &[u8],
+    ) -> Result<Option<Match>, S::Error> {
         assert!(!self.config.multi_line);
         assert_eq!(
             self.matcher.line_terminator().unwrap(),
             self.config.line_term,
-            "find_fast requires a matcher's line terminator to match config",
+            "requires a matcher's line terminator to match config",
         );
 
         let mut pos = self.pos.get();
         while !buf[pos..].is_empty() {
             match self.matcher.find_candidate_line(&buf[pos..]) {
-                Err(err) => return Err(err),
+                Err(err) => return Err(S::error_message(err)),
                 Ok(None) => return Ok(None),
                 Ok(Some(LineMatchKind::Confirmed(i))) => {
-                    return Ok(Some(lines::locate(
+                    let line = lines::locate(
                         buf,
                         self.config.line_term,
                         Match::zero(i).offset(pos),
-                    )));
+                    );
+                    // If we matched beyond the end of the buffer, then we
+                    // don't report this as a match.
+                    if line.start() == buf.len() {
+                        pos = buf.len();
+                        continue;
+                    }
+                    return Ok(Some(line));
                 }
                 Ok(Some(LineMatchKind::Candidate(i))) => {
                     let line = lines::locate(
@@ -640,14 +713,19 @@ where M: Matcher,
                         self.config.line_term,
                         Match::zero(i).offset(pos),
                     );
+                    // We need to strip the line terminator here to match the
+                    // semantics of line-by-line searching. Namely, regexes
+                    // like `(?m)^$` can match at the final position beyond a
+                    // line terminator, which is non-sensical in line oriented
+                    // matching.
                     let slice = lines::without_terminator(
                         &buf[line],
                         self.config.line_term,
                     );
-                    match self.matcher.shortest_match(slice) {
-                        Err(err) => return Err(err),
-                        Ok(Some(_)) => return Ok(Some(line)),
-                        Ok(None) => {
+                    match self.matcher.is_match(slice) {
+                        Err(err) => return Err(S::error_message(err)),
+                        Ok(true) => return Ok(Some(line)),
+                        Ok(false) => {
                             pos = line.end();
                             continue;
                         }
@@ -659,20 +737,20 @@ where M: Matcher,
     }
 }
 
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
-struct LineMatch {
-    line: Match,
-    line_number: Option<u64>,
-}
-
 #[derive(Debug)]
 pub struct SearcherMultiLine<'s, M: 's, S> {
     config: &'s Config,
-    core: SearcherCore<'s, M>,
+    core: SearcherCore<'s, M, S>,
     matcher: &'s M,
     sink: S,
     slice: &'s [u8],
     last_match: Option<LineMatch>,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+struct LineMatch {
+    line: Match,
+    line_number: Option<u64>,
 }
 
 impl<'s, M, S> SearcherMultiLine<'s, M, S>
@@ -860,7 +938,7 @@ mod tests {
     use std::fmt;
 
     use searcher_builder::*;
-    use testutil::{EmptyLineMatcher, KitchenSink, SubstringMatcher};
+    use testutil::{EmptyLineMatcher, KitchenSink, RegexMatcher, SubstringMatcher};
 
     use super::*;
 
@@ -873,11 +951,10 @@ but Doctor Watson has to have it taken out for him and dusted,
 and exhibited clearly, with a label attached.\
 ";
 
-    /// Executes the given search on all available searchers, and asserts that
-    /// the result of every search is equivalent to the expected result.
-    ///
-    /// This creates a substring matcher from the given pattern.
-    fn search_assert_all<F>(
+    /// Executes the given substring pattern on all available searchers, and
+    /// asserts that the result of every search is equivalent to the expected
+    /// result.
+    fn assert_substring<F>(
         expected: &str,
         haystack: &str,
         pattern: &str,
@@ -886,7 +963,7 @@ and exhibited clearly, with a label attached.\
     where F: FnMut(&mut SearcherBuilder) -> &mut SearcherBuilder
     {
         let mut matcher = SubstringMatcher::new(pattern);
-        search_assert_all_matcher(expected, haystack, &matcher, &mut build);
+        assert_matcher(expected, haystack, &matcher, &mut build);
 
         // If we're testing single line search, then set the line terminator
         // to force the searcher to use the fast path. This doesn't matter for
@@ -894,22 +971,20 @@ and exhibited clearly, with a label attached.\
         // line terminator in the pattern).
         if !build(&mut SearcherBuilder::new()).config.multi_line {
             matcher.set_line_term(Some(b'\n'));
-            search_assert_all_matcher(
+            assert_matcher(
                 expected, haystack, &matcher, &mut build);
 
             // Also, exercise the line oriented optimization by forcing the
             // matcher to report every single line as a candidate match.
             matcher.every_line_is_candidate(true);
-            search_assert_all_matcher(
+            assert_matcher(
                 expected, haystack, &matcher, &mut build);
         }
     }
 
-    /// Executes the given search on all available searchers, and asserts that
+    /// Executes the given matcher on all available searchers, and asserts that
     /// the result of every search is equivalent to the expected result.
-    ///
-    /// This uses the matcher provided.
-    fn search_assert_all_matcher<M, F>(
+    fn assert_matcher<M, F>(
         expected: &str,
         haystack: &str,
         matcher: M,
@@ -989,15 +1064,15 @@ and exhibited clearly, with a label attached.\
 
 byte count:366
 ";
-        search_assert_all(exp, SHERLOCK, "Sherlock", |b| b);
-        search_assert_all(exp, SHERLOCK, "Sherlock", |b| b.multi_line(true));
+        assert_substring(exp, SHERLOCK, "Sherlock", |b| b);
+        assert_substring(exp, SHERLOCK, "Sherlock", |b| b.multi_line(true));
     }
 
     #[test]
     fn basic2() {
         let exp = "\nbyte count:366\n";
-        search_assert_all(exp, SHERLOCK, "NADA", |b| b);
-        search_assert_all(exp, SHERLOCK, "NADA", |b| b.multi_line(true));
+        assert_substring(exp, SHERLOCK, "NADA", |b| b);
+        assert_substring(exp, SHERLOCK, "NADA", |b| b.multi_line(true));
     }
 
     #[test]
@@ -1011,8 +1086,29 @@ byte count:366
 321:and exhibited clearly, with a label attached.
 byte count:366
 ";
-        search_assert_all(exp, SHERLOCK, "a", |b| b);
-        search_assert_all(exp, SHERLOCK, "a", |b| b.multi_line(true));
+        assert_substring(exp, SHERLOCK, "a", |b| b);
+        assert_substring(exp, SHERLOCK, "a", |b| b.multi_line(true));
+    }
+
+    #[test]
+    fn basic4() {
+        let haystack = "\
+a
+b
+
+c
+
+
+d
+";
+        let byte_count = haystack.len();
+        let mut matcher = RegexMatcher::new(r"a$");
+        matcher.set_line_term(Some(b'\n'));
+        matcher.every_line_is_candidate(true);
+
+        let exp = format!("0:a\n\nbyte count:{}\n", byte_count);
+        assert_matcher(&exp, haystack, &matcher, |b| b);
+        assert_matcher(&exp, haystack, &matcher, |b| b.multi_line(true));
     }
 
     #[test]
@@ -1026,10 +1122,10 @@ byte count:366
 byte count:366
 ";
 
-        search_assert_all(exp, SHERLOCK, pattern, |b| {
+        assert_substring(exp, SHERLOCK, pattern, |b| {
             b.invert_match(true)
         });
-        search_assert_all(exp, SHERLOCK, pattern, |b| {
+        assert_substring(exp, SHERLOCK, pattern, |b| {
             b.invert_match(true).multi_line(true)
         });
     }
@@ -1042,10 +1138,10 @@ byte count:366
 
 byte count:366
 ";
-        search_assert_all(exp, SHERLOCK, "Sherlock", |b| {
+        assert_substring(exp, SHERLOCK, "Sherlock", |b| {
             b.line_number(true)
         });
-        search_assert_all(exp, SHERLOCK, "Sherlock", |b| {
+        assert_substring(exp, SHERLOCK, "Sherlock", |b| {
             b.line_number(true).multi_line(true)
         });
     }
@@ -1059,10 +1155,10 @@ byte count:366
 6:321:and exhibited clearly, with a label attached.
 byte count:366
 ";
-        search_assert_all(exp, SHERLOCK, "Sherlock", |b| {
+        assert_substring(exp, SHERLOCK, "Sherlock", |b| {
             b.line_number(true).invert_match(true)
         });
-        search_assert_all(exp, SHERLOCK, "Sherlock", |b| {
+        assert_substring(exp, SHERLOCK, "Sherlock", |b| {
             b.line_number(true).multi_line(true).invert_match(true)
         });
     }
@@ -1076,7 +1172,7 @@ byte count:366
             "4:abc\n8:defxxxabc\n18:defxxx\n\nbyte count:{}\n",
             byte_count);
 
-        search_assert_all(&exp, haystack, pattern, |b| b.multi_line(true));
+        assert_substring(&exp, haystack, pattern, |b| b.multi_line(true));
     }
 
     #[test]
@@ -1088,23 +1184,23 @@ byte count:366
             "4:abc\n8:defabc\n15:defxxx\n\nbyte count:{}\n",
             byte_count);
 
-        search_assert_all(&exp, haystack, pattern, |b| b.multi_line(true));
+        assert_substring(&exp, haystack, pattern, |b| b.multi_line(true));
     }
 
     #[test]
     fn empty_line1() {
         let haystack = "";
-        let matcher = EmptyLineMatcher::new(b'\n');
+        let matcher = EmptyLineMatcher::new();
         let exp = "\nbyte count:0\n";
 
-        search_assert_all_matcher(exp, haystack, &matcher, |b| b);
-        search_assert_all_matcher(exp, haystack, &matcher, |b| {
+        assert_matcher(exp, haystack, &matcher, |b| b);
+        assert_matcher(exp, haystack, &matcher, |b| {
             b.line_number(true)
         });
-        search_assert_all_matcher(exp, haystack, &matcher, |b| {
+        assert_matcher(exp, haystack, &matcher, |b| {
             b.multi_line(true)
         });
-        search_assert_all_matcher(exp, haystack, &matcher, |b| {
+        assert_matcher(exp, haystack, &matcher, |b| {
             b.multi_line(true).line_number(true)
         });
     }
@@ -1112,18 +1208,18 @@ byte count:366
     #[test]
     fn empty_line2() {
         let haystack = "\n";
-        let matcher = EmptyLineMatcher::new(b'\n');
+        let matcher = EmptyLineMatcher::new();
         let exp = "0:\n\nbyte count:1\n";
         let exp_line = "1:0:\n\nbyte count:1\n";
 
-        search_assert_all_matcher(exp, haystack, &matcher, |b| b);
-        search_assert_all_matcher(exp_line, haystack, &matcher, |b| {
+        assert_matcher(exp, haystack, &matcher, |b| b);
+        assert_matcher(exp_line, haystack, &matcher, |b| {
             b.line_number(true)
         });
-        search_assert_all_matcher(exp, haystack, &matcher, |b| {
+        assert_matcher(exp, haystack, &matcher, |b| {
             b.multi_line(true)
         });
-        search_assert_all_matcher(exp_line, haystack, &matcher, |b| {
+        assert_matcher(exp_line, haystack, &matcher, |b| {
             b.multi_line(true).line_number(true)
         });
     }
@@ -1131,18 +1227,18 @@ byte count:366
     #[test]
     fn empty_line3() {
         let haystack = "\n\n";
-        let matcher = EmptyLineMatcher::new(b'\n');
+        let matcher = EmptyLineMatcher::new();
         let exp = "0:\n1:\n\nbyte count:2\n";
         let exp_line = "1:0:\n2:1:\n\nbyte count:2\n";
 
-        search_assert_all_matcher(exp, haystack, &matcher, |b| b);
-        search_assert_all_matcher(exp_line, haystack, &matcher, |b| {
+        assert_matcher(exp, haystack, &matcher, |b| b);
+        assert_matcher(exp_line, haystack, &matcher, |b| {
             b.line_number(true)
         });
-        search_assert_all_matcher(exp, haystack, &matcher, |b| {
+        assert_matcher(exp, haystack, &matcher, |b| {
             b.multi_line(true)
         });
-        search_assert_all_matcher(exp_line, haystack, &matcher, |b| {
+        assert_matcher(exp_line, haystack, &matcher, |b| {
             b.multi_line(true).line_number(true)
         });
     }
@@ -1160,20 +1256,44 @@ c
 d
 ";
         let byte_count = haystack.len();
-        let matcher = EmptyLineMatcher::new(b'\n');
+        let mut matcher = EmptyLineMatcher::new();
         let exp = format!("4:\n7:\n8:\n\nbyte count:{}\n", byte_count);
         let exp_line = format!(
             "3:4:\n5:7:\n6:8:\n\nbyte count:{}\n",
             byte_count);
 
-        search_assert_all_matcher(&exp, haystack, &matcher, |b| b);
-        search_assert_all_matcher(&exp_line, haystack, &matcher, |b| {
+        assert_matcher(&exp, haystack, &matcher, |b| b);
+        assert_matcher(&exp_line, haystack, &matcher, |b| {
             b.line_number(true)
         });
-        search_assert_all_matcher(&exp, haystack, &matcher, |b| {
+        assert_matcher(&exp, haystack, &matcher, |b| {
             b.multi_line(true)
         });
-        search_assert_all_matcher(&exp_line, haystack, &matcher, |b| {
+        assert_matcher(&exp_line, haystack, &matcher, |b| {
+            b.multi_line(true).line_number(true)
+        });
+
+        matcher.set_line_term(Some(b'\n'));
+        assert_matcher(&exp, haystack, &matcher, |b| b);
+        assert_matcher(&exp_line, haystack, &matcher, |b| {
+            b.line_number(true)
+        });
+        assert_matcher(&exp, haystack, &matcher, |b| {
+            b.multi_line(true)
+        });
+        assert_matcher(&exp_line, haystack, &matcher, |b| {
+            b.multi_line(true).line_number(true)
+        });
+
+        matcher.every_line_is_candidate(true);
+        assert_matcher(&exp, haystack, &matcher, |b| b);
+        assert_matcher(&exp_line, haystack, &matcher, |b| {
+            b.line_number(true)
+        });
+        assert_matcher(&exp, haystack, &matcher, |b| {
+            b.multi_line(true)
+        });
+        assert_matcher(&exp_line, haystack, &matcher, |b| {
             b.multi_line(true).line_number(true)
         });
     }
@@ -1191,20 +1311,20 @@ c
 
 d";
         let byte_count = haystack.len();
-        let matcher = EmptyLineMatcher::new(b'\n');
+        let matcher = EmptyLineMatcher::new();
         let exp = format!("4:\n7:\n8:\n\nbyte count:{}\n", byte_count);
         let exp_line = format!(
             "3:4:\n5:7:\n6:8:\n\nbyte count:{}\n",
             byte_count);
 
-        search_assert_all_matcher(&exp, haystack, &matcher, |b| b);
-        search_assert_all_matcher(&exp_line, haystack, &matcher, |b| {
+        assert_matcher(&exp, haystack, &matcher, |b| b);
+        assert_matcher(&exp_line, haystack, &matcher, |b| {
             b.line_number(true)
         });
-        search_assert_all_matcher(&exp, haystack, &matcher, |b| {
+        assert_matcher(&exp, haystack, &matcher, |b| {
             b.multi_line(true)
         });
-        search_assert_all_matcher(&exp_line, haystack, &matcher, |b| {
+        assert_matcher(&exp_line, haystack, &matcher, |b| {
             b.multi_line(true).line_number(true)
         });
     }
@@ -1224,7 +1344,7 @@ d
 
 ";
         let byte_count = haystack.len();
-        let matcher = EmptyLineMatcher::new(b'\n');
+        let matcher = EmptyLineMatcher::new();
         let exp = format!(
             "4:\n7:\n8:\n11:\n\nbyte count:{}\n",
             byte_count);
@@ -1232,14 +1352,14 @@ d
             "3:4:\n5:7:\n6:8:\n8:11:\n\nbyte count:{}\n",
             byte_count);
 
-        search_assert_all_matcher(&exp, haystack, &matcher, |b| b);
-        search_assert_all_matcher(&exp_line, haystack, &matcher, |b| {
+        assert_matcher(&exp, haystack, &matcher, |b| b);
+        assert_matcher(&exp_line, haystack, &matcher, |b| {
             b.line_number(true)
         });
-        search_assert_all_matcher(&exp, haystack, &matcher, |b| {
+        assert_matcher(&exp, haystack, &matcher, |b| {
             b.multi_line(true)
         });
-        search_assert_all_matcher(&exp_line, haystack, &matcher, |b| {
+        assert_matcher(&exp_line, haystack, &matcher, |b| {
             b.multi_line(true).line_number(true)
         });
     }
@@ -1311,10 +1431,10 @@ d
     fn binary1() {
         let haystack = "\x00a";
         let exp = "\nbyte count:0\nbinary offset:0\n";
-        search_assert_all(exp, haystack, "a", |b| {
+        assert_substring(exp, haystack, "a", |b| {
             b.binary_detection(BinaryDetection::quit(0))
         });
-        search_assert_all(exp, haystack, "a", |b| {
+        assert_substring(exp, haystack, "a", |b| {
             b.multi_line(true).binary_detection(BinaryDetection::quit(0))
         });
     }
@@ -1324,10 +1444,10 @@ d
         let haystack = "a\x00";
 
         let exp = "\nbyte count:0\nbinary offset:1\n";
-        search_assert_all(exp, haystack, "a", |b| {
+        assert_substring(exp, haystack, "a", |b| {
             b.binary_detection(BinaryDetection::quit(0))
         });
-        search_assert_all(exp, haystack, "a", |b| {
+        assert_substring(exp, haystack, "a", |b| {
             b.multi_line(true).binary_detection(BinaryDetection::quit(0))
         });
     }
@@ -1363,7 +1483,7 @@ d
         assert_eq!(exp, got, "\nsearch_slice mismatch");
 
         let exp = "0:a\n32770:a\n\nbyte count:32773\nbinary offset:32773\n";
-        search_assert_all(&exp, &haystack, "a", |b| {
+        assert_substring(&exp, &haystack, "a", |b| {
             b.multi_line(true).binary_detection(BinaryDetection::quit(0))
         });
     }
