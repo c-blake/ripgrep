@@ -471,7 +471,14 @@ where M: Matcher,
             };
             self.set_pos(line.end());
             if matched != self.config.invert_match {
+                if !self.before_context_by_line(buf, line.start())? {
+                    return Ok(false);
+                }
                 if !self.sink_match(buf, &line)? {
+                    return Ok(false);
+                }
+            } else if self.after_context_left.get() >= 1 {
+                if !self.sink_after_context(buf, &line)? {
                     return Ok(false);
                 }
             }
@@ -667,6 +674,9 @@ where M: Matcher,
             return Ok(true);
         }
         let range = Match::new(self.last_line_visited.get(), upto);
+        if range.is_empty() {
+            return Ok(true);
+        }
         let before_context_start = lines::preceding(
             &buf[..range.end()],
             self.config.line_term,
@@ -759,7 +769,6 @@ d
             .test();
     }
 
-    /*
     #[test]
     fn basic_context1() {
         let exp = "\
@@ -779,7 +788,6 @@ byte count:366
             .expected_no_line_number(exp)
             .test();
     }
-    */
 
     #[test]
     fn invert1() {
