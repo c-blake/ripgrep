@@ -352,9 +352,11 @@ struct Core<'s, M: 's, S> {
     matcher: &'s M,
     searcher: &'s Searcher<M>,
     pos: Cell<usize>,
+    binary_byte_offset: Cell<Option<usize>>,
     line_number: Option<Cell<u64>>,
     last_line_counted: Cell<usize>,
-    binary_byte_offset: Cell<Option<usize>>,
+    last_line_visited: Cell<usize>,
+    after_context_left: Cell<usize>,
 }
 
 impl<'s, M, S> Core<'s, M, S>
@@ -375,9 +377,11 @@ where M: Matcher,
             matcher: &searcher.matcher,
             searcher: searcher,
             pos: Cell::new(0),
+            binary_byte_offset: Cell::new(None),
             line_number: line_number,
             last_line_counted: Cell::new(0),
-            binary_byte_offset: Cell::new(None),
+            last_line_visited: Cell::new(0),
+            after_context_left: Cell::new(0),
         }
     }
 
@@ -467,6 +471,38 @@ where M: Matcher,
         }
     }
 
+    fn visit_match<F>(
+        &self,
+        range: &Match,
+        mut on_match: F,
+    ) -> Result<bool, S::Error>
+    where F: FnMut(&Self, &Match) -> Result<bool, S::Error>
+    {
+        if !on_match(self, range)? {
+            return Ok(false);
+        }
+        self.last_line_visited.set(range.end());
+        self.after_context_left.set(self.config.after_context);
+        Ok(true)
+    }
+
+    fn visit_context<F>(
+        &self,
+        range: &Match,
+        mut on_context: F,
+    ) -> Result<bool, S::Error>
+    where F: FnMut(&Self, &Match) -> Result<bool, S::Error>
+    {
+        assert!(self.after_context_left.get() >= 1);
+
+        if !on_context(self, range)? {
+            return Ok(false);
+        }
+        self.last_line_visited.set(range.end());
+        self.after_context_left.set(self.after_context_left.get() - 1);
+        Ok(true)
+    }
+
     fn match_by_line_slow<F>(
         &self,
         buf: &[u8],
@@ -495,7 +531,7 @@ where M: Matcher,
             };
             self.set_pos(line.end());
             if matched != self.config.invert_match {
-                if !on_match(self, &line)? {
+                if !self.visit_match(&line, &mut on_match)? {
                     return Ok(false);
                 }
             }
@@ -518,7 +554,7 @@ where M: Matcher,
             } else if let Some(line) = self.find_by_line_fast(buf)? {
                 self.count_lines(buf, line.start());
                 self.set_pos(line.end());
-                if !on_match(self, &line)? {
+                if !self.visit_match(&line, &mut on_match)? {
                     return Ok(false);
                 }
             } else {
@@ -551,7 +587,7 @@ where M: Matcher,
         self.count_lines(buf, invert_match.start());
         let mut stepper = LineStep::new(self.config.line_term, invert_match);
         while let Some(line) = stepper.next(buf) {
-            if !on_match(self, &line)? {
+            if !self.visit_match(&line, &mut on_match)? {
                 return Ok(false);
             }
             self.add_one_line(line.end());
@@ -616,6 +652,58 @@ where M: Matcher,
             }
         }
         Ok(None)
+    }
+
+    fn after_context_by_line<F>(
+        &self,
+        buf: &[u8],
+        upto: usize,
+        mut on_context: F,
+    ) -> Result<bool, S::Error>
+    where F: FnMut(&Self, &Match) -> Result<bool, S::Error>
+    {
+        if self.after_context_left.get() == 0 {
+            return Ok(true);
+        }
+        let range = Match::new(self.last_line_visited.get(), upto);
+        let mut stepper = LineStep::new(self.config.line_term, range);
+        while let Some(line) = stepper.next(buf) {
+            if !self.visit_context(&line, &mut on_context)? {
+                return Ok(false);
+            }
+            if self.after_context_left.get() == 0 {
+                break;
+            }
+        }
+        Ok(true)
+    }
+
+    fn before_context_by_line<F>(
+        &self,
+        buf: &[u8],
+        upto: usize,
+        mut on_context: F,
+    ) -> Result<bool, S::Error>
+    where F: FnMut(&Self, &Match) -> Result<bool, S::Error>
+    {
+        if self.config.before_context == 0 {
+            return Ok(true);
+        }
+        let range = Match::new(self.last_line_visited.get(), upto);
+        let before_context_start = lines::preceding(
+            &buf[..range.end()],
+            self.config.line_term,
+            self.config.before_context - 1,
+        );
+
+        let range = Match::new(before_context_start, range.end());
+        let mut stepper = LineStep::new(self.config.line_term, range);
+        while let Some(line) = stepper.next(buf) {
+            if !self.visit_context(&line, &mut on_context)? {
+                return Ok(false);
+            }
+        }
+        Ok(true)
     }
 }
 
@@ -693,6 +781,28 @@ d
             .expected_no_line_number(&exp)
             .test();
     }
+
+    /*
+    #[test]
+    fn basic_context1() {
+        let exp = "\
+0:For the Doctor Watsons of this world, as opposed to the Sherlock
+65-Holmeses, success in the province of detective work must always
+129:be, to a very large extent, the result of luck. Sherlock Holmes
+193-can extract a clew from a wisp of straw or a flake of cigar ash;
+
+byte count:366
+";
+        SearcherTester::new(SHERLOCK, "Sherlock")
+            .filter(r"^reader-byline-noterm-nonumber$")
+            .print_labels(true)
+            .after_context(1)
+            .before_context(1)
+            .line_number(false)
+            .expected_no_line_number(exp)
+            .test();
+    }
+    */
 
     #[test]
     fn invert1() {

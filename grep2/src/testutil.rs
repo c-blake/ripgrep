@@ -203,6 +203,7 @@ pub struct SearcherTester {
     haystack: String,
     pattern: String,
     filter: Option<::regex::Regex>,
+    print_labels: bool,
     expected_no_line_number: Option<String>,
     expected_with_line_number: Option<String>,
     expected_slice_no_line_number: Option<String>,
@@ -213,6 +214,8 @@ pub struct SearcherTester {
     line_number: bool,
     binary: BinaryDetection,
     auto_heap_limit: bool,
+    after_context: usize,
+    before_context: usize,
 }
 
 impl SearcherTester {
@@ -222,6 +225,7 @@ impl SearcherTester {
             haystack: haystack.to_string(),
             pattern: pattern.to_string(),
             filter: None,
+            print_labels: false,
             expected_no_line_number: None,
             expected_with_line_number: None,
             expected_slice_no_line_number: None,
@@ -232,6 +236,8 @@ impl SearcherTester {
             line_number: true,
             binary: BinaryDetection::none(),
             auto_heap_limit: true,
+            after_context: 0,
+            before_context: 0,
         }
     }
 
@@ -251,27 +257,33 @@ impl SearcherTester {
         if configs.is_empty() {
             panic!("test configuration resulted in nothing being tested");
         }
-        for config in &configs {
-            if let Some(ref re) = self.filter {
-                if !re.is_match(&config.label) {
-                    continue;
+        if self.print_labels {
+            for config in &configs {
+                let labels = vec![
+                    format!("reader-{}", config.label),
+                    format!("slice-{}", config.label),
+                ];
+                for label in &labels {
+                    if self.include(label) {
+                        println!("{}", label);
+                    } else {
+                        println!("{} (ignored)", label);
+                    }
                 }
             }
-            let got = config.search_reader(&self.haystack);
-            assert_eq!(
-                config.expected_reader,
-                got,
-                "\nreader-{}",
-                config.label,
-            );
+        }
+        for config in &configs {
+            let label = format!("reader-{}", config.label);
+            if self.include(&label) {
+                let got = config.search_reader(&self.haystack);
+                assert_eq!(config.expected_reader, got, "\n{}", label);
+            }
 
-            let got = config.search_slice(&self.haystack);
-            assert_eq!(
-                config.expected_slice,
-                got,
-                "\nslice-{}",
-                config.label,
-            );
+            let label = format!("slice-{}", config.label);
+            if self.include(&label) {
+                let got = config.search_slice(&self.haystack);
+                assert_eq!(config.expected_slice, got, "\n{}", label);
+            }
         }
     }
 
@@ -285,6 +297,16 @@ impl SearcherTester {
     /// execute.
     pub fn filter(&mut self, pattern: &str) -> &mut SearcherTester {
         self.filter = Some(::regex::Regex::new(pattern).unwrap());
+        self
+    }
+
+    /// When set, the labels for all test configurations are printed before
+    /// executing any test.
+    ///
+    /// Note that in order to see these in tests that aren't failing, you'll
+    /// want to use `cargo test -- --nocapture`.
+    pub fn print_labels(&mut self, yes: bool) -> &mut SearcherTester {
+        self.print_labels = yes;
         self
     }
 
@@ -387,9 +409,38 @@ impl SearcherTester {
         self
     }
 
+    /// Set the number of lines to include in the "after" context.
+    ///
+    /// The default is `0`, which is equivalent to not printing any context.
+    pub fn after_context(&mut self, lines: usize) -> &mut SearcherTester {
+        self.after_context = lines;
+        self
+    }
+
+    /// Set the number of lines to include in the "before" context.
+    ///
+    /// The default is `0`, which is equivalent to not printing any context.
+    pub fn before_context(&mut self, lines: usize) -> &mut SearcherTester {
+        self.before_context = lines;
+        self
+    }
+
     /// Return the maximum line length in this builder's haystack.
     fn max_line_len(&self) -> usize {
         self.haystack.lines().map(|s| s.len()).max().unwrap_or(0)
+    }
+
+    /// Returns true if and only if the given label should be included as part
+    /// of executing `test`.
+    ///
+    /// Inclusion is determined by the filter specified. If no filter has been
+    /// given, then this always returns `true`.
+    fn include(&self, label: &str) -> bool {
+        let re = match self.filter {
+            None => return true,
+            Some(ref re) => re,
+        };
+        re.is_match(label)
     }
 
     /// Configs generates a set of all search configurations that should be
@@ -400,8 +451,11 @@ impl SearcherTester {
 
         let matcher = RegexMatcher::new(&self.pattern);
         let mut builder = SearcherBuilder::new();
-        builder.invert_match(self.invert_match);
-        builder.binary_detection(self.binary.clone());
+        builder
+            .invert_match(self.invert_match)
+            .binary_detection(self.binary.clone())
+            .after_context(self.after_context)
+            .before_context(self.before_context);
 
         if self.by_line {
             let mut matcher = matcher.clone();
