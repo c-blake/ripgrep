@@ -29,10 +29,14 @@ pub trait Sink {
         Ok(false)
     }
 
-    fn context(
+    fn context<M>(
         &mut self,
+        _searcher: &Searcher<M>,
         _context: &SinkContext,
-    ) -> Result<bool, Self::Error> {
+    ) -> Result<bool, Self::Error>
+    where M: Matcher,
+          M::Error: fmt::Display
+    {
         Ok(true)
     }
 
@@ -67,11 +71,15 @@ impl<'a, S: Sink> Sink for &'a mut S {
         (**self).matched(searcher, mat)
     }
 
-    fn context(
+    fn context<M>(
         &mut self,
+        searcher: &Searcher<M>,
         context: &SinkContext,
-    ) -> Result<bool, S::Error> {
-        (**self).context(context)
+    ) -> Result<bool, S::Error>
+    where M: Matcher,
+          M::Error: fmt::Display
+    {
+        (**self).context(searcher, context)
     }
 
     fn context_break(&mut self) -> Result<(), S::Error> {

@@ -160,10 +160,14 @@ impl Sink for KitchenSink {
         Ok(true)
     }
 
-    fn context(
+    fn context<M>(
         &mut self,
+        _searcher: &Searcher<M>,
         context: &SinkContext,
-    ) -> Result<bool, io::Error> {
+    ) -> Result<bool, io::Error>
+    where M: Matcher,
+          M::Error: fmt::Display
+    {
         write!(self.0, "{}-", context.absolute_byte_offset)?;
         if let Some(line_number) = context.line_number() {
             write!(self.0, "{}-", line_number)?;
