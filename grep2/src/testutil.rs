@@ -6,7 +6,7 @@ use memchr::memchr;
 use regex::bytes::{Regex, RegexBuilder};
 
 use matcher::{LineMatchKind, Match, Matcher, NoCaptures, NoError};
-use searcher_builder::Searcher;
+use searcher_builder::{BinaryDetection, Searcher, SearcherBuilder};
 use sink::{Sink, SinkContext, SinkFinish, SinkMatch};
 
 /// A simple regex matcher.
@@ -103,187 +103,6 @@ impl Matcher for RegexMatcher {
     }
 }
 
-/// A simple substring matcher that requires UTF-8.
-///
-/// This supports setting the matcher's line terminator configuration directly,
-/// which we use for testing purposes.
-#[derive(Clone, Debug)]
-pub struct SubstringMatcher {
-    pattern: String,
-    line_term: Option<u8>,
-    every_line_is_candidate: bool,
-}
-
-impl SubstringMatcher {
-    /// Create a new substring matcher.
-    pub fn new(pattern: &str) -> SubstringMatcher {
-        SubstringMatcher {
-            pattern: pattern.to_string(),
-            line_term: None,
-            every_line_is_candidate: false,
-        }
-    }
-
-    /// Forcefully set the line terminator of this matcher.
-    ///
-    /// By default, this matcher has no line terminator set.
-    ///
-    /// This panics if the pattern string contains the given line terminator.
-    pub fn set_line_term(
-        &mut self,
-        line_term: Option<u8>,
-    ) -> &mut SubstringMatcher {
-        if let Some(b) = line_term {
-            let bytes = self.pattern.as_bytes();
-            assert!(bytes.iter().position(|&x| x == b).is_none());
-        }
-        self.line_term = line_term;
-        self
-    }
-
-    /// Whether to return every line as a candidate or not.
-    ///
-    /// This forces searchers to handle the case of reporting a false positive.
-    pub fn every_line_is_candidate(
-        &mut self,
-        yes: bool,
-    ) -> &mut SubstringMatcher {
-        self.every_line_is_candidate = yes;
-        self
-    }
-}
-
-impl Matcher for SubstringMatcher {
-    type Captures = NoCaptures;
-    type Error = str::Utf8Error;
-
-    fn find_at(
-        &self,
-        haystack: &[u8],
-        at: usize,
-    ) -> Result<Option<Match>, str::Utf8Error> {
-        let slice = str::from_utf8(haystack)?;
-        Ok(slice[at..].find(&self.pattern).map(|i| {
-            Match::new(at + i, at + i + self.pattern.len())
-        }))
-    }
-
-    fn new_captures(&self) -> Result<NoCaptures, str::Utf8Error> {
-        Ok(NoCaptures::new())
-    }
-
-    fn line_terminator(&self) -> Option<u8> {
-        self.line_term
-    }
-
-    fn find_candidate_line(
-        &self,
-        haystack: &[u8],
-    ) -> Result<Option<LineMatchKind>, str::Utf8Error> {
-        if self.every_line_is_candidate {
-            assert!(self.line_term.is_some());
-            if haystack.is_empty() {
-                return Ok(None);
-            }
-            // Make it interesting and return the last byte in the current
-            // line.
-            let i = memchr(self.line_term.unwrap(), haystack)
-                .map(|i| i)
-                .unwrap_or(haystack.len() - 1);
-            Ok(Some(LineMatchKind::Candidate(i)))
-        } else {
-            Ok(self.shortest_match(haystack)?.map(LineMatchKind::Confirmed))
-        }
-    }
-}
-
-/// A matcher that matches only the empty line and nothing else. An empty line
-/// is defined as a line with at most one byte, where that byte is the line
-/// terminator.
-#[derive(Clone, Debug)]
-pub struct EmptyLineMatcher {
-    regex: Regex,
-    line_term: Option<u8>,
-    every_line_is_candidate: bool,
-}
-
-impl EmptyLineMatcher {
-    /// Create a new empty line matcher.
-    pub fn new() -> EmptyLineMatcher {
-        EmptyLineMatcher {
-            regex: Regex::new(r"(?m)^$").unwrap(),
-            line_term: None,
-            every_line_is_candidate: false,
-        }
-    }
-
-    /// Set the line terminator that is reported by the Matcher implementation.
-    ///
-    /// This is useful for exercising different paths through the searcher.
-    pub fn set_line_term(
-        &mut self,
-        line_term: Option<u8>,
-    ) -> &mut EmptyLineMatcher {
-        self.line_term = line_term;
-        self
-    }
-
-    /// Whether to return every line as a candidate or not.
-    ///
-    /// This forces searchers to handle the case of reporting a false positive.
-    pub fn every_line_is_candidate(
-        &mut self,
-        yes: bool,
-    ) -> &mut EmptyLineMatcher {
-        self.every_line_is_candidate = yes;
-        self
-    }
-}
-
-impl Matcher for EmptyLineMatcher {
-    type Captures = NoCaptures;
-    type Error = NoError;
-
-    fn find_at(
-        &self,
-        haystack: &[u8],
-        at: usize,
-    ) -> Result<Option<Match>, NoError> {
-        Ok(self.regex
-           .find_at(haystack, at)
-           .map(|m| Match::new(m.start(), m.end())))
-    }
-
-    fn new_captures(&self) -> Result<NoCaptures, NoError> {
-        Ok(NoCaptures::new())
-    }
-
-    fn line_terminator(&self) -> Option<u8> {
-        self.line_term
-    }
-
-    fn find_candidate_line(
-        &self,
-        haystack: &[u8],
-    ) -> Result<Option<LineMatchKind>, NoError> {
-        if self.every_line_is_candidate {
-            assert!(self.line_term.is_some());
-
-            if haystack.is_empty() {
-                return Ok(None);
-            }
-            // Make it interesting and return the last byte in the current
-            // line.
-            let i = memchr(self.line_term.unwrap(), haystack)
-                .map(|i| i)
-                .unwrap_or(haystack.len());
-            Ok(Some(LineMatchKind::Candidate(i)))
-        } else {
-            Ok(self.shortest_match(haystack)?.map(LineMatchKind::Confirmed))
-        }
-    }
-}
-
 /// An implementation of Sink that prints all available information.
 ///
 /// This is useful for tests because it lets us easily confirm whether data
@@ -368,6 +187,402 @@ impl Sink for KitchenSink {
     }
 }
 
+/// A type for expressing tests on a searcher.
+///
+/// The searcher code has a lot of different code paths, mostly for the
+/// purposes of optimizing a bunch of different use cases. The intent of the
+/// searcher is to pick the best code path based on the configuration, which
+/// means there is no obviously direct way to ask that a specific code path
+/// be exercised. Thus, the purpose of this tester is to explicitly check as
+/// many code paths that make sense.
+///
+/// The tester works by assuming you want to test all pertinent code paths.
+/// These can be trimmed down as necessary via the various builder methods.
+#[derive(Debug)]
+pub struct SearcherTester {
+    haystack: String,
+    pattern: String,
+    filter: Option<::regex::Regex>,
+    expected_no_line_number: Option<String>,
+    expected_with_line_number: Option<String>,
+    expected_slice_no_line_number: Option<String>,
+    expected_slice_with_line_number: Option<String>,
+    by_line: bool,
+    multi_line: bool,
+    invert_match: bool,
+    line_number: bool,
+    binary: BinaryDetection,
+    auto_heap_limit: bool,
+}
+
+impl SearcherTester {
+    /// Create a new tester for testing searchers.
+    pub fn new(haystack: &str, pattern: &str) -> SearcherTester {
+        SearcherTester {
+            haystack: haystack.to_string(),
+            pattern: pattern.to_string(),
+            filter: None,
+            expected_no_line_number: None,
+            expected_with_line_number: None,
+            expected_slice_no_line_number: None,
+            expected_slice_with_line_number: None,
+            by_line: true,
+            multi_line: true,
+            invert_match: false,
+            line_number: true,
+            binary: BinaryDetection::none(),
+            auto_heap_limit: true,
+        }
+    }
+
+    /// Execute the test. If the test succeeds, then this returns successfully.
+    /// If the test fails, then it panics with an informative message.
+    pub fn test(&self) {
+        // Check for configuration errors.
+        if self.expected_no_line_number.is_none() {
+            panic!("an 'expected' string with NO line numbers must be given");
+        }
+        if self.line_number && self.expected_with_line_number.is_none() {
+            panic!("an 'expected' string with line numbers must be given, \
+                    or disable testing with line numbers");
+        }
+
+        let configs = self.configs();
+        if configs.is_empty() {
+            panic!("test configuration resulted in nothing being tested");
+        }
+        for config in &configs {
+            if let Some(ref re) = self.filter {
+                if !re.is_match(&config.label) {
+                    continue;
+                }
+            }
+            let got = config.search_reader(&self.haystack);
+            assert_eq!(
+                config.expected_reader,
+                got,
+                "\nreader-{}",
+                config.label,
+            );
+
+            let got = config.search_slice(&self.haystack);
+            assert_eq!(
+                config.expected_slice,
+                got,
+                "\nslice-{}",
+                config.label,
+            );
+        }
+    }
+
+    /// Set a regex pattern to filter the tests that are run.
+    ///
+    /// By default, no filter is present. When a filter is set, only test
+    /// configurations with a label matching the given pattern will be run.
+    ///
+    /// This is often useful when debugging tests, e.g., when you want to do
+    /// printf debugging and only want one particular test configuration to
+    /// execute.
+    pub fn filter(&mut self, pattern: &str) -> &mut SearcherTester {
+        self.filter = Some(::regex::Regex::new(pattern).unwrap());
+        self
+    }
+
+    /// Set the expected search results, without line numbers.
+    pub fn expected_no_line_number(
+        &mut self,
+        exp: &str,
+    ) -> &mut SearcherTester {
+        self.expected_no_line_number = Some(exp.to_string());
+        self
+    }
+
+    /// Set the expected search results, with line numbers.
+    pub fn expected_with_line_number(
+        &mut self,
+        exp: &str,
+    ) -> &mut SearcherTester {
+        self.expected_with_line_number = Some(exp.to_string());
+        self
+    }
+
+    /// Set the expected search results, without line numbers, when performing
+    /// a search on a slice. When not present, `expected_no_line_number` is
+    /// used instead.
+    pub fn expected_slice_no_line_number(
+        &mut self,
+        exp: &str,
+    ) -> &mut SearcherTester {
+        self.expected_slice_no_line_number = Some(exp.to_string());
+        self
+    }
+
+    /// Set the expected search results, with line numbers, when performing a
+    /// search on a slice. When not present, `expected_with_line_number` is
+    /// used instead.
+    pub fn expected_slice_with_line_number(
+        &mut self,
+        exp: &str,
+    ) -> &mut SearcherTester {
+        self.expected_slice_with_line_number = Some(exp.to_string());
+        self
+    }
+
+    /// Whether to test search with line numbers or not.
+    ///
+    /// This is enabled by default. When enabled, the string that is expected
+    /// when line numbers are present must be provided. Otherwise, the expected
+    /// string isn't required.
+    pub fn line_number(&mut self, yes: bool) -> &mut SearcherTester {
+        self.line_number = yes;
+        self
+    }
+
+    /// Whether to test search using the line-by-line searcher or not.
+    ///
+    /// By default, this is enabled.
+    pub fn by_line(&mut self, yes: bool) -> &mut SearcherTester {
+        self.by_line = yes;
+        self
+    }
+
+    /// Whether to test search using the multi line searcher or not.
+    ///
+    /// By default, this is enabled.
+    pub fn multi_line(&mut self, yes: bool) -> &mut SearcherTester {
+        self.multi_line = yes;
+        self
+    }
+
+    /// Whether to perform an inverted search or not.
+    ///
+    /// By default, this is disabled.
+    pub fn invert_match(&mut self, yes: bool) -> &mut SearcherTester {
+        self.invert_match = yes;
+        self
+    }
+
+    /// Whether to enable binary detection on all searches.
+    ///
+    /// By default, this is disabled.
+    pub fn binary_detection(
+        &mut self,
+        detection: BinaryDetection,
+    ) -> &mut SearcherTester {
+        self.binary = detection;
+        self
+    }
+
+    /// Whether to automatically attempt to test the heap limit setting or not.
+    ///
+    /// By default, one of the test configurations includes setting the heap
+    /// limit to its minimal value for normal operation, which checks that
+    /// everything works even at the extremes. However, in some cases, the heap
+    /// limit can (expectedly) alter the output slightly. For example, it can
+    /// impact the number of bytes searched when performing binary detection.
+    /// For convenience, it can be useful to disable the automatic heap limit
+    /// test.
+    pub fn auto_heap_limit(&mut self, yes: bool) -> &mut SearcherTester {
+        self.auto_heap_limit = yes;
+        self
+    }
+
+    /// Return the maximum line length in this builder's haystack.
+    fn max_line_len(&self) -> usize {
+        self.haystack.lines().map(|s| s.len()).max().unwrap_or(0)
+    }
+
+    /// Configs generates a set of all search configurations that should be
+    /// tested. The configs generated are based on the configuration in this
+    /// builder.
+    fn configs(&self) -> Vec<TesterConfig> {
+        let mut configs = vec![];
+
+        let matcher = RegexMatcher::new(&self.pattern);
+        let mut builder = SearcherBuilder::new();
+        builder.invert_match(self.invert_match);
+        builder.binary_detection(self.binary.clone());
+
+        if self.by_line {
+            let mut matcher = matcher.clone();
+            let mut builder = builder.clone();
+
+            let expected_reader =
+                self.expected_no_line_number.as_ref().unwrap().to_string();
+            let expected_slice = match self.expected_slice_no_line_number {
+                None => expected_reader.clone(),
+                Some(ref e) => e.to_string(),
+            };
+            configs.push(TesterConfig {
+                label: "byline-noterm-nonumber".to_string(),
+                expected_reader: expected_reader.clone(),
+                expected_slice: expected_slice.clone(),
+                builder: builder.clone(),
+                matcher: matcher.clone(),
+            });
+
+            if self.auto_heap_limit {
+                builder.heap_limit(Some(self.max_line_len() + 1));
+                configs.push(TesterConfig {
+                    label: "byline-noterm-nonumber-heaplimit".to_string(),
+                    expected_reader: expected_reader.clone(),
+                    expected_slice: expected_slice.clone(),
+                    builder: builder.clone(),
+                    matcher: matcher.clone(),
+                });
+                builder.heap_limit(None);
+            }
+
+            matcher.set_line_term(Some(b'\n'));
+            configs.push(TesterConfig {
+                label: "byline-term-nonumber".to_string(),
+                expected_reader: expected_reader.clone(),
+                expected_slice: expected_slice.clone(),
+                builder: builder.clone(),
+                matcher: matcher.clone(),
+            });
+
+            matcher.every_line_is_candidate(true);
+            configs.push(TesterConfig {
+                label: "byline-term-nonumber-candidates".to_string(),
+                expected_reader: expected_reader.clone(),
+                expected_slice: expected_slice.clone(),
+                builder: builder.clone(),
+                matcher: matcher.clone(),
+            });
+        }
+        if self.by_line && self.line_number {
+            let mut matcher = matcher.clone();
+            let mut builder = builder.clone();
+
+            let expected_reader =
+                self.expected_with_line_number.as_ref().unwrap().to_string();
+            let expected_slice = match self.expected_slice_with_line_number {
+                None => expected_reader.clone(),
+                Some(ref e) => e.to_string(),
+            };
+
+            builder.line_number(true);
+            configs.push(TesterConfig {
+                label: "byline-noterm-number".to_string(),
+                expected_reader: expected_reader.clone(),
+                expected_slice: expected_slice.clone(),
+                builder: builder.clone(),
+                matcher: matcher.clone(),
+            });
+
+            matcher.set_line_term(Some(b'\n'));
+            configs.push(TesterConfig {
+                label: "byline-term-number".to_string(),
+                expected_reader: expected_reader.clone(),
+                expected_slice: expected_slice.clone(),
+                builder: builder.clone(),
+                matcher: matcher.clone(),
+            });
+
+            matcher.every_line_is_candidate(true);
+            configs.push(TesterConfig {
+                label: "byline-term-number-candidates".to_string(),
+                expected_reader: expected_reader.clone(),
+                expected_slice: expected_slice.clone(),
+                builder: builder.clone(),
+                matcher: matcher.clone(),
+            });
+        }
+        if self.multi_line {
+            let mut builder = builder.clone();
+            let expected_slice = match self.expected_slice_no_line_number {
+                None => {
+                    self.expected_no_line_number.as_ref().unwrap().to_string()
+                }
+                Some(ref e) => e.to_string(),
+            };
+
+            builder.multi_line(true);
+            configs.push(TesterConfig {
+                label: "multiline-nonumber".to_string(),
+                expected_reader: expected_slice.clone(),
+                expected_slice: expected_slice.clone(),
+                builder: builder.clone(),
+                matcher: matcher.clone(),
+            });
+
+            if self.auto_heap_limit {
+                builder.heap_limit(Some(self.haystack.len() + 1));
+                configs.push(TesterConfig {
+                    label: "multiline-nonumber-heaplimit".to_string(),
+                    expected_reader: expected_slice.clone(),
+                    expected_slice: expected_slice.clone(),
+                    builder: builder.clone(),
+                    matcher: matcher.clone(),
+                });
+                builder.heap_limit(None);
+            }
+        }
+        if self.multi_line && self.line_number {
+            let mut builder = builder.clone();
+            let expected_slice = match self.expected_slice_with_line_number {
+                None => {
+                    self.expected_with_line_number
+                        .as_ref().unwrap().to_string()
+                }
+                Some(ref e) => e.to_string(),
+            };
+
+            builder.multi_line(true);
+            builder.line_number(true);
+            configs.push(TesterConfig {
+                label: "multiline-number".to_string(),
+                expected_reader: expected_slice.clone(),
+                expected_slice: expected_slice.clone(),
+                builder: builder.clone(),
+                matcher: matcher.clone(),
+            });
+
+            builder.heap_limit(Some(self.haystack.len() + 1));
+            configs.push(TesterConfig {
+                label: "multiline-number-heaplimit".to_string(),
+                expected_reader: expected_slice.clone(),
+                expected_slice: expected_slice.clone(),
+                builder: builder.clone(),
+                matcher: matcher.clone(),
+            });
+            builder.heap_limit(None);
+        }
+        configs
+    }
+}
+
+#[derive(Debug)]
+struct TesterConfig {
+    label: String,
+    expected_reader: String,
+    expected_slice: String,
+    builder: SearcherBuilder,
+    matcher: RegexMatcher,
+}
+
+impl TesterConfig {
+    /// Execute a search using a reader. This exercises the incremental search
+    /// strategy, where the entire contents of the corpus aren't necessarily
+    /// in memory at once.
+    fn search_reader(&self, haystack: &str) -> String {
+        let mut sink = KitchenSink::new();
+        let mut searcher = self.builder.build(&self.matcher).unwrap();
+        searcher.search_reader(haystack.as_bytes(), &mut sink).unwrap();
+        String::from_utf8(sink.as_bytes().to_vec()).unwrap()
+    }
+
+    /// Execute a search using a slice. This exercises the search routines that
+    /// have the entire contents of the corpus in memory at one time.
+    fn search_slice(&self, haystack: &str) -> String {
+        let mut sink = KitchenSink::new();
+        let mut searcher = self.builder.build(&self.matcher).unwrap();
+        searcher.search_slice(haystack.as_bytes(), &mut sink).unwrap();
+        String::from_utf8(sink.as_bytes().to_vec()).unwrap()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use matcher::{Match, Matcher};
@@ -381,7 +596,7 @@ mod tests {
     #[test]
     fn empty_line1() {
         let haystack = b"";
-        let matcher = EmptyLineMatcher::new();
+        let matcher = RegexMatcher::new(r"^$");
 
         assert_eq!(matcher.find_at(haystack, 0), Ok(Some(m(0, 0))));
     }
@@ -389,7 +604,7 @@ mod tests {
     #[test]
     fn empty_line2() {
         let haystack = b"\n";
-        let matcher = EmptyLineMatcher::new();
+        let matcher = RegexMatcher::new(r"^$");
 
         assert_eq!(matcher.find_at(haystack, 0), Ok(Some(m(0, 0))));
         assert_eq!(matcher.find_at(haystack, 1), Ok(Some(m(1, 1))));
@@ -398,7 +613,7 @@ mod tests {
     #[test]
     fn empty_line3() {
         let haystack = b"\n\n";
-        let matcher = EmptyLineMatcher::new();
+        let matcher = RegexMatcher::new(r"^$");
 
         assert_eq!(matcher.find_at(haystack, 0), Ok(Some(m(0, 0))));
         assert_eq!(matcher.find_at(haystack, 1), Ok(Some(m(1, 1))));
@@ -408,7 +623,7 @@ mod tests {
     #[test]
     fn empty_line4() {
         let haystack = b"a\n\nb\n";
-        let matcher = EmptyLineMatcher::new();
+        let matcher = RegexMatcher::new(r"^$");
 
         assert_eq!(matcher.find_at(haystack, 0), Ok(Some(m(2, 2))));
         assert_eq!(matcher.find_at(haystack, 1), Ok(Some(m(2, 2))));
@@ -421,7 +636,7 @@ mod tests {
     #[test]
     fn empty_line5() {
         let haystack = b"a\n\nb\nc";
-        let matcher = EmptyLineMatcher::new();
+        let matcher = RegexMatcher::new(r"^$");
 
         assert_eq!(matcher.find_at(haystack, 0), Ok(Some(m(2, 2))));
         assert_eq!(matcher.find_at(haystack, 1), Ok(Some(m(2, 2))));
@@ -435,7 +650,7 @@ mod tests {
     #[test]
     fn empty_line6() {
         let haystack = b"a\n";
-        let matcher = EmptyLineMatcher::new();
+        let matcher = RegexMatcher::new(r"^$");
 
         assert_eq!(matcher.find_at(haystack, 0), Ok(Some(m(2, 2))));
         assert_eq!(matcher.find_at(haystack, 1), Ok(Some(m(2, 2))));

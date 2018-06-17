@@ -526,7 +526,7 @@ impl LineBuffer {
                 let used = self.buf.len() - self.config.capacity;
                 let n = cmp::min(len * 2, limit - used);
                 if n == 0 {
-                    return Err(alloc_error(limit));
+                    return Err(alloc_error(self.config.capacity + limit));
                 }
                 n
             }

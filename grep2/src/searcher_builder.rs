@@ -9,12 +9,7 @@ use line_buffer::{
     DEFAULT_BUFFER_CAPACITY, alloc_error,
 };
 use matcher::Matcher;
-use searcher_exec::{
-    Reader, SliceReader,
-    SearcherByLine,
-    SearcherReadByLine,
-    SearcherMultiLine,
-};
+use searcher_exec::{ReadByLine, SliceByLine, MultiLine};
 use sink::Sink;
 
 /// The behavior of binary detection while searching.
@@ -226,7 +221,7 @@ impl fmt::Display for ConfigError {
     }
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct SearcherBuilder {
     pub(crate) config: Config,
 }
@@ -368,7 +363,7 @@ where M: Matcher,
         } else {
             let mut line_buffer = self.line_buffer.borrow_mut();
             let rdr = LineBufferReader::new(read_from, &mut *line_buffer);
-            SearcherReadByLine::new(self, rdr, write_to).run()
+            ReadByLine::new(self, rdr, write_to).run()
         }
     }
 
@@ -380,16 +375,8 @@ where M: Matcher,
         if self.config.multi_line {
             self.search_multi_line(slice, write_to)
         } else {
-            self.search_by_line(SliceReader::new(slice), write_to)
+            SliceByLine::new(self, slice, write_to).run()
         }
-    }
-
-    fn search_by_line<R: Reader, S: Sink>(
-        &self,
-        read_from: R,
-        write_to: S,
-    ) -> Result<(), S::Error> {
-        SearcherByLine::new(self, read_from, write_to).run()
     }
 
     fn search_multi_line<S: Sink>(
@@ -397,7 +384,7 @@ where M: Matcher,
         slice: &[u8],
         write_to: S,
     ) -> Result<(), S::Error> {
-        SearcherMultiLine::new(self, slice, write_to).run()
+        MultiLine::new(self, slice, write_to).run()
     }
 
     /// Fill the buffer for use with multi-line searching from the given file.
