@@ -340,6 +340,7 @@ where M: Matcher,
         self.set_pos(0);
         self.absolute_byte_offset.set(absolute_byte_offset + buf.len() as u64);
         self.last_line_counted.set(0);
+        self.last_line_visited.set(0);
     }
 
     fn config(&self) -> &Config {
@@ -770,26 +771,6 @@ d
     }
 
     #[test]
-    fn basic_context1() {
-        let exp = "\
-0:For the Doctor Watsons of this world, as opposed to the Sherlock
-65-Holmeses, success in the province of detective work must always
-129:be, to a very large extent, the result of luck. Sherlock Holmes
-193-can extract a clew from a wisp of straw or a flake of cigar ash;
-
-byte count:366
-";
-        SearcherTester::new(SHERLOCK, "Sherlock")
-            .filter(r"^reader-byline-noterm-nonumber$")
-            .print_labels(true)
-            .after_context(1)
-            .before_context(1)
-            .line_number(false)
-            .expected_no_line_number(exp)
-            .test();
-    }
-
-    #[test]
     fn invert1() {
         let exp = "\
 65:Holmeses, success in the province of detective work must always
@@ -1129,6 +1110,103 @@ d
             .auto_heap_limit(false)
             .expected_no_line_number(exp)
             .expected_slice_no_line_number(exp_slice)
+            .test();
+    }
+
+    #[test]
+    fn context1() {
+        let exp = "\
+0:For the Doctor Watsons of this world, as opposed to the Sherlock
+65-Holmeses, success in the province of detective work must always
+129:be, to a very large extent, the result of luck. Sherlock Holmes
+193-can extract a clew from a wisp of straw or a flake of cigar ash;
+
+byte count:366
+";
+        // before and after
+        SearcherTester::new(SHERLOCK, "Sherlock")
+            .filter(r"^reader-byline-noterm-nonumber$")
+            .print_labels(true)
+            .after_context(1)
+            .before_context(1)
+            .line_number(false)
+            .expected_no_line_number(exp)
+            .test();
+
+        // after (same as before + after)
+        SearcherTester::new(SHERLOCK, "Sherlock")
+            .filter(r"^reader-byline-noterm-nonumber$")
+            .print_labels(true)
+            .after_context(1)
+            .line_number(false)
+            .expected_no_line_number(exp)
+            .test();
+
+        // before
+        let before_exp = "\
+0:For the Doctor Watsons of this world, as opposed to the Sherlock
+65-Holmeses, success in the province of detective work must always
+129:be, to a very large extent, the result of luck. Sherlock Holmes
+
+byte count:366
+";
+        SearcherTester::new(SHERLOCK, "Sherlock")
+            .filter(r"^reader-byline-noterm-nonumber$")
+            .print_labels(true)
+            .before_context(1)
+            .line_number(false)
+            .expected_no_line_number(before_exp)
+            .test();
+    }
+
+    #[test]
+    fn context_invert1() {
+        let exp = "\
+0-For the Doctor Watsons of this world, as opposed to the Sherlock
+65:Holmeses, success in the province of detective work must always
+129-be, to a very large extent, the result of luck. Sherlock Holmes
+193:can extract a clew from a wisp of straw or a flake of cigar ash;
+258:but Doctor Watson has to have it taken out for him and dusted,
+321:and exhibited clearly, with a label attached.
+byte count:366
+";
+        // before and after
+        SearcherTester::new(SHERLOCK, "Sherlock")
+            .filter(r"^reader-byline-noterm-nonumber$")
+            .print_labels(true)
+            .after_context(1)
+            .before_context(1)
+            .line_number(false)
+            .invert_match(true)
+            .expected_no_line_number(exp)
+            .test();
+
+        // after
+        let after_exp = "\
+65:Holmeses, success in the province of detective work must always
+129-be, to a very large extent, the result of luck. Sherlock Holmes
+193:can extract a clew from a wisp of straw or a flake of cigar ash;
+258:but Doctor Watson has to have it taken out for him and dusted,
+321:and exhibited clearly, with a label attached.
+byte count:366
+";
+        SearcherTester::new(SHERLOCK, "Sherlock")
+            .filter(r"^reader-byline-noterm-nonumber$")
+            .print_labels(true)
+            .after_context(1)
+            .line_number(false)
+            .invert_match(true)
+            .expected_no_line_number(after_exp)
+            .test();
+
+        // before (same as before + after)
+        SearcherTester::new(SHERLOCK, "Sherlock")
+            .filter(r"^reader-byline-noterm-nonumber$")
+            .print_labels(true)
+            .before_context(1)
+            .line_number(false)
+            .invert_match(true)
+            .expected_no_line_number(exp)
             .test();
     }
 }
