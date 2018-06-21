@@ -55,8 +55,9 @@ where M: Matcher,
     fn fill(&mut self) -> Result<bool, S::Error> {
         assert!(self.rdr.buffer()[self.core.pos()..].is_empty());
 
-        self.core.roll(self.rdr.absolute_byte_offset(), self.rdr.buffer());
-        self.rdr.consume_all();
+        let consumed = self.core.roll(
+            self.rdr.absolute_byte_offset(), self.rdr.buffer());
+        self.rdr.consume(consumed);
         let didread = match self.rdr.fill() {
             Err(err) => return Err(S::error_io(err)),
             Ok(didread) => didread,
@@ -335,12 +336,39 @@ where M: Matcher,
         }
     }
 
-    fn roll(&self, absolute_byte_offset: u64, buf: &[u8]) {
-        self.count_remaining_lines(buf);
-        self.set_pos(0);
-        self.absolute_byte_offset.set(absolute_byte_offset + buf.len() as u64);
+    fn roll(&self, absolute_byte_offset: u64, buf: &[u8]) -> usize {
+        let consumed =
+            if self.config.before_context == 0 {
+                buf.len()
+            } else {
+                let before_context_start = lines::preceding(
+                    buf,
+                    self.config.line_term,
+                    self.config.before_context - 1,
+                );
+                let consumed = cmp::max(
+                    before_context_start,
+                    self.last_line_visited.get(),
+                );
+                // If we can't make any progress, then that implies the entire
+                // contents of the buffer are considered part of a potential
+                // "before" context. However, if the entire buffer is just for
+                // the context, then that implies all of the buffer has already
+                // been searched, which in turn implies the context can never
+                // be used again since there are no more matches. In this case,
+                // we forcefully consume the rest of the buffer.
+                if consumed == 0 {
+                    buf.len()
+                } else {
+                    consumed
+                }
+            };
+        self.count_lines(buf, consumed);
+        self.absolute_byte_offset.set(absolute_byte_offset + consumed as u64);
         self.last_line_counted.set(0);
         self.last_line_visited.set(0);
+        self.set_pos(buf.len() - consumed);
+        consumed
     }
 
     fn config(&self) -> &Config {
@@ -377,10 +405,6 @@ where M: Matcher,
 
     fn line_number(&self) -> Option<u64> {
         self.line_number.as_ref().map(|cell| cell.get())
-    }
-
-    fn count_remaining_lines(&self, buf: &[u8]) {
-        self.count_lines(buf, buf.len());
     }
 
     fn count_lines(&self, buf: &[u8], upto: usize) {
@@ -1207,6 +1231,26 @@ byte count:366
             .line_number(false)
             .invert_match(true)
             .expected_no_line_number(exp)
+            .test();
+    }
+
+    #[test]
+    fn context2() {
+        // before
+        let before_exp = "\
+65-Holmeses, success in the province of detective work must always
+129:be, to a very large extent, the result of luck. Sherlock Holmes
+193:can extract a clew from a wisp of straw or a flake of cigar ash;
+258-but Doctor Watson has to have it taken out for him and dusted,
+321:and exhibited clearly, with a label attached.
+byte count:366
+";
+        SearcherTester::new(SHERLOCK, " a ")
+            .filter(r"^reader-byline-noterm-nonumber$")
+            .print_labels(true)
+            .before_context(1)
+            .line_number(false)
+            .expected_no_line_number(before_exp)
             .test();
     }
 }
