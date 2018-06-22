@@ -40,11 +40,24 @@ pub trait Sink {
         Ok(true)
     }
 
-    fn context_break(&mut self) -> Result<(), Self::Error> {
-        Ok(())
+    fn context_break<M>(
+        &mut self,
+        _searcher: &Searcher<M>,
+    ) -> Result<bool, Self::Error>
+    where M: Matcher,
+          M::Error: fmt::Display
+    {
+        Ok(true)
     }
 
-    fn finish(&mut self, _: &SinkFinish) -> Result<(), Self::Error> {
+    fn finish<M>(
+        &mut self,
+        _searcher: &Searcher<M>,
+        _: &SinkFinish,
+    ) -> Result<(), Self::Error>
+    where M: Matcher,
+          M::Error: fmt::Display
+    {
         Ok(())
     }
 }
@@ -82,12 +95,25 @@ impl<'a, S: Sink> Sink for &'a mut S {
         (**self).context(searcher, context)
     }
 
-    fn context_break(&mut self) -> Result<(), S::Error> {
-        (**self).context_break()
+    fn context_break<M>(
+        &mut self,
+        searcher: &Searcher<M>,
+    ) -> Result<bool, S::Error>
+    where M: Matcher,
+          M::Error: fmt::Display
+    {
+        (**self).context_break(searcher)
     }
 
-    fn finish(&mut self, sink_finish: &SinkFinish) -> Result<(), S::Error> {
-        (**self).finish(sink_finish)
+    fn finish<M>(
+        &mut self,
+        searcher: &Searcher<M>,
+        sink_finish: &SinkFinish,
+    ) -> Result<(), S::Error>
+    where M: Matcher,
+          M::Error: fmt::Display
+    {
+        (**self).finish(searcher, sink_finish)
     }
 }
 

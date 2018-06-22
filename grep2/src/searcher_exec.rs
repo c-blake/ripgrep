@@ -380,10 +380,12 @@ where M: Matcher,
         byte_count: u64,
         binary_byte_offset: Option<u64>,
     ) -> Result<(), S::Error> {
-        self.sink.borrow_mut().finish(&SinkFinish {
-            byte_count,
-            binary_byte_offset,
-        })
+        self.sink.borrow_mut().finish(
+            &self.searcher,
+            &SinkFinish {
+                byte_count,
+                binary_byte_offset,
+            })
     }
 
     fn is_line_by_line_fast(&self) -> bool {
@@ -446,6 +448,9 @@ where M: Matcher,
 
     fn sink_match(&self, buf: &[u8], range: &Match) -> Result<bool, S::Error> {
         if self.binary && self.detect_binary(buf, range) {
+            return Ok(false);
+        }
+        if !self.sink_break_context(range.start())? {
             return Ok(false);
         }
         let offset = self.absolute_byte_offset.get() + range.start() as u64;
@@ -711,11 +716,33 @@ where M: Matcher,
         let range = Match::new(before_context_start, range.end());
         let mut stepper = LineStep::new(self.config.line_term, range);
         while let Some(line) = stepper.next(buf) {
+            if !self.sink_break_context(line.start())? {
+                return Ok(false);
+            }
             if !self.sink_before_context(buf, &line)? {
                 return Ok(false);
             }
         }
         Ok(true)
+    }
+
+    fn sink_break_context(
+        &self,
+        start_of_line: usize,
+    ) -> Result<bool, S::Error> {
+        let any_context =
+            self.config.before_context > 0
+            || self.config.after_context > 0;
+        let beginning =
+            self.last_line_visited.get() == 0
+            && self.absolute_byte_offset.get() == 0;
+        let is_gap =
+            self.last_line_visited.get() < start_of_line;
+        if !any_context || beginning || !is_gap {
+            Ok(true)
+        } else {
+            self.sink.borrow_mut().context_break(&self.searcher)
+        }
     }
 }
 
@@ -1157,7 +1184,7 @@ byte count:366
             .expected_no_line_number(exp)
             .test();
 
-        // after (same as before + after)
+        // after
         SearcherTester::new(SHERLOCK, "Sherlock")
             .filter(r"^reader-byline-noterm-nonumber$")
             .print_labels(true)
@@ -1167,7 +1194,7 @@ byte count:366
             .test();
 
         // before
-        let before_exp = "\
+        let exp = "\
 0:For the Doctor Watsons of this world, as opposed to the Sherlock
 65-Holmeses, success in the province of detective work must always
 129:be, to a very large extent, the result of luck. Sherlock Holmes
@@ -1179,7 +1206,7 @@ byte count:366
             .print_labels(true)
             .before_context(1)
             .line_number(false)
-            .expected_no_line_number(before_exp)
+            .expected_no_line_number(exp)
             .test();
     }
 
@@ -1205,8 +1232,18 @@ byte count:366
             .expected_no_line_number(exp)
             .test();
 
+        // before
+        SearcherTester::new(SHERLOCK, "Sherlock")
+            .filter(r"^reader-byline-noterm-nonumber$")
+            .print_labels(true)
+            .before_context(1)
+            .line_number(false)
+            .invert_match(true)
+            .expected_no_line_number(exp)
+            .test();
+
         // after
-        let after_exp = "\
+        let exp = "\
 65:Holmeses, success in the province of detective work must always
 129-be, to a very large extent, the result of luck. Sherlock Holmes
 193:can extract a clew from a wisp of straw or a flake of cigar ash;
@@ -1220,25 +1257,41 @@ byte count:366
             .after_context(1)
             .line_number(false)
             .invert_match(true)
-            .expected_no_line_number(after_exp)
-            .test();
-
-        // before (same as before + after)
-        SearcherTester::new(SHERLOCK, "Sherlock")
-            .filter(r"^reader-byline-noterm-nonumber$")
-            .print_labels(true)
-            .before_context(1)
-            .line_number(false)
-            .invert_match(true)
             .expected_no_line_number(exp)
             .test();
     }
 
     #[test]
     fn context2() {
-        // before
-        let before_exp = "\
+        let exp = "\
 65-Holmeses, success in the province of detective work must always
+129:be, to a very large extent, the result of luck. Sherlock Holmes
+193:can extract a clew from a wisp of straw or a flake of cigar ash;
+258-but Doctor Watson has to have it taken out for him and dusted,
+321:and exhibited clearly, with a label attached.
+byte count:366
+";
+        // before + after
+        SearcherTester::new(SHERLOCK, " a ")
+            .filter(r"^reader-byline-noterm-nonumber$")
+            .print_labels(true)
+            .after_context(1)
+            .before_context(1)
+            .line_number(false)
+            .expected_no_line_number(exp)
+            .test();
+
+        // before
+        SearcherTester::new(SHERLOCK, " a ")
+            .filter(r"^reader-byline-noterm-nonumber$")
+            .print_labels(true)
+            .before_context(1)
+            .line_number(false)
+            .expected_no_line_number(exp)
+            .test();
+
+        // after
+        let exp = "\
 129:be, to a very large extent, the result of luck. Sherlock Holmes
 193:can extract a clew from a wisp of straw or a flake of cigar ash;
 258-but Doctor Watson has to have it taken out for him and dusted,
@@ -1248,9 +1301,70 @@ byte count:366
         SearcherTester::new(SHERLOCK, " a ")
             .filter(r"^reader-byline-noterm-nonumber$")
             .print_labels(true)
+            .after_context(1)
+            .line_number(false)
+            .expected_no_line_number(exp)
+            .test();
+    }
+
+    #[test]
+    fn context_invert2() {
+        // before + after
+        let exp = "\
+0:For the Doctor Watsons of this world, as opposed to the Sherlock
+65:Holmeses, success in the province of detective work must always
+129-be, to a very large extent, the result of luck. Sherlock Holmes
+193-can extract a clew from a wisp of straw or a flake of cigar ash;
+258:but Doctor Watson has to have it taken out for him and dusted,
+321-and exhibited clearly, with a label attached.
+byte count:366
+";
+        SearcherTester::new(SHERLOCK, " a ")
+            .filter(r"^reader-byline-noterm-nonumber$")
+            .print_labels(true)
+            .after_context(1)
             .before_context(1)
             .line_number(false)
-            .expected_no_line_number(before_exp)
+            .invert_match(true)
+            .expected_no_line_number(exp)
+            .test();
+
+        // before
+        let exp = "\
+0:For the Doctor Watsons of this world, as opposed to the Sherlock
+65:Holmeses, success in the province of detective work must always
+--
+193-can extract a clew from a wisp of straw or a flake of cigar ash;
+258:but Doctor Watson has to have it taken out for him and dusted,
+
+byte count:366
+";
+        SearcherTester::new(SHERLOCK, " a ")
+            .filter(r"^reader-byline-noterm-nonumber$")
+            .print_labels(true)
+            .before_context(1)
+            .line_number(false)
+            .invert_match(true)
+            .expected_no_line_number(exp)
+            .test();
+
+        // after
+        let exp = "\
+0:For the Doctor Watsons of this world, as opposed to the Sherlock
+65:Holmeses, success in the province of detective work must always
+129-be, to a very large extent, the result of luck. Sherlock Holmes
+--
+258:but Doctor Watson has to have it taken out for him and dusted,
+321-and exhibited clearly, with a label attached.
+byte count:366
+";
+        SearcherTester::new(SHERLOCK, " a ")
+            .filter(r"^reader-byline-noterm-nonumber$")
+            .print_labels(true)
+            .after_context(1)
+            .line_number(false)
+            .invert_match(true)
+            .expected_no_line_number(exp)
             .test();
     }
 }

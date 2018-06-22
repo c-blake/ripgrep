@@ -176,12 +176,25 @@ impl Sink for KitchenSink {
         Ok(true)
     }
 
-    fn context_break(&mut self) -> Result<(), io::Error> {
+    fn context_break<M>(
+        &mut self,
+        _searcher: &Searcher<M>,
+    ) -> Result<bool, io::Error>
+    where M: Matcher,
+          M::Error: fmt::Display
+    {
         self.0.write_all(b"--\n")?;
-        Ok(())
+        Ok(true)
     }
 
-    fn finish(&mut self, sink_finish: &SinkFinish) -> Result<(), io::Error> {
+    fn finish<M>(
+        &mut self,
+        _searcher: &Searcher<M>,
+        sink_finish: &SinkFinish,
+    ) -> Result<(), io::Error>
+    where M: Matcher,
+          M::Error: fmt::Display
+    {
         writeln!(self.0, "")?;
         writeln!(self.0, "byte count:{}", sink_finish.byte_count())?;
         if let Some(offset) = sink_finish.binary_byte_offset() {
