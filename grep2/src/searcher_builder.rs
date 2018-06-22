@@ -199,7 +199,9 @@ pub enum ConfigError {
     __Nonexhaustive,
 }
 
-impl ::std::error::Error for ConfigError {}
+impl ::std::error::Error for ConfigError {
+    fn description(&self) -> &str { "grep configuration error" }
+}
 
 impl fmt::Display for ConfigError {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {

@@ -449,7 +449,7 @@ impl LineBuffer {
                     }
                 }
                 BinaryDetection::Convert(byte) => {
-                    if let Some(mut i) = replace_bytes(
+                    if let Some(i) = replace_bytes(
                         newbytes,
                         byte,
                         self.config.lineterm,
