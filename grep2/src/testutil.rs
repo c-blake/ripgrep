@@ -6,7 +6,7 @@ use memchr::memchr;
 use regex::bytes::{Regex, RegexBuilder};
 
 use matcher::{LineMatchKind, Match, Matcher, NoCaptures, NoError};
-use searcher_builder::{BinaryDetection, Searcher, SearcherBuilder};
+use searcher::{BinaryDetection, Searcher, SearcherBuilder};
 use sink::{Sink, SinkContext, SinkFinish, SinkMatch};
 
 /// A simple regex matcher.

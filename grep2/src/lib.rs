@@ -9,7 +9,7 @@ pub use lines::LineIter;
 pub use matcher::{
     Captures, LineMatchKind, Match, Matcher, NoCaptures, NoError,
 };
-pub use searcher_builder::{
+pub use searcher::{
     BinaryDetection, ConfigError, MmapChoice,
     Searcher, SearcherBuilder,
 };
@@ -19,8 +19,7 @@ mod interpolate;
 mod line_buffer;
 mod lines;
 mod matcher;
-mod searcher_builder;
-mod searcher_exec;
+mod searcher;
 mod sink;
 #[cfg(test)]
 mod testutil;

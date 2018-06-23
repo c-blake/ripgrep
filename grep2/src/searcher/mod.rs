@@ -9,8 +9,11 @@ use line_buffer::{
     DEFAULT_BUFFER_CAPACITY, alloc_error,
 };
 use matcher::Matcher;
-use searcher_exec::{ReadByLine, SliceByLine, MultiLine};
+use searcher::glue::{ReadByLine, SliceByLine, MultiLine};
 use sink::Sink;
+
+mod core;
+mod glue;
 
 /// The behavior of binary detection while searching.
 ///
