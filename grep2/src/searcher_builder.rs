@@ -150,6 +150,14 @@ impl Default for Config {
 }
 
 impl Config {
+    /// Return the maximal amount of lines needed to fulfill this
+    /// configuration's context.
+    ///
+    /// If this returns `0`, then no context is ever needed.
+    pub(crate) fn max_context(&self) -> usize {
+        cmp::max(self.before_context, self.after_context)
+    }
+
     /// Build a line buffer from this configuration.
     fn line_buffer(&self) -> LineBuffer {
         let mut builder = LineBufferBuilder::new();

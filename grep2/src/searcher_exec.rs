@@ -338,16 +338,21 @@ where M: Matcher,
 
     fn roll(&self, absolute_byte_offset: u64, buf: &[u8]) -> usize {
         let consumed =
-            if self.config.before_context == 0 {
+            if self.config.max_context() == 0 {
                 buf.len()
             } else {
-                let before_context_start = lines::preceding(
+                // It might seem like all we need to care about here is just
+                // the "before context," but in order to sink the context
+                // separator (when before_context==0 and after_context>0), we
+                // need to know something about the position of the previous
+                // line visited, even if we're at the beginning of the buffer.
+                let context_start = lines::preceding(
                     buf,
                     self.config.line_term,
-                    self.config.before_context - 1,
+                    self.config.max_context(),
                 );
                 let consumed = cmp::max(
-                    before_context_start,
+                    context_start,
                     self.last_line_visited.get(),
                 );
                 // If we can't make any progress, then that implies the entire
@@ -453,6 +458,7 @@ where M: Matcher,
         if !self.sink_break_context(range.start())? {
             return Ok(false);
         }
+        self.count_lines(buf, range.start());
         let offset = self.absolute_byte_offset.get() + range.start() as u64;
         let keepgoing = self.sink.borrow_mut().matched(
             &self.searcher,
@@ -524,15 +530,24 @@ where M: Matcher,
                     return Ok(false);
                 }
             } else if let Some(line) = self.find_by_line_fast(buf)? {
-                self.count_lines(buf, line.start());
+                if !self.after_context_by_line(buf, line.start())? {
+                    return Ok(false);
+                }
+                if !self.before_context_by_line(buf, line.start())? {
+                    return Ok(false);
+                }
                 self.set_pos(line.end());
                 if !self.sink_match(buf, &line)? {
                     return Ok(false);
                 }
             } else {
-                self.set_pos(buf.len());
+                break;
             }
         }
+        if !self.after_context_by_line(buf, buf.len())? {
+            return Ok(false);
+        }
+        self.set_pos(buf.len());
         Ok(true)
     }
 
@@ -551,6 +566,15 @@ where M: Matcher,
                 m
             }
         };
+        if invert_match.is_empty() {
+            return Ok(true);
+        }
+        if !self.after_context_by_line(buf, invert_match.start())? {
+            return Ok(false);
+        }
+        if !self.before_context_by_line(buf, invert_match.start())? {
+            return Ok(false);
+        }
         self.count_lines(buf, invert_match.start());
         let mut stepper = LineStep::new(self.config.line_term, invert_match);
         while let Some(line) = stepper.next(buf) {
@@ -631,6 +655,7 @@ where M: Matcher,
         if self.binary && self.detect_binary(buf, range) {
             return Ok(false);
         }
+        self.count_lines(buf, range.start());
         let offset = self.absolute_byte_offset.get() + range.start() as u64;
         let keepgoing = self.sink.borrow_mut().context(
             &self.searcher,
@@ -678,6 +703,7 @@ where M: Matcher,
         if self.binary && self.detect_binary(buf, range) {
             return Ok(false);
         }
+        self.count_lines(buf, range.start());
         let offset = self.absolute_byte_offset.get() + range.start() as u64;
         let keepgoing = self.sink.borrow_mut().context(
             &self.searcher,
@@ -707,11 +733,12 @@ where M: Matcher,
         if range.is_empty() {
             return Ok(true);
         }
-        let before_context_start = lines::preceding(
-            &buf[..range.end()],
+        let before_context_start = range.start() + lines::preceding(
+            &buf[range],
             self.config.line_term,
             self.config.before_context - 1,
         );
+        println!("{:?} :: {:?}", range, before_context_start);
 
         let range = Match::new(before_context_start, range.end());
         let mut stepper = LineStep::new(self.config.line_term, range);
@@ -738,6 +765,7 @@ where M: Matcher,
             && self.absolute_byte_offset.get() == 0;
         let is_gap =
             self.last_line_visited.get() < start_of_line;
+
         if !any_context || beginning || !is_gap {
             Ok(true)
         } else {
@@ -760,6 +788,22 @@ be, to a very large extent, the result of luck. Sherlock Holmes
 can extract a clew from a wisp of straw or a flake of cigar ash;
 but Doctor Watson has to have it taken out for him and dusted,
 and exhibited clearly, with a label attached.\
+";
+
+    const CODE: &'static str = "\
+extern crate snap;
+
+use std::io;
+
+fn main() {
+    let stdin = io::stdin();
+    let stdout = io::stdout();
+
+    // Wrap the stdin reader in a Snappy reader.
+    let mut rdr = snap::Reader::new(stdin.lock());
+    let mut wtr = stdout.lock();
+    io::copy(&mut rdr, &mut wtr).expect(\"I/O operation failed\");
+}
 ";
 
     #[test]
@@ -1165,7 +1209,7 @@ d
     }
 
     #[test]
-    fn context1() {
+    fn context_sherlock1() {
         let exp = "\
 0:For the Doctor Watsons of this world, as opposed to the Sherlock
 65-Holmeses, success in the province of detective work must always
@@ -1176,7 +1220,7 @@ byte count:366
 ";
         // before and after
         SearcherTester::new(SHERLOCK, "Sherlock")
-            .filter(r"^reader-byline-noterm-nonumber$")
+            .filter(r"^reader-byline-(no)?term-nonumber$")
             .print_labels(true)
             .after_context(1)
             .before_context(1)
@@ -1186,7 +1230,7 @@ byte count:366
 
         // after
         SearcherTester::new(SHERLOCK, "Sherlock")
-            .filter(r"^reader-byline-noterm-nonumber$")
+            .filter(r"^reader-byline-(no)?term-nonumber$")
             .print_labels(true)
             .after_context(1)
             .line_number(false)
@@ -1202,7 +1246,7 @@ byte count:366
 byte count:366
 ";
         SearcherTester::new(SHERLOCK, "Sherlock")
-            .filter(r"^reader-byline-noterm-nonumber$")
+            .filter(r"^reader-byline-(no)?term-nonumber$")
             .print_labels(true)
             .before_context(1)
             .line_number(false)
@@ -1211,7 +1255,7 @@ byte count:366
     }
 
     #[test]
-    fn context_invert1() {
+    fn context_sherlock_invert1() {
         let exp = "\
 0-For the Doctor Watsons of this world, as opposed to the Sherlock
 65:Holmeses, success in the province of detective work must always
@@ -1223,7 +1267,7 @@ byte count:366
 ";
         // before and after
         SearcherTester::new(SHERLOCK, "Sherlock")
-            .filter(r"^reader-byline-noterm-nonumber$")
+            .filter(r"^reader-byline-(no)?term-nonumber$")
             .print_labels(true)
             .after_context(1)
             .before_context(1)
@@ -1234,7 +1278,7 @@ byte count:366
 
         // before
         SearcherTester::new(SHERLOCK, "Sherlock")
-            .filter(r"^reader-byline-noterm-nonumber$")
+            .filter(r"^reader-byline-(no)?term-nonumber$")
             .print_labels(true)
             .before_context(1)
             .line_number(false)
@@ -1252,7 +1296,7 @@ byte count:366
 byte count:366
 ";
         SearcherTester::new(SHERLOCK, "Sherlock")
-            .filter(r"^reader-byline-noterm-nonumber$")
+            .filter(r"^reader-byline-(no)?term-nonumber$")
             .print_labels(true)
             .after_context(1)
             .line_number(false)
@@ -1262,7 +1306,7 @@ byte count:366
     }
 
     #[test]
-    fn context2() {
+    fn context_sherlock2() {
         let exp = "\
 65-Holmeses, success in the province of detective work must always
 129:be, to a very large extent, the result of luck. Sherlock Holmes
@@ -1273,7 +1317,7 @@ byte count:366
 ";
         // before + after
         SearcherTester::new(SHERLOCK, " a ")
-            .filter(r"^reader-byline-noterm-nonumber$")
+            .filter(r"^reader-byline-(no)?term-nonumber$")
             .print_labels(true)
             .after_context(1)
             .before_context(1)
@@ -1283,7 +1327,7 @@ byte count:366
 
         // before
         SearcherTester::new(SHERLOCK, " a ")
-            .filter(r"^reader-byline-noterm-nonumber$")
+            .filter(r"^reader-byline-(no)?term-nonumber$")
             .print_labels(true)
             .before_context(1)
             .line_number(false)
@@ -1299,7 +1343,7 @@ byte count:366
 byte count:366
 ";
         SearcherTester::new(SHERLOCK, " a ")
-            .filter(r"^reader-byline-noterm-nonumber$")
+            .filter(r"^reader-byline-(no)?term-nonumber$")
             .print_labels(true)
             .after_context(1)
             .line_number(false)
@@ -1308,7 +1352,7 @@ byte count:366
     }
 
     #[test]
-    fn context_invert2() {
+    fn context_sherlock_invert2() {
         // before + after
         let exp = "\
 0:For the Doctor Watsons of this world, as opposed to the Sherlock
@@ -1320,7 +1364,7 @@ byte count:366
 byte count:366
 ";
         SearcherTester::new(SHERLOCK, " a ")
-            .filter(r"^reader-byline-noterm-nonumber$")
+            .filter(r"^reader-byline-(no)?term-nonumber$")
             .print_labels(true)
             .after_context(1)
             .before_context(1)
@@ -1340,7 +1384,7 @@ byte count:366
 byte count:366
 ";
         SearcherTester::new(SHERLOCK, " a ")
-            .filter(r"^reader-byline-noterm-nonumber$")
+            .filter(r"^reader-byline-(no)?term-nonumber$")
             .print_labels(true)
             .before_context(1)
             .line_number(false)
@@ -1359,11 +1403,420 @@ byte count:366
 byte count:366
 ";
         SearcherTester::new(SHERLOCK, " a ")
-            .filter(r"^reader-byline-noterm-nonumber$")
+            .filter(r"^reader-byline-(no)?term-nonumber$")
             .print_labels(true)
             .after_context(1)
             .line_number(false)
             .invert_match(true)
+            .expected_no_line_number(exp)
+            .test();
+    }
+
+    #[test]
+    fn context_sherlock3() {
+        let exp = "\
+0:For the Doctor Watsons of this world, as opposed to the Sherlock
+65-Holmeses, success in the province of detective work must always
+129:be, to a very large extent, the result of luck. Sherlock Holmes
+193-can extract a clew from a wisp of straw or a flake of cigar ash;
+258-but Doctor Watson has to have it taken out for him and dusted,
+
+byte count:366
+";
+        // before and after
+        SearcherTester::new(SHERLOCK, "Sherlock")
+            .filter(r"^reader-byline-(no)?term-nonumber$")
+            .print_labels(true)
+            .after_context(2)
+            .before_context(2)
+            .line_number(false)
+            .expected_no_line_number(exp)
+            .test();
+
+        // after
+        SearcherTester::new(SHERLOCK, "Sherlock")
+            .filter(r"^reader-byline-(no)?term-nonumber$")
+            .print_labels(true)
+            .after_context(2)
+            .line_number(false)
+            .expected_no_line_number(exp)
+            .test();
+
+        // before
+        let exp = "\
+0:For the Doctor Watsons of this world, as opposed to the Sherlock
+65-Holmeses, success in the province of detective work must always
+129:be, to a very large extent, the result of luck. Sherlock Holmes
+
+byte count:366
+";
+        SearcherTester::new(SHERLOCK, "Sherlock")
+            .filter(r"^reader-byline-(no)?term-nonumber$")
+            .print_labels(true)
+            .before_context(2)
+            .line_number(false)
+            .expected_no_line_number(exp)
+            .test();
+    }
+
+    #[test]
+    fn context_sherlock4() {
+        // before and after
+        let exp = "\
+129-be, to a very large extent, the result of luck. Sherlock Holmes
+193-can extract a clew from a wisp of straw or a flake of cigar ash;
+258:but Doctor Watson has to have it taken out for him and dusted,
+321-and exhibited clearly, with a label attached.
+byte count:366
+";
+        SearcherTester::new(SHERLOCK, "dusted")
+            .filter(r"^reader-byline-(no)?term-nonumber$")
+            .print_labels(true)
+            .after_context(2)
+            .before_context(2)
+            .line_number(false)
+            .expected_no_line_number(exp)
+            .test();
+
+        // after
+        let exp = "\
+258:but Doctor Watson has to have it taken out for him and dusted,
+321-and exhibited clearly, with a label attached.
+byte count:366
+";
+        SearcherTester::new(SHERLOCK, "dusted")
+            .filter(r"^reader-byline-(no)?term-nonumber$")
+            .print_labels(true)
+            .after_context(2)
+            .line_number(false)
+            .expected_no_line_number(exp)
+            .test();
+
+        // before
+        let exp = "\
+129-be, to a very large extent, the result of luck. Sherlock Holmes
+193-can extract a clew from a wisp of straw or a flake of cigar ash;
+258:but Doctor Watson has to have it taken out for him and dusted,
+
+byte count:366
+";
+        SearcherTester::new(SHERLOCK, "dusted")
+            .filter(r"^reader-byline-(no)?term-nonumber$")
+            .print_labels(true)
+            .before_context(2)
+            .line_number(false)
+            .expected_no_line_number(exp)
+            .test();
+    }
+
+    #[test]
+    fn context_sherlock5() {
+        // before and after
+        let exp = "\
+0-For the Doctor Watsons of this world, as opposed to the Sherlock
+65:Holmeses, success in the province of detective work must always
+129-be, to a very large extent, the result of luck. Sherlock Holmes
+193-can extract a clew from a wisp of straw or a flake of cigar ash;
+258-but Doctor Watson has to have it taken out for him and dusted,
+321:and exhibited clearly, with a label attached.
+byte count:366
+";
+        SearcherTester::new(SHERLOCK, "success|attached")
+            .filter(r"^reader-byline-(no)?term-nonumber$")
+            .print_labels(true)
+            .after_context(2)
+            .before_context(2)
+            .line_number(false)
+            .expected_no_line_number(exp)
+            .test();
+
+        // after
+        let exp = "\
+65:Holmeses, success in the province of detective work must always
+129-be, to a very large extent, the result of luck. Sherlock Holmes
+193-can extract a clew from a wisp of straw or a flake of cigar ash;
+--
+321:and exhibited clearly, with a label attached.
+byte count:366
+";
+        SearcherTester::new(SHERLOCK, "success|attached")
+            .filter(r"^reader-byline-(no)?term-nonumber$")
+            .print_labels(true)
+            .after_context(2)
+            .line_number(false)
+            .expected_no_line_number(exp)
+            .test();
+
+        // before
+        let exp = "\
+0-For the Doctor Watsons of this world, as opposed to the Sherlock
+65:Holmeses, success in the province of detective work must always
+--
+193-can extract a clew from a wisp of straw or a flake of cigar ash;
+258-but Doctor Watson has to have it taken out for him and dusted,
+321:and exhibited clearly, with a label attached.
+byte count:366
+";
+        SearcherTester::new(SHERLOCK, "success|attached")
+            .filter(r"^reader-byline-(no)?term-nonumber$")
+            .print_labels(true)
+            .before_context(2)
+            .line_number(false)
+            .expected_no_line_number(exp)
+            .test();
+    }
+
+    #[test]
+    fn context_sherlock6() {
+        // before and after
+        let exp = "\
+0:For the Doctor Watsons of this world, as opposed to the Sherlock
+65-Holmeses, success in the province of detective work must always
+129:be, to a very large extent, the result of luck. Sherlock Holmes
+193-can extract a clew from a wisp of straw or a flake of cigar ash;
+258-but Doctor Watson has to have it taken out for him and dusted,
+321-and exhibited clearly, with a label attached.
+byte count:366
+";
+        SearcherTester::new(SHERLOCK, "Sherlock")
+            .filter(r"^reader-byline-(no)?term-nonumber$")
+            .print_labels(true)
+            .after_context(3)
+            .before_context(3)
+            .line_number(false)
+            .expected_no_line_number(exp)
+            .test();
+
+        // after
+        let exp = "\
+0:For the Doctor Watsons of this world, as opposed to the Sherlock
+65-Holmeses, success in the province of detective work must always
+129:be, to a very large extent, the result of luck. Sherlock Holmes
+193-can extract a clew from a wisp of straw or a flake of cigar ash;
+258-but Doctor Watson has to have it taken out for him and dusted,
+321-and exhibited clearly, with a label attached.
+byte count:366
+";
+        SearcherTester::new(SHERLOCK, "Sherlock")
+            .filter(r"^reader-byline-(no)?term-nonumber$")
+            .print_labels(true)
+            .after_context(3)
+            .line_number(false)
+            .expected_no_line_number(exp)
+            .test();
+
+        // before
+        let exp = "\
+0:For the Doctor Watsons of this world, as opposed to the Sherlock
+65-Holmeses, success in the province of detective work must always
+129:be, to a very large extent, the result of luck. Sherlock Holmes
+
+byte count:366
+";
+        SearcherTester::new(SHERLOCK, "Sherlock")
+            .filter(r"^reader-byline-(no)?term-nonumber$")
+            .print_labels(true)
+            .before_context(3)
+            .line_number(false)
+            .expected_no_line_number(exp)
+            .test();
+    }
+
+    #[test]
+    fn context_code1() {
+        // before and after
+        let exp = "\
+33-
+34-fn main() {
+46:    let stdin = io::stdin();
+75-    let stdout = io::stdout();
+106-
+107:    // Wrap the stdin reader in a Snappy reader.
+156:    let mut rdr = snap::Reader::new(stdin.lock());
+207-    let mut wtr = stdout.lock();
+240-    io::copy(&mut rdr, &mut wtr).expect(\"I/O operation failed\");
+
+byte count:307
+";
+        SearcherTester::new(CODE, "stdin")
+            .filter(r"^reader-byline-(no)?term-nonumber$")
+            .print_labels(true)
+            .after_context(2)
+            .before_context(2)
+            .line_number(false)
+            .expected_no_line_number(exp)
+            .test();
+
+        // after
+        let exp = "\
+46:    let stdin = io::stdin();
+75-    let stdout = io::stdout();
+106-
+107:    // Wrap the stdin reader in a Snappy reader.
+156:    let mut rdr = snap::Reader::new(stdin.lock());
+207-    let mut wtr = stdout.lock();
+240-    io::copy(&mut rdr, &mut wtr).expect(\"I/O operation failed\");
+
+byte count:307
+";
+        SearcherTester::new(CODE, "stdin")
+            .filter(r"^reader-byline-(no)?term-nonumber$")
+            .print_labels(true)
+            .after_context(2)
+            .line_number(false)
+            .expected_no_line_number(exp)
+            .test();
+
+        // before
+        let exp = "\
+33-
+34-fn main() {
+46:    let stdin = io::stdin();
+75-    let stdout = io::stdout();
+106-
+107:    // Wrap the stdin reader in a Snappy reader.
+156:    let mut rdr = snap::Reader::new(stdin.lock());
+
+byte count:307
+";
+        SearcherTester::new(CODE, "stdin")
+            .filter(r"^reader-byline-(no)?term-nonumber$")
+            .print_labels(true)
+            .before_context(2)
+            .line_number(false)
+            .expected_no_line_number(exp)
+            .test();
+    }
+
+    #[test]
+    fn context_code2() {
+        // before and after
+        let exp = "\
+34-fn main() {
+46-    let stdin = io::stdin();
+75:    let stdout = io::stdout();
+106-
+107-    // Wrap the stdin reader in a Snappy reader.
+156-    let mut rdr = snap::Reader::new(stdin.lock());
+207:    let mut wtr = stdout.lock();
+240-    io::copy(&mut rdr, &mut wtr).expect(\"I/O operation failed\");
+305-}
+
+byte count:307
+";
+        SearcherTester::new(CODE, "stdout")
+            .filter(r"^reader-byline-(no)?term-nonumber$")
+            .print_labels(true)
+            .after_context(2)
+            .before_context(2)
+            .line_number(false)
+            .expected_no_line_number(exp)
+            .test();
+
+        // after
+        let exp = "\
+75:    let stdout = io::stdout();
+106-
+107-    // Wrap the stdin reader in a Snappy reader.
+--
+207:    let mut wtr = stdout.lock();
+240-    io::copy(&mut rdr, &mut wtr).expect(\"I/O operation failed\");
+305-}
+
+byte count:307
+";
+        SearcherTester::new(CODE, "stdout")
+            .filter(r"^reader-byline-(no)?term-nonumber$")
+            .print_labels(true)
+            .after_context(2)
+            .line_number(false)
+            .expected_no_line_number(exp)
+            .test();
+
+        // before
+        let exp = "\
+34-fn main() {
+46-    let stdin = io::stdin();
+75:    let stdout = io::stdout();
+--
+107-    // Wrap the stdin reader in a Snappy reader.
+156-    let mut rdr = snap::Reader::new(stdin.lock());
+207:    let mut wtr = stdout.lock();
+
+byte count:307
+";
+        SearcherTester::new(CODE, "stdout")
+            .filter(r"^reader-byline-(no)?term-nonumber$")
+            .print_labels(true)
+            .before_context(2)
+            .line_number(false)
+            .expected_no_line_number(exp)
+            .test();
+    }
+
+    #[test]
+    fn context_code3() {
+        // before and after
+        let exp = "\
+20-use std::io;
+33-
+34:fn main() {
+46-    let stdin = io::stdin();
+75-    let stdout = io::stdout();
+106-
+107-    // Wrap the stdin reader in a Snappy reader.
+156:    let mut rdr = snap::Reader::new(stdin.lock());
+207-    let mut wtr = stdout.lock();
+240-    io::copy(&mut rdr, &mut wtr).expect(\"I/O operation failed\");
+
+byte count:307
+";
+        SearcherTester::new(CODE, "fn main|let mut rdr")
+            .filter(r"^reader-byline-(no)?term-nonumber$")
+            .print_labels(true)
+            .after_context(2)
+            .before_context(2)
+            .line_number(false)
+            .expected_no_line_number(exp)
+            .test();
+
+        // after
+        let exp = "\
+34:fn main() {
+46-    let stdin = io::stdin();
+75-    let stdout = io::stdout();
+--
+156:    let mut rdr = snap::Reader::new(stdin.lock());
+207-    let mut wtr = stdout.lock();
+240-    io::copy(&mut rdr, &mut wtr).expect(\"I/O operation failed\");
+
+byte count:307
+";
+        SearcherTester::new(CODE, "fn main|let mut rdr")
+            .filter(r"^reader-byline-(no)?term-nonumber$")
+            .print_labels(true)
+            .after_context(2)
+            .line_number(false)
+            .expected_no_line_number(exp)
+            .test();
+
+        // before
+        let exp = "\
+20-use std::io;
+33-
+34:fn main() {
+--
+106-
+107-    // Wrap the stdin reader in a Snappy reader.
+156:    let mut rdr = snap::Reader::new(stdin.lock());
+
+byte count:307
+";
+        SearcherTester::new(CODE, "fn main|let mut rdr")
+            .filter(r"^reader-byline-(no)?term-nonumber$")
+            .print_labels(true)
+            .before_context(2)
+            .line_number(false)
             .expected_no_line_number(exp)
             .test();
     }
