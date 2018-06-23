@@ -442,9 +442,36 @@ impl SearcherTester {
         self
     }
 
-    /// Return the maximum line length in this builder's haystack.
-    fn max_line_len(&self) -> usize {
-        self.haystack.lines().map(|s| s.len()).max().unwrap_or(0)
+    /// Return the minimum size of a buffer required for a successful search.
+    ///
+    /// Generally, this corresponds to the maximum length of a line (including
+    /// its terminator), but if context settings are enabled, then this must
+    /// include the sum of the longest N lines.
+    ///
+    /// Note that this must account for whether the test is using multi line
+    /// search or not, since multi line search requires being able to fit the
+    /// entire haystack into memory.
+    fn minimal_heap_limit(&self, multi_line: bool) -> usize {
+        if multi_line {
+            1 + self.haystack.len()
+        } else if self.before_context == 0 && self.after_context == 0 {
+            1 + self.haystack.lines().map(|s| s.len()).max().unwrap_or(0)
+        } else {
+            let mut lens: Vec<usize> =
+                self.haystack.lines().map(|s| s.len()).collect();
+            lens.sort();
+            lens.reverse();
+
+            // Why do we add 2 here? Well, we need to add 1 in order to have
+            // room to search at least one line. We add another because the
+            // implementation will occasionally include an additional line when
+            // handling the context. There's no particularly good reason, other
+            // than keeping the implementation simple.
+            let n = 2 + self.before_context + self.after_context;
+            // We add 1 to each line since `str::lines` doesn't include the
+            // line terminator.
+            lens.into_iter().take(n).map(|len| len + 1).sum::<usize>()
+        }
     }
 
     /// Returns true if and only if the given label should be included as part
@@ -493,7 +520,7 @@ impl SearcherTester {
             });
 
             if self.auto_heap_limit {
-                builder.heap_limit(Some(self.max_line_len() + 1));
+                builder.heap_limit(Some(self.minimal_heap_limit(false)));
                 configs.push(TesterConfig {
                     label: "byline-noterm-nonumber-heaplimit".to_string(),
                     expected_reader: expected_reader.clone(),
@@ -579,7 +606,7 @@ impl SearcherTester {
             });
 
             if self.auto_heap_limit {
-                builder.heap_limit(Some(self.haystack.len() + 1));
+                builder.heap_limit(Some(self.minimal_heap_limit(true)));
                 configs.push(TesterConfig {
                     label: "multiline-nonumber-heaplimit".to_string(),
                     expected_reader: expected_slice.clone(),
@@ -610,7 +637,7 @@ impl SearcherTester {
                 matcher: matcher.clone(),
             });
 
-            builder.heap_limit(Some(self.haystack.len() + 1));
+            builder.heap_limit(Some(self.minimal_heap_limit(true)));
             configs.push(TesterConfig {
                 label: "multiline-number-heaplimit".to_string(),
                 expected_reader: expected_slice.clone(),
@@ -640,7 +667,11 @@ impl TesterConfig {
     fn search_reader(&self, haystack: &str) -> String {
         let mut sink = KitchenSink::new();
         let mut searcher = self.builder.build(&self.matcher).unwrap();
-        searcher.search_reader(haystack.as_bytes(), &mut sink).unwrap();
+        let result = searcher.search_reader(haystack.as_bytes(), &mut sink);
+        if let Err(err) = result {
+            let label = format!("reader-{}", self.label);
+            panic!("error running '{}': {}", label, err);
+        }
         String::from_utf8(sink.as_bytes().to_vec()).unwrap()
     }
 
@@ -649,7 +680,11 @@ impl TesterConfig {
     fn search_slice(&self, haystack: &str) -> String {
         let mut sink = KitchenSink::new();
         let mut searcher = self.builder.build(&self.matcher).unwrap();
-        searcher.search_slice(haystack.as_bytes(), &mut sink).unwrap();
+        let result = searcher.search_slice(haystack.as_bytes(), &mut sink);
+        if let Err(err) = result {
+            let label = format!("slice-{}", self.label);
+            panic!("error running '{}': {}", label, err);
+        }
         String::from_utf8(sink.as_bytes().to_vec()).unwrap()
     }
 }

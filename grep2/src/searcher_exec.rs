@@ -45,9 +45,8 @@ where M: Matcher,
         assert!(!self.config.multi_line);
 
         while self.fill()? && self.core.match_by_line(self.rdr.buffer())? {}
-        let absolute_byte_offset = self.core.absolute_byte_offset.get();
         self.core.finish(
-            absolute_byte_offset,
+            self.rdr.absolute_byte_offset(),
             self.rdr.binary_byte_offset(),
         )
     }
@@ -55,6 +54,7 @@ where M: Matcher,
     fn fill(&mut self) -> Result<bool, S::Error> {
         assert!(self.rdr.buffer()[self.core.pos()..].is_empty());
 
+        let old_buf_len = self.rdr.buffer().len();
         let consumed = self.core.roll(
             self.rdr.absolute_byte_offset(), self.rdr.buffer());
         self.rdr.consume(consumed);
@@ -63,6 +63,14 @@ where M: Matcher,
             Ok(didread) => didread,
         };
         if !didread || self.rdr.binary_byte_offset().is_some() {
+            return Ok(false);
+        }
+        // If rolling the buffer didn't result in consuming anything and if
+        // re-filling the buffer didn't add any bytes, then the only thing in
+        // our buffer is leftover context, which we no longer need since there
+        // is nothing left to search. So forcefully quit.
+        if consumed == 0 && old_buf_len == self.rdr.buffer().len() {
+            self.rdr.consume(old_buf_len);
             return Ok(false);
         }
         Ok(true)
@@ -302,6 +310,7 @@ struct Core<'s, M: 's, S> {
     last_line_counted: Cell<usize>,
     last_line_visited: Cell<usize>,
     after_context_left: Cell<usize>,
+    has_sunk: Cell<bool>,
 }
 
 impl<'s, M, S> Core<'s, M, S>
@@ -333,6 +342,7 @@ where M: Matcher,
             last_line_counted: Cell::new(0),
             last_line_visited: Cell::new(0),
             after_context_left: Cell::new(0),
+            has_sunk: Cell::new(false),
         }
     }
 
@@ -355,18 +365,7 @@ where M: Matcher,
                     context_start,
                     self.last_line_visited.get(),
                 );
-                // If we can't make any progress, then that implies the entire
-                // contents of the buffer are considered part of a potential
-                // "before" context. However, if the entire buffer is just for
-                // the context, then that implies all of the buffer has already
-                // been searched, which in turn implies the context can never
-                // be used again since there are no more matches. In this case,
-                // we forcefully consume the rest of the buffer.
-                if consumed == 0 {
-                    buf.len()
-                } else {
-                    consumed
-                }
+                consumed
             };
         self.count_lines(buf, consumed);
         self.absolute_byte_offset.set(absolute_byte_offset + consumed as u64);
@@ -474,6 +473,7 @@ where M: Matcher,
         }
         self.last_line_visited.set(range.end());
         self.after_context_left.set(self.config.after_context);
+        self.has_sunk.set(true);
         Ok(true)
     }
 
@@ -671,6 +671,7 @@ where M: Matcher,
         }
         self.last_line_visited.set(range.end());
         self.after_context_left.set(self.after_context_left.get() - 1);
+        self.has_sunk.set(true);
         Ok(true)
     }
 
@@ -718,6 +719,7 @@ where M: Matcher,
             return Ok(false);
         }
         self.last_line_visited.set(range.end());
+        self.has_sunk.set(true);
         Ok(true)
     }
 
@@ -738,7 +740,6 @@ where M: Matcher,
             self.config.line_term,
             self.config.before_context - 1,
         );
-        println!("{:?} :: {:?}", range, before_context_start);
 
         let range = Match::new(before_context_start, range.end());
         let mut stepper = LineStep::new(self.config.line_term, range);
@@ -760,13 +761,10 @@ where M: Matcher,
         let any_context =
             self.config.before_context > 0
             || self.config.after_context > 0;
-        let beginning =
-            self.last_line_visited.get() == 0
-            && self.absolute_byte_offset.get() == 0;
         let is_gap =
             self.last_line_visited.get() < start_of_line;
 
-        if !any_context || beginning || !is_gap {
+        if !any_context || !self.has_sunk.get() || !is_gap {
             Ok(true)
         } else {
             self.sink.borrow_mut().context_break(&self.searcher)
@@ -1220,7 +1218,7 @@ byte count:366
 ";
         // before and after
         SearcherTester::new(SHERLOCK, "Sherlock")
-            .filter(r"^reader-byline-(no)?term-nonumber$")
+            .filter(r"^(slice|reader)-byline-(no)?term-nonumber(-heaplimit|-candidates)?$")
             .print_labels(true)
             .after_context(1)
             .before_context(1)
@@ -1230,7 +1228,7 @@ byte count:366
 
         // after
         SearcherTester::new(SHERLOCK, "Sherlock")
-            .filter(r"^reader-byline-(no)?term-nonumber$")
+            .filter(r"^(slice|reader)-byline-(no)?term-nonumber(-heaplimit|-candidates)?$")
             .print_labels(true)
             .after_context(1)
             .line_number(false)
@@ -1246,7 +1244,7 @@ byte count:366
 byte count:366
 ";
         SearcherTester::new(SHERLOCK, "Sherlock")
-            .filter(r"^reader-byline-(no)?term-nonumber$")
+            .filter(r"^(slice|reader)-byline-(no)?term-nonumber(-heaplimit|-candidates)?$")
             .print_labels(true)
             .before_context(1)
             .line_number(false)
@@ -1267,7 +1265,7 @@ byte count:366
 ";
         // before and after
         SearcherTester::new(SHERLOCK, "Sherlock")
-            .filter(r"^reader-byline-(no)?term-nonumber$")
+            .filter(r"^(slice|reader)-byline-(no)?term-nonumber(-heaplimit|-candidates)?$")
             .print_labels(true)
             .after_context(1)
             .before_context(1)
@@ -1278,7 +1276,7 @@ byte count:366
 
         // before
         SearcherTester::new(SHERLOCK, "Sherlock")
-            .filter(r"^reader-byline-(no)?term-nonumber$")
+            .filter(r"^(slice|reader)-byline-(no)?term-nonumber(-heaplimit|-candidates)?$")
             .print_labels(true)
             .before_context(1)
             .line_number(false)
@@ -1296,7 +1294,7 @@ byte count:366
 byte count:366
 ";
         SearcherTester::new(SHERLOCK, "Sherlock")
-            .filter(r"^reader-byline-(no)?term-nonumber$")
+            .filter(r"^(slice|reader)-byline-(no)?term-nonumber(-heaplimit|-candidates)?$")
             .print_labels(true)
             .after_context(1)
             .line_number(false)
@@ -1317,7 +1315,7 @@ byte count:366
 ";
         // before + after
         SearcherTester::new(SHERLOCK, " a ")
-            .filter(r"^reader-byline-(no)?term-nonumber$")
+            .filter(r"^(slice|reader)-byline-(no)?term-nonumber(-heaplimit|-candidates)?$")
             .print_labels(true)
             .after_context(1)
             .before_context(1)
@@ -1327,7 +1325,8 @@ byte count:366
 
         // before
         SearcherTester::new(SHERLOCK, " a ")
-            .filter(r"^reader-byline-(no)?term-nonumber$")
+            .filter(r"^(slice|reader)-byline-(no)?term-nonumber(-heaplimit|-candidates)?$")
+            .filter(r"^reader-byline-noterm-nonumber-heaplimit$")
             .print_labels(true)
             .before_context(1)
             .line_number(false)
@@ -1343,7 +1342,7 @@ byte count:366
 byte count:366
 ";
         SearcherTester::new(SHERLOCK, " a ")
-            .filter(r"^reader-byline-(no)?term-nonumber$")
+            .filter(r"^(slice|reader)-byline-(no)?term-nonumber(-heaplimit|-candidates)?$")
             .print_labels(true)
             .after_context(1)
             .line_number(false)
@@ -1364,7 +1363,7 @@ byte count:366
 byte count:366
 ";
         SearcherTester::new(SHERLOCK, " a ")
-            .filter(r"^reader-byline-(no)?term-nonumber$")
+            .filter(r"^(slice|reader)-byline-(no)?term-nonumber(-heaplimit|-candidates)?$")
             .print_labels(true)
             .after_context(1)
             .before_context(1)
@@ -1384,7 +1383,7 @@ byte count:366
 byte count:366
 ";
         SearcherTester::new(SHERLOCK, " a ")
-            .filter(r"^reader-byline-(no)?term-nonumber$")
+            .filter(r"^(slice|reader)-byline-(no)?term-nonumber(-heaplimit|-candidates)?$")
             .print_labels(true)
             .before_context(1)
             .line_number(false)
@@ -1403,7 +1402,7 @@ byte count:366
 byte count:366
 ";
         SearcherTester::new(SHERLOCK, " a ")
-            .filter(r"^reader-byline-(no)?term-nonumber$")
+            .filter(r"^(slice|reader)-byline-(no)?term-nonumber(-heaplimit|-candidates)?$")
             .print_labels(true)
             .after_context(1)
             .line_number(false)
@@ -1425,7 +1424,7 @@ byte count:366
 ";
         // before and after
         SearcherTester::new(SHERLOCK, "Sherlock")
-            .filter(r"^reader-byline-(no)?term-nonumber$")
+            .filter(r"^(slice|reader)-byline-(no)?term-nonumber(-heaplimit|-candidates)?$")
             .print_labels(true)
             .after_context(2)
             .before_context(2)
@@ -1435,7 +1434,7 @@ byte count:366
 
         // after
         SearcherTester::new(SHERLOCK, "Sherlock")
-            .filter(r"^reader-byline-(no)?term-nonumber$")
+            .filter(r"^(slice|reader)-byline-(no)?term-nonumber(-heaplimit|-candidates)?$")
             .print_labels(true)
             .after_context(2)
             .line_number(false)
@@ -1451,7 +1450,7 @@ byte count:366
 byte count:366
 ";
         SearcherTester::new(SHERLOCK, "Sherlock")
-            .filter(r"^reader-byline-(no)?term-nonumber$")
+            .filter(r"^(slice|reader)-byline-(no)?term-nonumber(-heaplimit|-candidates)?$")
             .print_labels(true)
             .before_context(2)
             .line_number(false)
@@ -1470,7 +1469,7 @@ byte count:366
 byte count:366
 ";
         SearcherTester::new(SHERLOCK, "dusted")
-            .filter(r"^reader-byline-(no)?term-nonumber$")
+            .filter(r"^(slice|reader)-byline-(no)?term-nonumber(-heaplimit|-candidates)?$")
             .print_labels(true)
             .after_context(2)
             .before_context(2)
@@ -1485,7 +1484,7 @@ byte count:366
 byte count:366
 ";
         SearcherTester::new(SHERLOCK, "dusted")
-            .filter(r"^reader-byline-(no)?term-nonumber$")
+            .filter(r"^(slice|reader)-byline-(no)?term-nonumber(-heaplimit|-candidates)?$")
             .print_labels(true)
             .after_context(2)
             .line_number(false)
@@ -1501,7 +1500,7 @@ byte count:366
 byte count:366
 ";
         SearcherTester::new(SHERLOCK, "dusted")
-            .filter(r"^reader-byline-(no)?term-nonumber$")
+            .filter(r"^(slice|reader)-byline-(no)?term-nonumber(-heaplimit|-candidates)?$")
             .print_labels(true)
             .before_context(2)
             .line_number(false)
@@ -1522,7 +1521,7 @@ byte count:366
 byte count:366
 ";
         SearcherTester::new(SHERLOCK, "success|attached")
-            .filter(r"^reader-byline-(no)?term-nonumber$")
+            .filter(r"^(slice|reader)-byline-(no)?term-nonumber(-heaplimit|-candidates)?$")
             .print_labels(true)
             .after_context(2)
             .before_context(2)
@@ -1540,7 +1539,7 @@ byte count:366
 byte count:366
 ";
         SearcherTester::new(SHERLOCK, "success|attached")
-            .filter(r"^reader-byline-(no)?term-nonumber$")
+            .filter(r"^(slice|reader)-byline-(no)?term-nonumber(-heaplimit|-candidates)?$")
             .print_labels(true)
             .after_context(2)
             .line_number(false)
@@ -1558,7 +1557,7 @@ byte count:366
 byte count:366
 ";
         SearcherTester::new(SHERLOCK, "success|attached")
-            .filter(r"^reader-byline-(no)?term-nonumber$")
+            .filter(r"^(slice|reader)-byline-(no)?term-nonumber(-heaplimit|-candidates)?$")
             .print_labels(true)
             .before_context(2)
             .line_number(false)
@@ -1579,7 +1578,7 @@ byte count:366
 byte count:366
 ";
         SearcherTester::new(SHERLOCK, "Sherlock")
-            .filter(r"^reader-byline-(no)?term-nonumber$")
+            .filter(r"^(slice|reader)-byline-(no)?term-nonumber(-heaplimit|-candidates)?$")
             .print_labels(true)
             .after_context(3)
             .before_context(3)
@@ -1598,7 +1597,7 @@ byte count:366
 byte count:366
 ";
         SearcherTester::new(SHERLOCK, "Sherlock")
-            .filter(r"^reader-byline-(no)?term-nonumber$")
+            .filter(r"^(slice|reader)-byline-(no)?term-nonumber(-heaplimit|-candidates)?$")
             .print_labels(true)
             .after_context(3)
             .line_number(false)
@@ -1614,7 +1613,7 @@ byte count:366
 byte count:366
 ";
         SearcherTester::new(SHERLOCK, "Sherlock")
-            .filter(r"^reader-byline-(no)?term-nonumber$")
+            .filter(r"^(slice|reader)-byline-(no)?term-nonumber(-heaplimit|-candidates)?$")
             .print_labels(true)
             .before_context(3)
             .line_number(false)
@@ -1639,7 +1638,7 @@ byte count:366
 byte count:307
 ";
         SearcherTester::new(CODE, "stdin")
-            .filter(r"^reader-byline-(no)?term-nonumber$")
+            .filter(r"^(slice|reader)-byline-(no)?term-nonumber(-heaplimit|-candidates)?$")
             .print_labels(true)
             .after_context(2)
             .before_context(2)
@@ -1660,7 +1659,7 @@ byte count:307
 byte count:307
 ";
         SearcherTester::new(CODE, "stdin")
-            .filter(r"^reader-byline-(no)?term-nonumber$")
+            .filter(r"^(slice|reader)-byline-(no)?term-nonumber(-heaplimit|-candidates)?$")
             .print_labels(true)
             .after_context(2)
             .line_number(false)
@@ -1680,7 +1679,7 @@ byte count:307
 byte count:307
 ";
         SearcherTester::new(CODE, "stdin")
-            .filter(r"^reader-byline-(no)?term-nonumber$")
+            .filter(r"^(slice|reader)-byline-(no)?term-nonumber(-heaplimit|-candidates)?$")
             .print_labels(true)
             .before_context(2)
             .line_number(false)
@@ -1705,7 +1704,7 @@ byte count:307
 byte count:307
 ";
         SearcherTester::new(CODE, "stdout")
-            .filter(r"^reader-byline-(no)?term-nonumber$")
+            .filter(r"^(slice|reader)-byline-(no)?term-nonumber(-heaplimit|-candidates)?$")
             .print_labels(true)
             .after_context(2)
             .before_context(2)
@@ -1726,7 +1725,7 @@ byte count:307
 byte count:307
 ";
         SearcherTester::new(CODE, "stdout")
-            .filter(r"^reader-byline-(no)?term-nonumber$")
+            .filter(r"^(slice|reader)-byline-(no)?term-nonumber(-heaplimit|-candidates)?$")
             .print_labels(true)
             .after_context(2)
             .line_number(false)
@@ -1746,7 +1745,7 @@ byte count:307
 byte count:307
 ";
         SearcherTester::new(CODE, "stdout")
-            .filter(r"^reader-byline-(no)?term-nonumber$")
+            .filter(r"^(slice|reader)-byline-(no)?term-nonumber(-heaplimit|-candidates)?$")
             .print_labels(true)
             .before_context(2)
             .line_number(false)
@@ -1772,7 +1771,7 @@ byte count:307
 byte count:307
 ";
         SearcherTester::new(CODE, "fn main|let mut rdr")
-            .filter(r"^reader-byline-(no)?term-nonumber$")
+            .filter(r"^(slice|reader)-byline-(no)?term-nonumber(-heaplimit|-candidates)?$")
             .print_labels(true)
             .after_context(2)
             .before_context(2)
@@ -1793,7 +1792,7 @@ byte count:307
 byte count:307
 ";
         SearcherTester::new(CODE, "fn main|let mut rdr")
-            .filter(r"^reader-byline-(no)?term-nonumber$")
+            .filter(r"^(slice|reader)-byline-(no)?term-nonumber(-heaplimit|-candidates)?$")
             .print_labels(true)
             .after_context(2)
             .line_number(false)
@@ -1813,7 +1812,7 @@ byte count:307
 byte count:307
 ";
         SearcherTester::new(CODE, "fn main|let mut rdr")
-            .filter(r"^reader-byline-(no)?term-nonumber$")
+            .filter(r"^(slice|reader)-byline-(no)?term-nonumber(-heaplimit|-candidates)?$")
             .print_labels(true)
             .before_context(2)
             .line_number(false)
