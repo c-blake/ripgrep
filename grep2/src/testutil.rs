@@ -168,10 +168,10 @@ impl Sink for KitchenSink {
     where M: Matcher,
           M::Error: fmt::Display
     {
-        write!(self.0, "{}-", context.absolute_byte_offset)?;
         if let Some(line_number) = context.line_number() {
             write!(self.0, "{}-", line_number)?;
         }
+        write!(self.0, "{}-", context.absolute_byte_offset)?;
         self.0.write_all(context.bytes())?;
         Ok(true)
     }

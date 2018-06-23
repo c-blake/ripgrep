@@ -108,11 +108,10 @@ where M: Matcher,
 
         let binary_upto = cmp::min(self.slice.len(), DEFAULT_BUFFER_CAPACITY);
         if !self.core.detect_binary(self.slice, &Match::new(0, binary_upto)) {
-            while !self.slice[self.core.pos()..].is_empty() {
-                if !self.core.match_by_line(self.slice)? {
-                    break;
-                }
-            }
+            while
+                !self.slice[self.core.pos()..].is_empty()
+                && self.core.match_by_line(self.slice)?
+            {}
         }
         let byte_count = self.byte_count();
         let binary_byte_offset = self.core.binary_byte_offset();
@@ -131,15 +130,8 @@ where M: Matcher,
 pub struct MultiLine<'s, M: 's, S> {
     config: &'s Config,
     core: Core<'s, M, S>,
-    matcher: &'s M,
     slice: &'s [u8],
-    last_match: Option<LineMatch>,
-}
-
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
-struct LineMatch {
-    line: Match,
-    line_number: Option<u64>,
+    last_match: Option<Match>,
 }
 
 impl<'s, M, S> MultiLine<'s, M, S>
@@ -157,7 +149,6 @@ where M: Matcher,
         MultiLine {
             config: &searcher.config,
             core: Core::new(searcher, write_to, true),
-            matcher: &searcher.matcher,
             slice: slice,
             last_match: None,
         }
@@ -168,13 +159,19 @@ where M: Matcher,
 
         let binary_upto = cmp::min(self.slice.len(), DEFAULT_BUFFER_CAPACITY);
         if !self.core.detect_binary(self.slice, &Match::new(0, binary_upto)) {
-            while !self.slice[self.core.pos()..].is_empty() {
-                if !self.sink()? {
-                    break;
+            while !self.slice[self.core.pos()..].is_empty() && self.sink()? {}
+            let keepgoing = match self.last_match.take() {
+                None => true,
+                Some(last_match) => {
+                    if self.sink_context(&last_match)? {
+                        self.sink_matched(&last_match)?;
+                    }
+                    true
                 }
-            }
-            if let Some(last_match) = self.last_match.take() {
-                self.sink_matched(&last_match)?;
+            };
+            // Take care of any remaining context after the last match.
+            if keepgoing {
+                self.core.after_context_by_line(self.slice, self.slice.len())?;
             }
         }
         let byte_count = self.byte_count();
@@ -193,37 +190,35 @@ where M: Matcher,
                 return Ok(true);
             }
         };
+        self.advance(&mat);
+
         let line = lines::locate(self.slice, self.config.line_term, mat);
         // We delay sinking the match to make sure we group adjacent matches
         // together in a single sink. Adjacent matches are distinct matches
         // that start and end on the same line, respectively. This guarantees
         // that a single line is never sinked more than once.
-        let keepgoing = match self.last_match.take() {
-            None => true,
+        match self.last_match.take() {
+            None => {
+                self.last_match = Some(line);
+                Ok(true)
+            }
             Some(last_match) => {
                 // If the lines in the previous match overlap with the lines
                 // in this match, then simply grow the match and move on.
                 // This happens when the next match begins on the same line
                 // that the last match ends on.
-                if last_match.line.end() > line.start() {
-                    self.last_match = Some(LineMatch {
-                        line: last_match.line.with_end(line.end()),
-                        line_number: last_match.line_number,
-                    });
-                    self.advance(&mat);
-                    return Ok(true);
+                if last_match.end() > line.start() {
+                    self.last_match = Some(last_match.with_end(line.end()));
+                    Ok(true)
                 } else {
-                    self.sink_matched(&last_match)?
+                    self.last_match = Some(line);
+                    if !self.sink_context(&last_match)? {
+                        return Ok(false);
+                    }
+                    self.sink_matched(&last_match)
                 }
             }
-        };
-        self.core.count_lines(self.slice, line.start());
-        self.last_match = Some(LineMatch {
-            line: line,
-            line_number: self.core.line_number(),
-        });
-        self.advance(&mat);
-        Ok(keepgoing)
+        }
     }
 
     fn sink_matched_inverted(&self) -> Result<bool, S::Error> {
@@ -243,22 +238,23 @@ where M: Matcher,
                 m
             }
         };
+        if invert_match.is_empty() {
+            return Ok(true);
+        }
+        if !self.sink_context(&invert_match)? {
+            return Ok(false);
+        }
         let mut stepper = LineStep::new(self.config.line_term, invert_match);
         while let Some(line) = stepper.next(self.slice) {
-            self.core.count_lines(self.slice, line.start());
-            let m = LineMatch {
-                line: line,
-                line_number: self.core.line_number(),
-            };
-            if !self.sink_matched(&m)? {
+            if !self.sink_matched(&line)? {
                 return Ok(false);
             }
         }
         Ok(true)
     }
 
-    fn sink_matched(&self, m: &LineMatch) -> Result<bool, S::Error> {
-        if m.line.is_empty() {
+    fn sink_matched(&self, range: &Match) -> Result<bool, S::Error> {
+        if range.is_empty() {
             // The only way we can produce an empty line for a match is if we
             // match the position immediately following the last byte that we
             // search, and where that last byte is also the line terminator. We
@@ -266,11 +262,21 @@ where M: Matcher,
             // point anyway, so stop the search.
             return Ok(false);
         }
-        self.core.sink_match(self.slice, &m.line)
+        self.core.sink_matched(self.slice, range)
+    }
+
+    fn sink_context(&self, range: &Match) -> Result<bool, S::Error> {
+        if !self.core.after_context_by_line(self.slice, range.start())? {
+            return Ok(false);
+        }
+        if !self.core.before_context_by_line(self.slice, range.start())? {
+            return Ok(false);
+        }
+        Ok(true)
     }
 
     fn find(&self) -> Result<Option<Match>, S::Error> {
-        match self.matcher.find(&self.slice[self.core.pos()..]) {
+        match self.core.matcher.find(&self.slice[self.core.pos()..]) {
             Err(err) => Err(S::error_message(err)),
             Ok(None) => Ok(None),
             Ok(Some(m)) => Ok(Some(m.offset(self.core.pos()))),
@@ -415,6 +421,9 @@ where M: Matcher,
 
     fn count_lines(&self, buf: &[u8], upto: usize) {
         if let Some(ref line_number) = self.line_number {
+            if self.last_line_counted.get() >= upto {
+                return;
+            }
             let slice = &buf[self.last_line_counted.get()..upto];
             let count = lines::count(slice, self.config.line_term);
             line_number.set(line_number.get() + count);
@@ -450,7 +459,7 @@ where M: Matcher,
         }
     }
 
-    fn sink_match(&self, buf: &[u8], range: &Match) -> Result<bool, S::Error> {
+    fn sink_matched(&self, buf: &[u8], range: &Match) -> Result<bool, S::Error> {
         if self.binary && self.detect_binary(buf, range) {
             return Ok(false);
         }
@@ -510,7 +519,7 @@ where M: Matcher,
                 if !self.before_context_by_line(buf, line.start())? {
                     return Ok(false);
                 }
-                if !self.sink_match(buf, &line)? {
+                if !self.sink_matched(buf, &line)? {
                     return Ok(false);
                 }
             } else if self.after_context_left.get() >= 1 {
@@ -518,7 +527,6 @@ where M: Matcher,
                     return Ok(false);
                 }
             }
-            self.add_one_line(line.end());
         }
         Ok(true)
     }
@@ -537,7 +545,7 @@ where M: Matcher,
                     return Ok(false);
                 }
                 self.set_pos(line.end());
-                if !self.sink_match(buf, &line)? {
+                if !self.sink_matched(buf, &line)? {
                     return Ok(false);
                 }
             } else {
@@ -578,10 +586,9 @@ where M: Matcher,
         self.count_lines(buf, invert_match.start());
         let mut stepper = LineStep::new(self.config.line_term, invert_match);
         while let Some(line) = stepper.next(buf) {
-            if !self.sink_match(buf, &line)? {
+            if !self.sink_matched(buf, &line)? {
                 return Ok(false);
             }
-            self.add_one_line(line.end());
         }
         Ok(true)
     }
@@ -1216,20 +1223,25 @@ d
 
 byte count:366
 ";
-        // before and after
+        let exp_lines = "\
+1:0:For the Doctor Watsons of this world, as opposed to the Sherlock
+2-65-Holmeses, success in the province of detective work must always
+3:129:be, to a very large extent, the result of luck. Sherlock Holmes
+4-193-can extract a clew from a wisp of straw or a flake of cigar ash;
+
+byte count:366
+";
+        // before and after + line numbers
         SearcherTester::new(SHERLOCK, "Sherlock")
-            .filter(r"^(slice|reader)-byline-(no)?term-nonumber(-heaplimit|-candidates)?$")
-            .print_labels(true)
             .after_context(1)
             .before_context(1)
-            .line_number(false)
+            .line_number(true)
             .expected_no_line_number(exp)
+            .expected_with_line_number(exp_lines)
             .test();
 
         // after
         SearcherTester::new(SHERLOCK, "Sherlock")
-            .filter(r"^(slice|reader)-byline-(no)?term-nonumber(-heaplimit|-candidates)?$")
-            .print_labels(true)
             .after_context(1)
             .line_number(false)
             .expected_no_line_number(exp)
@@ -1244,8 +1256,6 @@ byte count:366
 byte count:366
 ";
         SearcherTester::new(SHERLOCK, "Sherlock")
-            .filter(r"^(slice|reader)-byline-(no)?term-nonumber(-heaplimit|-candidates)?$")
-            .print_labels(true)
             .before_context(1)
             .line_number(false)
             .expected_no_line_number(exp)
@@ -1263,21 +1273,27 @@ byte count:366
 321:and exhibited clearly, with a label attached.
 byte count:366
 ";
-        // before and after
+        let exp_lines = "\
+1-0-For the Doctor Watsons of this world, as opposed to the Sherlock
+2:65:Holmeses, success in the province of detective work must always
+3-129-be, to a very large extent, the result of luck. Sherlock Holmes
+4:193:can extract a clew from a wisp of straw or a flake of cigar ash;
+5:258:but Doctor Watson has to have it taken out for him and dusted,
+6:321:and exhibited clearly, with a label attached.
+byte count:366
+";
+        // before and after + line numbers
         SearcherTester::new(SHERLOCK, "Sherlock")
-            .filter(r"^(slice|reader)-byline-(no)?term-nonumber(-heaplimit|-candidates)?$")
-            .print_labels(true)
             .after_context(1)
             .before_context(1)
-            .line_number(false)
+            .line_number(true)
             .invert_match(true)
             .expected_no_line_number(exp)
+            .expected_with_line_number(exp_lines)
             .test();
 
         // before
         SearcherTester::new(SHERLOCK, "Sherlock")
-            .filter(r"^(slice|reader)-byline-(no)?term-nonumber(-heaplimit|-candidates)?$")
-            .print_labels(true)
             .before_context(1)
             .line_number(false)
             .invert_match(true)
@@ -1294,8 +1310,6 @@ byte count:366
 byte count:366
 ";
         SearcherTester::new(SHERLOCK, "Sherlock")
-            .filter(r"^(slice|reader)-byline-(no)?term-nonumber(-heaplimit|-candidates)?$")
-            .print_labels(true)
             .after_context(1)
             .line_number(false)
             .invert_match(true)
@@ -1313,21 +1327,25 @@ byte count:366
 321:and exhibited clearly, with a label attached.
 byte count:366
 ";
-        // before + after
+        let exp_lines = "\
+2-65-Holmeses, success in the province of detective work must always
+3:129:be, to a very large extent, the result of luck. Sherlock Holmes
+4:193:can extract a clew from a wisp of straw or a flake of cigar ash;
+5-258-but Doctor Watson has to have it taken out for him and dusted,
+6:321:and exhibited clearly, with a label attached.
+byte count:366
+";
+        // before + after + line numbers
         SearcherTester::new(SHERLOCK, " a ")
-            .filter(r"^(slice|reader)-byline-(no)?term-nonumber(-heaplimit|-candidates)?$")
-            .print_labels(true)
             .after_context(1)
             .before_context(1)
-            .line_number(false)
+            .line_number(true)
             .expected_no_line_number(exp)
+            .expected_with_line_number(exp_lines)
             .test();
 
         // before
         SearcherTester::new(SHERLOCK, " a ")
-            .filter(r"^(slice|reader)-byline-(no)?term-nonumber(-heaplimit|-candidates)?$")
-            .filter(r"^reader-byline-noterm-nonumber-heaplimit$")
-            .print_labels(true)
             .before_context(1)
             .line_number(false)
             .expected_no_line_number(exp)
@@ -1342,8 +1360,6 @@ byte count:366
 byte count:366
 ";
         SearcherTester::new(SHERLOCK, " a ")
-            .filter(r"^(slice|reader)-byline-(no)?term-nonumber(-heaplimit|-candidates)?$")
-            .print_labels(true)
             .after_context(1)
             .line_number(false)
             .expected_no_line_number(exp)
@@ -1352,7 +1368,6 @@ byte count:366
 
     #[test]
     fn context_sherlock_invert2() {
-        // before + after
         let exp = "\
 0:For the Doctor Watsons of this world, as opposed to the Sherlock
 65:Holmeses, success in the province of detective work must always
@@ -1362,14 +1377,23 @@ byte count:366
 321-and exhibited clearly, with a label attached.
 byte count:366
 ";
+        let exp_lines = "\
+1:0:For the Doctor Watsons of this world, as opposed to the Sherlock
+2:65:Holmeses, success in the province of detective work must always
+3-129-be, to a very large extent, the result of luck. Sherlock Holmes
+4-193-can extract a clew from a wisp of straw or a flake of cigar ash;
+5:258:but Doctor Watson has to have it taken out for him and dusted,
+6-321-and exhibited clearly, with a label attached.
+byte count:366
+";
+        // before + after + line numbers
         SearcherTester::new(SHERLOCK, " a ")
-            .filter(r"^(slice|reader)-byline-(no)?term-nonumber(-heaplimit|-candidates)?$")
-            .print_labels(true)
             .after_context(1)
             .before_context(1)
-            .line_number(false)
+            .line_number(true)
             .invert_match(true)
             .expected_no_line_number(exp)
+            .expected_with_line_number(exp_lines)
             .test();
 
         // before
@@ -1383,8 +1407,6 @@ byte count:366
 byte count:366
 ";
         SearcherTester::new(SHERLOCK, " a ")
-            .filter(r"^(slice|reader)-byline-(no)?term-nonumber(-heaplimit|-candidates)?$")
-            .print_labels(true)
             .before_context(1)
             .line_number(false)
             .invert_match(true)
@@ -1402,8 +1424,6 @@ byte count:366
 byte count:366
 ";
         SearcherTester::new(SHERLOCK, " a ")
-            .filter(r"^(slice|reader)-byline-(no)?term-nonumber(-heaplimit|-candidates)?$")
-            .print_labels(true)
             .after_context(1)
             .line_number(false)
             .invert_match(true)
@@ -1422,20 +1442,26 @@ byte count:366
 
 byte count:366
 ";
-        // before and after
+        let exp_lines = "\
+1:0:For the Doctor Watsons of this world, as opposed to the Sherlock
+2-65-Holmeses, success in the province of detective work must always
+3:129:be, to a very large extent, the result of luck. Sherlock Holmes
+4-193-can extract a clew from a wisp of straw or a flake of cigar ash;
+5-258-but Doctor Watson has to have it taken out for him and dusted,
+
+byte count:366
+";
+        // before and after + line numbers
         SearcherTester::new(SHERLOCK, "Sherlock")
-            .filter(r"^(slice|reader)-byline-(no)?term-nonumber(-heaplimit|-candidates)?$")
-            .print_labels(true)
             .after_context(2)
             .before_context(2)
-            .line_number(false)
+            .line_number(true)
             .expected_no_line_number(exp)
+            .expected_with_line_number(exp_lines)
             .test();
 
         // after
         SearcherTester::new(SHERLOCK, "Sherlock")
-            .filter(r"^(slice|reader)-byline-(no)?term-nonumber(-heaplimit|-candidates)?$")
-            .print_labels(true)
             .after_context(2)
             .line_number(false)
             .expected_no_line_number(exp)
@@ -1450,8 +1476,6 @@ byte count:366
 byte count:366
 ";
         SearcherTester::new(SHERLOCK, "Sherlock")
-            .filter(r"^(slice|reader)-byline-(no)?term-nonumber(-heaplimit|-candidates)?$")
-            .print_labels(true)
             .before_context(2)
             .line_number(false)
             .expected_no_line_number(exp)
@@ -1460,7 +1484,6 @@ byte count:366
 
     #[test]
     fn context_sherlock4() {
-        // before and after
         let exp = "\
 129-be, to a very large extent, the result of luck. Sherlock Holmes
 193-can extract a clew from a wisp of straw or a flake of cigar ash;
@@ -1468,13 +1491,20 @@ byte count:366
 321-and exhibited clearly, with a label attached.
 byte count:366
 ";
+        let exp_lines = "\
+3-129-be, to a very large extent, the result of luck. Sherlock Holmes
+4-193-can extract a clew from a wisp of straw or a flake of cigar ash;
+5:258:but Doctor Watson has to have it taken out for him and dusted,
+6-321-and exhibited clearly, with a label attached.
+byte count:366
+";
+        // before and after + line numbers
         SearcherTester::new(SHERLOCK, "dusted")
-            .filter(r"^(slice|reader)-byline-(no)?term-nonumber(-heaplimit|-candidates)?$")
-            .print_labels(true)
             .after_context(2)
             .before_context(2)
-            .line_number(false)
+            .line_number(true)
             .expected_no_line_number(exp)
+            .expected_with_line_number(exp_lines)
             .test();
 
         // after
@@ -1484,8 +1514,6 @@ byte count:366
 byte count:366
 ";
         SearcherTester::new(SHERLOCK, "dusted")
-            .filter(r"^(slice|reader)-byline-(no)?term-nonumber(-heaplimit|-candidates)?$")
-            .print_labels(true)
             .after_context(2)
             .line_number(false)
             .expected_no_line_number(exp)
@@ -1500,8 +1528,6 @@ byte count:366
 byte count:366
 ";
         SearcherTester::new(SHERLOCK, "dusted")
-            .filter(r"^(slice|reader)-byline-(no)?term-nonumber(-heaplimit|-candidates)?$")
-            .print_labels(true)
             .before_context(2)
             .line_number(false)
             .expected_no_line_number(exp)
@@ -1510,7 +1536,6 @@ byte count:366
 
     #[test]
     fn context_sherlock5() {
-        // before and after
         let exp = "\
 0-For the Doctor Watsons of this world, as opposed to the Sherlock
 65:Holmeses, success in the province of detective work must always
@@ -1520,13 +1545,22 @@ byte count:366
 321:and exhibited clearly, with a label attached.
 byte count:366
 ";
+        let exp_lines = "\
+1-0-For the Doctor Watsons of this world, as opposed to the Sherlock
+2:65:Holmeses, success in the province of detective work must always
+3-129-be, to a very large extent, the result of luck. Sherlock Holmes
+4-193-can extract a clew from a wisp of straw or a flake of cigar ash;
+5-258-but Doctor Watson has to have it taken out for him and dusted,
+6:321:and exhibited clearly, with a label attached.
+byte count:366
+";
+        // before and after + line numbers
         SearcherTester::new(SHERLOCK, "success|attached")
-            .filter(r"^(slice|reader)-byline-(no)?term-nonumber(-heaplimit|-candidates)?$")
-            .print_labels(true)
             .after_context(2)
             .before_context(2)
-            .line_number(false)
+            .line_number(true)
             .expected_no_line_number(exp)
+            .expected_with_line_number(exp_lines)
             .test();
 
         // after
@@ -1539,8 +1573,6 @@ byte count:366
 byte count:366
 ";
         SearcherTester::new(SHERLOCK, "success|attached")
-            .filter(r"^(slice|reader)-byline-(no)?term-nonumber(-heaplimit|-candidates)?$")
-            .print_labels(true)
             .after_context(2)
             .line_number(false)
             .expected_no_line_number(exp)
@@ -1557,8 +1589,6 @@ byte count:366
 byte count:366
 ";
         SearcherTester::new(SHERLOCK, "success|attached")
-            .filter(r"^(slice|reader)-byline-(no)?term-nonumber(-heaplimit|-candidates)?$")
-            .print_labels(true)
             .before_context(2)
             .line_number(false)
             .expected_no_line_number(exp)
@@ -1567,7 +1597,6 @@ byte count:366
 
     #[test]
     fn context_sherlock6() {
-        // before and after
         let exp = "\
 0:For the Doctor Watsons of this world, as opposed to the Sherlock
 65-Holmeses, success in the province of detective work must always
@@ -1577,13 +1606,22 @@ byte count:366
 321-and exhibited clearly, with a label attached.
 byte count:366
 ";
+        let exp_lines = "\
+1:0:For the Doctor Watsons of this world, as opposed to the Sherlock
+2-65-Holmeses, success in the province of detective work must always
+3:129:be, to a very large extent, the result of luck. Sherlock Holmes
+4-193-can extract a clew from a wisp of straw or a flake of cigar ash;
+5-258-but Doctor Watson has to have it taken out for him and dusted,
+6-321-and exhibited clearly, with a label attached.
+byte count:366
+";
+        // before and after + line numbers
         SearcherTester::new(SHERLOCK, "Sherlock")
-            .filter(r"^(slice|reader)-byline-(no)?term-nonumber(-heaplimit|-candidates)?$")
-            .print_labels(true)
             .after_context(3)
             .before_context(3)
-            .line_number(false)
+            .line_number(true)
             .expected_no_line_number(exp)
+            .expected_with_line_number(exp_lines)
             .test();
 
         // after
@@ -1597,8 +1635,6 @@ byte count:366
 byte count:366
 ";
         SearcherTester::new(SHERLOCK, "Sherlock")
-            .filter(r"^(slice|reader)-byline-(no)?term-nonumber(-heaplimit|-candidates)?$")
-            .print_labels(true)
             .after_context(3)
             .line_number(false)
             .expected_no_line_number(exp)
@@ -1613,8 +1649,6 @@ byte count:366
 byte count:366
 ";
         SearcherTester::new(SHERLOCK, "Sherlock")
-            .filter(r"^(slice|reader)-byline-(no)?term-nonumber(-heaplimit|-candidates)?$")
-            .print_labels(true)
             .before_context(3)
             .line_number(false)
             .expected_no_line_number(exp)
@@ -1637,13 +1671,26 @@ byte count:366
 
 byte count:307
 ";
+        let exp_lines = "\
+4-33-
+5-34-fn main() {
+6:46:    let stdin = io::stdin();
+7-75-    let stdout = io::stdout();
+8-106-
+9:107:    // Wrap the stdin reader in a Snappy reader.
+10:156:    let mut rdr = snap::Reader::new(stdin.lock());
+11-207-    let mut wtr = stdout.lock();
+12-240-    io::copy(&mut rdr, &mut wtr).expect(\"I/O operation failed\");
+
+byte count:307
+";
+        // before and after + line numbers
         SearcherTester::new(CODE, "stdin")
-            .filter(r"^(slice|reader)-byline-(no)?term-nonumber(-heaplimit|-candidates)?$")
-            .print_labels(true)
             .after_context(2)
             .before_context(2)
-            .line_number(false)
+            .line_number(true)
             .expected_no_line_number(exp)
+            .expected_with_line_number(exp_lines)
             .test();
 
         // after
@@ -1659,8 +1706,6 @@ byte count:307
 byte count:307
 ";
         SearcherTester::new(CODE, "stdin")
-            .filter(r"^(slice|reader)-byline-(no)?term-nonumber(-heaplimit|-candidates)?$")
-            .print_labels(true)
             .after_context(2)
             .line_number(false)
             .expected_no_line_number(exp)
@@ -1679,8 +1724,6 @@ byte count:307
 byte count:307
 ";
         SearcherTester::new(CODE, "stdin")
-            .filter(r"^(slice|reader)-byline-(no)?term-nonumber(-heaplimit|-candidates)?$")
-            .print_labels(true)
             .before_context(2)
             .line_number(false)
             .expected_no_line_number(exp)
@@ -1689,7 +1732,6 @@ byte count:307
 
     #[test]
     fn context_code2() {
-        // before and after
         let exp = "\
 34-fn main() {
 46-    let stdin = io::stdin();
@@ -1703,13 +1745,26 @@ byte count:307
 
 byte count:307
 ";
+        let exp_lines = "\
+5-34-fn main() {
+6-46-    let stdin = io::stdin();
+7:75:    let stdout = io::stdout();
+8-106-
+9-107-    // Wrap the stdin reader in a Snappy reader.
+10-156-    let mut rdr = snap::Reader::new(stdin.lock());
+11:207:    let mut wtr = stdout.lock();
+12-240-    io::copy(&mut rdr, &mut wtr).expect(\"I/O operation failed\");
+13-305-}
+
+byte count:307
+";
+        // before and after + line numbers
         SearcherTester::new(CODE, "stdout")
-            .filter(r"^(slice|reader)-byline-(no)?term-nonumber(-heaplimit|-candidates)?$")
-            .print_labels(true)
             .after_context(2)
             .before_context(2)
-            .line_number(false)
+            .line_number(true)
             .expected_no_line_number(exp)
+            .expected_with_line_number(exp_lines)
             .test();
 
         // after
@@ -1725,8 +1780,6 @@ byte count:307
 byte count:307
 ";
         SearcherTester::new(CODE, "stdout")
-            .filter(r"^(slice|reader)-byline-(no)?term-nonumber(-heaplimit|-candidates)?$")
-            .print_labels(true)
             .after_context(2)
             .line_number(false)
             .expected_no_line_number(exp)
@@ -1745,8 +1798,6 @@ byte count:307
 byte count:307
 ";
         SearcherTester::new(CODE, "stdout")
-            .filter(r"^(slice|reader)-byline-(no)?term-nonumber(-heaplimit|-candidates)?$")
-            .print_labels(true)
             .before_context(2)
             .line_number(false)
             .expected_no_line_number(exp)
@@ -1755,7 +1806,6 @@ byte count:307
 
     #[test]
     fn context_code3() {
-        // before and after
         let exp = "\
 20-use std::io;
 33-
@@ -1770,13 +1820,27 @@ byte count:307
 
 byte count:307
 ";
+        let exp_lines = "\
+3-20-use std::io;
+4-33-
+5:34:fn main() {
+6-46-    let stdin = io::stdin();
+7-75-    let stdout = io::stdout();
+8-106-
+9-107-    // Wrap the stdin reader in a Snappy reader.
+10:156:    let mut rdr = snap::Reader::new(stdin.lock());
+11-207-    let mut wtr = stdout.lock();
+12-240-    io::copy(&mut rdr, &mut wtr).expect(\"I/O operation failed\");
+
+byte count:307
+";
+        // before and after + line numbers
         SearcherTester::new(CODE, "fn main|let mut rdr")
-            .filter(r"^(slice|reader)-byline-(no)?term-nonumber(-heaplimit|-candidates)?$")
-            .print_labels(true)
             .after_context(2)
             .before_context(2)
-            .line_number(false)
+            .line_number(true)
             .expected_no_line_number(exp)
+            .expected_with_line_number(exp_lines)
             .test();
 
         // after
@@ -1792,8 +1856,6 @@ byte count:307
 byte count:307
 ";
         SearcherTester::new(CODE, "fn main|let mut rdr")
-            .filter(r"^(slice|reader)-byline-(no)?term-nonumber(-heaplimit|-candidates)?$")
-            .print_labels(true)
             .after_context(2)
             .line_number(false)
             .expected_no_line_number(exp)
@@ -1812,8 +1874,6 @@ byte count:307
 byte count:307
 ";
         SearcherTester::new(CODE, "fn main|let mut rdr")
-            .filter(r"^(slice|reader)-byline-(no)?term-nonumber(-heaplimit|-candidates)?$")
-            .print_labels(true)
             .before_context(2)
             .line_number(false)
             .expected_no_line_number(exp)
