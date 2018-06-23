@@ -4,10 +4,10 @@ use std::io;
 
 use lines::{self, LineStep};
 use line_buffer::{DEFAULT_BUFFER_CAPACITY, LineBufferReader};
-use matcher::{Match, Matcher};
+use matcher::Matcher;
 use sink::Sink;
 
-use searcher::{Config, Searcher};
+use searcher::{Config, Range, Searcher};
 use searcher::core::Core;
 
 #[derive(Debug)]
@@ -103,7 +103,7 @@ where M: Matcher,
         assert!(!self.config.multi_line);
 
         let binary_upto = cmp::min(self.slice.len(), DEFAULT_BUFFER_CAPACITY);
-        if !self.core.detect_binary(self.slice, &Match::new(0, binary_upto)) {
+        if !self.core.detect_binary(self.slice, &Range::new(0, binary_upto)) {
             while
                 !self.slice[self.core.pos()..].is_empty()
                 && self.core.match_by_line(self.slice)?
@@ -128,7 +128,7 @@ pub struct MultiLine<'s, M: 's, S> {
     core: Core<'s, M, S>,
     matcher: &'s M,
     slice: &'s [u8],
-    last_match: Option<Match>,
+    last_match: Option<Range>,
 }
 
 impl<'s, M, S> MultiLine<'s, M, S>
@@ -156,7 +156,7 @@ where M: Matcher,
         assert!(self.config.multi_line);
 
         let binary_upto = cmp::min(self.slice.len(), DEFAULT_BUFFER_CAPACITY);
-        if !self.core.detect_binary(self.slice, &Match::new(0, binary_upto)) {
+        if !self.core.detect_binary(self.slice, &Range::new(0, binary_upto)) {
             while !self.slice[self.core.pos()..].is_empty() && self.sink()? {}
             let keepgoing = match self.last_match.take() {
                 None => true,
@@ -224,16 +224,16 @@ where M: Matcher,
 
         let invert_match = match self.find()? {
             None => {
-                let m = Match::new(self.core.pos(), self.slice.len());
-                self.core.set_pos(m.end());
-                m
+                let range = Range::new(self.core.pos(), self.slice.len());
+                self.core.set_pos(range.end());
+                range
             }
             Some(mat) => {
                 let line = lines::locate(
                     self.slice, self.config.line_term, mat);
-                let m = Match::new(self.core.pos(), line.start());
+                let range = Range::new(self.core.pos(), line.start());
                 self.advance(&line);
-                m
+                range
             }
         };
         if invert_match.is_empty() {
@@ -251,7 +251,7 @@ where M: Matcher,
         Ok(true)
     }
 
-    fn sink_matched(&self, range: &Match) -> Result<bool, S::Error> {
+    fn sink_matched(&self, range: &Range) -> Result<bool, S::Error> {
         if range.is_empty() {
             // The only way we can produce an empty line for a match is if we
             // match the position immediately following the last byte that we
@@ -263,7 +263,7 @@ where M: Matcher,
         self.core.sink_matched(self.slice, range)
     }
 
-    fn sink_context(&self, range: &Match) -> Result<bool, S::Error> {
+    fn sink_context(&self, range: &Range) -> Result<bool, S::Error> {
         if !self.core.after_context_by_line(self.slice, range.start())? {
             return Ok(false);
         }
@@ -273,7 +273,7 @@ where M: Matcher,
         Ok(true)
     }
 
-    fn find(&self) -> Result<Option<Match>, S::Error> {
+    fn find(&self) -> Result<Option<Range>, S::Error> {
         match self.matcher.find(&self.slice[self.core.pos()..]) {
             Err(err) => Err(S::error_message(err)),
             Ok(None) => Ok(None),
@@ -285,9 +285,9 @@ where M: Matcher,
     ///
     /// If the previous match is zero width, then this advances the search
     /// position one byte past the end of the match.
-    fn advance(&self, m: &Match) {
-        self.core.set_pos(m.end());
-        if m.is_empty() && self.core.pos() < self.slice.len() {
+    fn advance(&self, range: &Range) {
+        self.core.set_pos(range.end());
+        if range.is_empty() && self.core.pos() < self.slice.len() {
             self.core.set_pos(self.core.pos() + 1);
         }
     }

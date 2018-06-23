@@ -6,8 +6,8 @@ use memchr::memchr;
 
 use lines::{self, LineStep};
 use line_buffer::BinaryDetection;
-use matcher::{LineMatchKind, Match, Matcher};
-use searcher::{Config, Searcher};
+use matcher::{LineMatchKind, Matcher};
+use searcher::{Config, Range, Searcher};
 use sink::{Sink, SinkFinish, SinkContext, SinkContextKind, SinkMatch};
 
 #[derive(Debug)]
@@ -106,15 +106,6 @@ where M: Matcher,
             })
     }
 
-    fn is_line_by_line_fast(&self) -> bool {
-        assert!(!self.config.multi_line);
-
-        match self.matcher.line_terminator() {
-            None => false,
-            Some(line_term) => line_term == self.config.line_term,
-        }
-    }
-
     pub fn pos(&self) -> usize {
         self.pos.get()
     }
@@ -143,7 +134,7 @@ where M: Matcher,
         self.binary_byte_offset.get().map(|offset| offset as u64)
     }
 
-    pub fn detect_binary(&self, buf: &[u8], range: &Match) -> bool {
+    pub fn detect_binary(&self, buf: &[u8], range: &Range) -> bool {
         if self.binary_byte_offset.get().is_some() {
             return true;
         }
@@ -163,7 +154,7 @@ where M: Matcher,
     pub fn sink_matched(
         &self,
         buf: &[u8],
-        range: &Match,
+        range: &Range,
     ) -> Result<bool, S::Error> {
         if self.binary && self.detect_binary(buf, range) {
             return Ok(false);
@@ -202,7 +193,7 @@ where M: Matcher,
     fn match_by_line_slow(&self, buf: &[u8]) -> Result<bool, S::Error> {
         assert!(!self.config.multi_line);
 
-        let range = Match::new(self.pos(), buf.len());
+        let range = Range::new(self.pos(), buf.len());
         let mut stepper = LineStep::new(self.config.line_term, range);
         while let Some(line) = stepper.next(buf) {
             let matched = {
@@ -269,14 +260,14 @@ where M: Matcher,
 
         let invert_match = match self.find_by_line_fast(buf)? {
             None => {
-                let m = Match::new(self.pos(), buf.len());
-                self.set_pos(m.end());
-                m
+                let range = Range::new(self.pos(), buf.len());
+                self.set_pos(range.end());
+                range
             }
             Some(line) => {
-                let m = Match::new(self.pos(), line.start());
+                let range = Range::new(self.pos(), line.start());
                 self.set_pos(line.end());
-                m
+                range
             }
         };
         if invert_match.is_empty() {
@@ -288,7 +279,6 @@ where M: Matcher,
         if !self.before_context_by_line(buf, invert_match.start())? {
             return Ok(false);
         }
-        self.count_lines(buf, invert_match.start());
         let mut stepper = LineStep::new(self.config.line_term, invert_match);
         while let Some(line) = stepper.next(buf) {
             if !self.sink_matched(buf, &line)? {
@@ -301,7 +291,7 @@ where M: Matcher,
     fn find_by_line_fast(
         &self,
         buf: &[u8],
-    ) -> Result<Option<Match>, S::Error> {
+    ) -> Result<Option<Range>, S::Error> {
         assert!(!self.config.multi_line);
         assert_eq!(
             self.matcher.line_terminator().unwrap(),
@@ -318,7 +308,7 @@ where M: Matcher,
                     let line = lines::locate(
                         buf,
                         self.config.line_term,
-                        Match::zero(i).offset(pos),
+                        Range::zero(i).offset(pos),
                     );
                     // If we matched beyond the end of the buffer, then we
                     // don't report this as a match.
@@ -332,7 +322,7 @@ where M: Matcher,
                     let line = lines::locate(
                         buf,
                         self.config.line_term,
-                        Match::zero(i).offset(pos),
+                        Range::zero(i).offset(pos),
                     );
                     // We need to strip the line terminator here to match the
                     // semantics of line-by-line searching. Namely, regexes
@@ -360,7 +350,7 @@ where M: Matcher,
     fn sink_after_context(
         &self,
         buf: &[u8],
-        range: &Match,
+        range: &Range,
     ) -> Result<bool, S::Error> {
         assert!(self.after_context_left.get() >= 1);
 
@@ -395,7 +385,7 @@ where M: Matcher,
         if self.after_context_left.get() == 0 {
             return Ok(true);
         }
-        let range = Match::new(self.last_line_visited.get(), upto);
+        let range = Range::new(self.last_line_visited.get(), upto);
         let mut stepper = LineStep::new(self.config.line_term, range);
         while let Some(line) = stepper.next(buf) {
             if !self.sink_after_context(buf, &line)? {
@@ -411,7 +401,7 @@ where M: Matcher,
     fn sink_before_context(
         &self,
         buf: &[u8],
-        range: &Match,
+        range: &Range,
     ) -> Result<bool, S::Error> {
         if self.binary && self.detect_binary(buf, range) {
             return Ok(false);
@@ -443,7 +433,7 @@ where M: Matcher,
         if self.config.before_context == 0 {
             return Ok(true);
         }
-        let range = Match::new(self.last_line_visited.get(), upto);
+        let range = Range::new(self.last_line_visited.get(), upto);
         if range.is_empty() {
             return Ok(true);
         }
@@ -453,7 +443,7 @@ where M: Matcher,
             self.config.before_context - 1,
         );
 
-        let range = Match::new(before_context_start, range.end());
+        let range = Range::new(before_context_start, range.end());
         let mut stepper = LineStep::new(self.config.line_term, range);
         while let Some(line) = stepper.next(buf) {
             if !self.sink_break_context(line.start())? {
@@ -480,6 +470,15 @@ where M: Matcher,
             Ok(true)
         } else {
             self.sink.borrow_mut().context_break(&self.searcher)
+        }
+    }
+
+    fn is_line_by_line_fast(&self) -> bool {
+        assert!(!self.config.multi_line);
+
+        match self.matcher.line_terminator() {
+            None => false,
+            Some(line_term) => line_term == self.config.line_term,
         }
     }
 }

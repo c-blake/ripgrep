@@ -8,12 +8,17 @@ use line_buffer::{
     self, BufferAllocation, LineBuffer, LineBufferBuilder, LineBufferReader,
     DEFAULT_BUFFER_CAPACITY, alloc_error,
 };
-use matcher::Matcher;
+use matcher::{Match, Matcher};
 use searcher::glue::{ReadByLine, SliceByLine, MultiLine};
 use sink::Sink;
 
 mod core;
 mod glue;
+
+/// We use this type alias since we want the ergonomics of a matcher's `Match`
+/// type, but in practice, we use it for arbitrary ranges. This is only used
+/// in the searcher's internals.
+type Range = Match;
 
 /// The behavior of binary detection while searching.
 ///
@@ -114,26 +119,26 @@ impl MmapChoice {
 #[derive(Clone, Debug)]
 pub struct Config {
     /// The line terminator to use.
-    pub line_term: u8,
+    line_term: u8,
     /// Whether to invert matching.
-    pub invert_match: bool,
+    invert_match: bool,
     /// The number of lines after a match to include.
-    pub after_context: usize,
+    after_context: usize,
     /// The number of lines before a match to include.
-    pub before_context: usize,
+    before_context: usize,
     /// Whether to count line numbers.
-    pub line_number: bool,
+    line_number: bool,
     /// The maximum amount of heap memory to use.
     ///
     /// When not given, no explicit limit is enforced. When set to `0`, then
     /// only the memory map search strategy is available.
-    pub heap_limit: Option<usize>,
+    heap_limit: Option<usize>,
     /// The memory map strategy.
-    pub mmap: MmapChoice,
+    mmap: MmapChoice,
     /// The binary data detection strategy.
-    pub binary: BinaryDetection,
+    binary: BinaryDetection,
     /// Whether to enable matching across multiple lines.
-    pub multi_line: bool,
+    multi_line: bool,
 }
 
 impl Default for Config {
@@ -157,7 +162,7 @@ impl Config {
     /// configuration's context.
     ///
     /// If this returns `0`, then no context is ever needed.
-    pub(crate) fn max_context(&self) -> usize {
+    fn max_context(&self) -> usize {
         cmp::max(self.before_context, self.after_context)
     }
 
@@ -339,8 +344,8 @@ impl SearcherBuilder {
 
 #[derive(Debug)]
 pub struct Searcher<M> {
-    pub(crate) config: Config,
-    pub(crate) matcher: M,
+    config: Config,
+    matcher: M,
     /// A line buffer for use in line oriented searching.
     ///
     /// We wrap it in a RefCell to permit lending out borrows of `Searcher`
@@ -480,13 +485,6 @@ where M: Matcher,
                 let doubled = 2 * buf.len();
                 buf.resize(cmp::min(doubled, limit), 0);
             }
-        }
-    }
-
-    fn is_line_by_line_fast(&self) -> bool {
-        match self.matcher.line_terminator() {
-            None => false,
-            Some(line_term) => line_term == self.config.line_term,
         }
     }
 }
