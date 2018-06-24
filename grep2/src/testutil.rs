@@ -126,14 +126,6 @@ impl KitchenSink {
 impl Sink for KitchenSink {
     type Error = io::Error;
 
-    fn error_message<T: fmt::Display>(message: T) -> io::Error {
-        io::Error::new(io::ErrorKind::Other, message.to_string())
-    }
-
-    fn error_io(err: io::Error) -> io::Error {
-        err
-    }
-
     fn matched<M>(
         &mut self,
         _searcher: &Searcher<M>,
@@ -168,6 +160,9 @@ impl Sink for KitchenSink {
     where M: Matcher,
           M::Error: fmt::Display
     {
+        assert!(!context.bytes().is_empty());
+        assert!(context.lines().count() == 1);
+
         if let Some(line_number) = context.line_number() {
             write!(self.0, "{}-", line_number)?;
         }
@@ -312,6 +307,7 @@ impl SearcherTester {
     /// This is often useful when debugging tests, e.g., when you want to do
     /// printf debugging and only want one particular test configuration to
     /// execute.
+    #[allow(dead_code)]
     pub fn filter(&mut self, pattern: &str) -> &mut SearcherTester {
         self.filter = Some(::regex::Regex::new(pattern).unwrap());
         self
@@ -322,6 +318,7 @@ impl SearcherTester {
     ///
     /// Note that in order to see these in tests that aren't failing, you'll
     /// want to use `cargo test -- --nocapture`.
+    #[allow(dead_code)]
     pub fn print_labels(&mut self, yes: bool) -> &mut SearcherTester {
         self.print_labels = yes;
         self
@@ -359,6 +356,7 @@ impl SearcherTester {
     /// Set the expected search results, with line numbers, when performing a
     /// search on a slice. When not present, `expected_with_line_number` is
     /// used instead.
+    #[allow(dead_code)]
     pub fn expected_slice_with_line_number(
         &mut self,
         exp: &str,
@@ -388,6 +386,7 @@ impl SearcherTester {
     /// Whether to test search using the multi line searcher or not.
     ///
     /// By default, this is enabled.
+    #[allow(dead_code)]
     pub fn multi_line(&mut self, yes: bool) -> &mut SearcherTester {
         self.multi_line = yes;
         self

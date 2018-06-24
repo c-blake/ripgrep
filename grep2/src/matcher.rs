@@ -221,46 +221,6 @@ impl fmt::Display for NoError {
     }
 }
 
-/*
-/// A matcher's line terminator settings.
-///
-/// The line terminator indicates the type of search that the caller intends
-/// to performer with a particular matcher. Broadly speaking, there are two
-/// main types of search: searches that can produce matches spanning multiple
-/// lines and searches that must be limited to producing matches spanning at
-/// most one line.
-///
-/// # Design rationale
-///
-/// The line terminator preference has a dual purpose.
-///
-/// The first purpose is to satisfy the need of an end user. Namely, an end
-/// user may want to see matches only limited to a single line. This can be
-/// important to express as an explicit preference in order to prevent common
-/// patterns such as `\s` from matching line terminators.
-///
-/// The second purpose is for performance. When a matcher knows that it only
-/// needs to find matches limited to a single line, then it can perform
-/// additional optimizations that would otherwise be impossible or hard to do.
-/// This is the purpose of the `NeverInMatch` variant for this type, which
-/// indicates that a line terminator will never appear in a match. This
-/// guarantee allows users of a matcher to avoid parsing out each individual
-/// line.
-#[derive(Clone, Copy, Debug)]
-pub enum LineTerminator {
-    /// No line terminator was requested. This indicates that the matcher may
-    /// produce matches that span multiple lines.
-    None,
-    /// The matcher uses the provided line terminator and *guarantees* that
-    /// the line terminator will never appear in any match produced by the
-    /// matcher.
-    NeverInMatch(u8),
-    /// The matcher uses the provided line terminator, but cannot guarantee
-    /// that the line terminator will never appear in a match.
-    Requested(u8),
-}
-*/
-
 /// The type of match for a line oriented matcher.
 #[derive(Clone, Copy, Debug)]
 pub enum LineMatchKind {
@@ -277,6 +237,7 @@ pub enum LineMatchKind {
     Candidate(usize),
 }
 
+/// A matcher defines an interface for regular expression implementations.
 pub trait Matcher {
     /// The concrete type of capturing groups used for this matcher.
     ///

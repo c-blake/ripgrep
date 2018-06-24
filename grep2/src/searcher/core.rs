@@ -7,7 +7,10 @@ use lines::{self, LineStep};
 use line_buffer::BinaryDetection;
 use matcher::{LineMatchKind, Matcher};
 use searcher::{Config, Range, Searcher};
-use sink::{Sink, SinkFinish, SinkContext, SinkContextKind, SinkMatch};
+use sink::{
+    Sink, SinkError,
+    SinkFinish, SinkContext, SinkContextKind, SinkMatch,
+};
 
 #[derive(Debug)]
 pub struct Core<'s, M: 's, S> {
@@ -210,7 +213,7 @@ where M: Matcher,
                     self.config.line_term,
                 );
                 match self.matcher.shortest_match(slice) {
-                    Err(err) => return Err(S::error_message(err)),
+                    Err(err) => return Err(S::Error::error_message(err)),
                     Ok(result) => result.is_some(),
                 }
             };
@@ -309,7 +312,7 @@ where M: Matcher,
         let mut pos = self.pos();
         while !buf[pos..].is_empty() {
             match self.matcher.find_candidate_line(&buf[pos..]) {
-                Err(err) => return Err(S::error_message(err)),
+                Err(err) => return Err(S::Error::error_message(err)),
                 Ok(None) => return Ok(None),
                 Ok(Some(LineMatchKind::Confirmed(i))) => {
                     let line = lines::locate(
@@ -341,7 +344,7 @@ where M: Matcher,
                         self.config.line_term,
                     );
                     match self.matcher.is_match(slice) {
-                        Err(err) => return Err(S::error_message(err)),
+                        Err(err) => return Err(S::Error::error_message(err)),
                         Ok(true) => return Ok(Some(line)),
                         Ok(false) => {
                             pos = line.end();
@@ -398,6 +401,7 @@ where M: Matcher,
         let keepgoing = self.sink.context(
             &self.searcher,
             &SinkContext {
+                line_term: self.config.line_term,
                 bytes: &buf[*range],
                 kind: SinkContextKind::Before,
                 absolute_byte_offset: offset,
@@ -427,6 +431,7 @@ where M: Matcher,
         let keepgoing = self.sink.context(
             &self.searcher,
             &SinkContext {
+                line_term: self.config.line_term,
                 bytes: &buf[*range],
                 kind: SinkContextKind::After,
                 absolute_byte_offset: offset,

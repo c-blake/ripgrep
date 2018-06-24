@@ -1,4 +1,8 @@
-#![allow(dead_code)]
+/*!
+grep, as a library.
+*/
+
+#![deny(missing_docs)]
 
 extern crate bytecount;
 extern crate memchr;
@@ -13,7 +17,11 @@ pub use searcher::{
     BinaryDetection, ConfigError, MmapChoice,
     Searcher, SearcherBuilder,
 };
-pub use sink::{Sink, SinkContext, SinkContextKind, SinkFinish, SinkMatch};
+pub use sink::{
+    Sink, SinkError,
+    SinkContext, SinkContextKind, SinkFinish, SinkMatch,
+};
+pub use sink::sinks;
 
 mod interpolate;
 mod line_buffer;

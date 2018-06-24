@@ -5,7 +5,7 @@ use std::io;
 use lines::{self, LineStep};
 use line_buffer::{DEFAULT_BUFFER_CAPACITY, LineBufferReader};
 use matcher::Matcher;
-use sink::Sink;
+use sink::{Sink, SinkError};
 
 use searcher::{Config, Range, Searcher};
 use searcher::core::Core;
@@ -54,7 +54,7 @@ where M: Matcher,
         let consumed = self.core.roll(self.rdr.buffer());
         self.rdr.consume(consumed);
         let didread = match self.rdr.fill() {
-            Err(err) => return Err(S::error_io(err)),
+            Err(err) => return Err(S::Error::error_io(err)),
             Ok(didread) => didread,
         };
         if !didread || self.rdr.binary_byte_offset().is_some() {
@@ -274,7 +274,7 @@ where M: Matcher,
 
     fn find(&mut self) -> Result<Option<Range>, S::Error> {
         match self.matcher.find(&self.slice[self.core.pos()..]) {
-            Err(err) => Err(S::error_message(err)),
+            Err(err) => Err(S::Error::error_message(err)),
             Ok(None) => Ok(None),
             Ok(Some(m)) => Ok(Some(m.offset(self.core.pos()))),
         }
@@ -1399,5 +1399,31 @@ byte count:307
             .line_number(false)
             .expected_no_line_number(exp)
             .test();
+    }
+
+    #[test]
+    fn scratch() {
+        use sinks;
+        use testutil::RegexMatcher;
+
+        const SHERLOCK: &'static [u8] = b"\
+For the Doctor Wat\xFFsons of this world, as opposed to the Sherlock
+Holmeses, success in the province of detective work must always
+be, to a very large extent, the result of luck. Sherlock Holmes
+can extract a clew from a wisp of straw or a flake of cigar ash;
+but Doctor Watson has to have it taken out for him and dusted,
+and exhibited clearly, with a label attached.\
+    ";
+
+        let haystack = SHERLOCK;
+        let matcher = RegexMatcher::new("Sherlock");
+        let mut searcher = SearcherBuilder::new()
+            .line_number(true)
+            .build(&matcher)
+            .unwrap();
+        searcher.search_reader(haystack, sinks::Lossy(|n, line| {
+            print!("{}:{}", n, line);
+            Ok(true)
+        })).unwrap();
     }
 }

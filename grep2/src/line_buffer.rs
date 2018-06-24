@@ -220,18 +220,6 @@ impl<'b, R: io::Read> LineBufferReader<'b, R> {
         LineBufferReader { rdr, line_buffer }
     }
 
-    /// Like `new`, but sets the binary detection behavior of the line buffer
-    /// to the behavior specified.
-    pub fn with_binary_detection(
-        rdr: R,
-        line_buffer: &'b mut LineBuffer,
-        detection: BinaryDetection,
-    ) -> LineBufferReader<'b, R> {
-        line_buffer.clear();
-        line_buffer.binary_detection(detection);
-        LineBufferReader { rdr, line_buffer }
-    }
-
     /// The absolute byte offset which corresponds to the starting offsets
     /// of the data returned by `buffer` relative to the beginning of the
     /// underlying reader's contents. As such, this offset does not generally
@@ -280,7 +268,8 @@ impl<'b, R: io::Read> LineBufferReader<'b, R> {
     /// guaranteed to return an empty slice until the buffer is refilled.
     ///
     /// This is a convenience function for `consume(buffer.len())`.
-    pub fn consume_all(&mut self) {
+    #[cfg(test)]
+    fn consume_all(&mut self) {
         self.line_buffer.consume_all();
     }
 }
@@ -349,17 +338,6 @@ impl LineBuffer {
         self.binary_byte_offset
     }
 
-    /// Set the binary detection behavior of this input buffer. The behavior
-    /// of this input buffer is not specified if this is called after `fill`
-    /// and before `clear`.
-    fn binary_detection(
-        &mut self,
-        detection: BinaryDetection,
-    ) -> &mut LineBuffer {
-        self.config.binary = detection;
-        self
-    }
-
     /// Return the contents of this buffer.
     fn buffer(&self) -> &[u8] {
         &self.buf[self.pos..self.last_lineterm]
@@ -383,6 +361,7 @@ impl LineBuffer {
     /// guaranteed to return an empty slice until the buffer is refilled.
     ///
     /// This is a convenience function for `consume(buffer.len())`.
+    #[cfg(test)]
     fn consume_all(&mut self) {
         let amt = self.buffer().len();
         self.consume(amt);

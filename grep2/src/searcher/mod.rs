@@ -10,14 +10,14 @@ use line_buffer::{
 };
 use matcher::{Match, Matcher};
 use searcher::glue::{ReadByLine, SliceByLine, MultiLine};
-use sink::Sink;
+use sink::{Sink, SinkError};
 
 mod core;
 mod glue;
 
 /// We use this type alias since we want the ergonomics of a matcher's `Match`
-/// type, but in practice, we use it for arbitrary ranges. This is only used
-/// in the searcher's internals.
+/// type, but in practice, we use it for arbitrary ranges, so give it a more
+/// accurate name. This is only used in the searcher's internals.
 type Range = Match;
 
 /// The behavior of binary detection while searching.
@@ -41,10 +41,10 @@ type Range = Match;
 ///    parts corresponding to a match. When `Quit` is enabled, then the first
 ///    few KB of the data are searched for binary data.
 #[derive(Clone, Debug, Default)]
-pub struct BinaryDetection(pub(crate) line_buffer::BinaryDetection);
+pub struct BinaryDetection(line_buffer::BinaryDetection);
 
 impl BinaryDetection {
-    /// No binary detection is performed. Data reported by the line buffer may
+    /// No binary detection is performed. Data reported by the searcher may
     /// contain arbitrary bytes.
     ///
     /// This is the default.
@@ -52,17 +52,39 @@ impl BinaryDetection {
         BinaryDetection(line_buffer::BinaryDetection::None)
     }
 
-    /// The given byte is searched in all contents read by the line buffer. If
-    /// it occurs, then the data is considered binary and the line buffer acts
-    /// as if it reached EOF. The line buffer guarantees that this byte will
-    /// never be observable by callers.
+    /// Binary detection is performed by looking for the given byte.
+    ///
+    /// When searching is performed using a fixed size buffer, then the
+    /// contents of that buffer are always searched for the presence of this
+    /// byte. If it is found, then the underlying data is considered binary
+    /// and the search stops as if it reached EOF.
+    ///
+    /// When searching is performed with the entire contents mapped into
+    /// memory, then binary detection is more conservative. Namely, only a
+    /// fixed sized region at the beginning of the contents are detected for
+    /// binary data. As a compromise, any subsequent matching (or context)
+    /// lines are also searched for binary data. If binary data is detected at
+    /// any point, then the search stops as if it reached EOF.
     pub fn quit(binary_byte: u8) -> BinaryDetection {
         BinaryDetection(line_buffer::BinaryDetection::Quit(binary_byte))
     }
 
+    // TODO(burntsushi): Figure out how to make binary conversion work. This
+    // permits implementing GNU grep's default behavior, which is to zap NUL
+    // bytes but still execute a search (if a match is detected, then GNU grep
+    // stops and reports that a match was found but doesn't print the matching
+    // line itself).
+    //
+    // This behavior is pretty simple to implement using the line buffer (and
+    // in fact, it is already implemented and tested), since there's a fixed
+    // size buffer that we can easily write to. The issue arises when searching
+    // a `&[u8]` (whether on the heap or via a memory map), since this isn't
+    // something we can easily write to.
+
     /// The given byte is searched in all contents read by the line buffer. If
     /// it occurs, then it is replaced by the line terminator. The line buffer
     /// guarantees that this byte will never be observable by callers.
+    #[allow(dead_code)]
     fn convert(binary_byte: u8) -> BinaryDetection {
         BinaryDetection(line_buffer::BinaryDetection::Convert(binary_byte))
     }
@@ -92,7 +114,7 @@ impl MmapChoice {
     ///
     /// The heuristics used to determine whether to use a memory map or not
     /// may depend on many things, including but not limited to, file size
-    /// and operating system.
+    /// and platform.
     ///
     /// If memory maps are unavailable or cannot be used for a specific input,
     /// then normal OS read calls are used instead.
@@ -239,9 +261,17 @@ impl fmt::Display for ConfigError {
     }
 }
 
+/// A builder for configuring a searcher.
+///
+/// A search builder permits specifying the configuration of a searcher,
+/// including options like whether to invert the search or to enable multi
+/// line search.
+///
+/// Once a searcher has been built, it is beneficial to reuse that searcher
+/// for multiple searches, if possible.
 #[derive(Clone, Debug)]
 pub struct SearcherBuilder {
-    pub(crate) config: Config,
+    config: Config,
 }
 
 impl Default for SearcherBuilder {
@@ -251,12 +281,20 @@ impl Default for SearcherBuilder {
 }
 
 impl SearcherBuilder {
+    /// Create a new searcher builder with a default configuration.
     pub fn new() -> SearcherBuilder {
         SearcherBuilder {
             config: Config::default(),
         }
     }
 
+    /// Builder a searcher with the given matcher.
+    ///
+    /// Building a searcher can fail if the configuration specified is invalid.
+    /// For example, if the heap limit is set to `0` and memory maps are
+    /// disabled, then most searches will fail. Another example is if the given
+    /// matcher has a line terminator set that is inconsistent with the line
+    /// terminator set in this builder.
     pub fn build<M>(&self, matcher: M) -> Result<Searcher<M>, ConfigError>
     where M: Matcher,
           M::Error: fmt::Display
@@ -281,16 +319,62 @@ impl SearcherBuilder {
         })
     }
 
+    /// Set the line terminator that is used by the searcher.
+    ///
+    /// When building a searcher, if the matcher provided has a line terminator
+    /// set, then it must be the same as this one. If they aren't, building
+    /// a searcher will return an error.
+    ///
+    /// By default, this is set to `b'\n'`.
     pub fn line_terminator(&mut self, line_term: u8) -> &mut SearcherBuilder {
         self.config.line_term = line_term;
         self
     }
 
+    /// Whether to invert matching, whereby lines that don't match are reported
+    /// instead of reporting lines that do match.
+    ///
+    /// By default, this is disabled.
     pub fn invert_match(&mut self, yes: bool) -> &mut SearcherBuilder {
         self.config.invert_match = yes;
         self
     }
 
+    /// Whether to count and include line numbers with matching lines.
+    ///
+    /// This is disabled by default. In particular, counting line numbers has
+    /// a small performance cost, so it's best not to do it unless they are
+    /// needed.
+    pub fn line_number(&mut self, yes: bool) -> &mut SearcherBuilder {
+        self.config.line_number = yes;
+        self
+    }
+
+    /// Whether to enable multi line search or not.
+    ///
+    /// When multi line search is enabled, matches *may* match across multiple
+    /// lines. Conversely, when multi line search is disabled, it is impossible
+    /// for any match to span more than one line.
+    ///
+    /// **Warning:** multi line search requires having the entire contents to
+    /// search mapped in memory at once. When searching files, memory maps
+    /// will be used if possible, which avoids using your program's heap.
+    /// However, if memory maps cannot be used (e.g., for searching streams
+    /// like `stdin`), then the entire contents of the stream are read on to
+    /// the heap before starting the search.
+    ///
+    /// This is disabled by default.
+    pub fn multi_line(&mut self, yes: bool) -> &mut SearcherBuilder {
+        self.config.multi_line = yes;
+        self
+    }
+
+    /// Whether to include a fixed number of lines after every match.
+    ///
+    /// When this is set to a non-zero number, then the searcher will report
+    /// `line_count` contextual lines after every match.
+    ///
+    /// This is set to `0` by default.
     pub fn after_context(
         &mut self,
         line_count: usize,
@@ -299,6 +383,12 @@ impl SearcherBuilder {
         self
     }
 
+    /// Whether to include a fixed number of lines before every match.
+    ///
+    /// When this is set to a non-zero number, then the searcher will report
+    /// `line_count` contextual lines before every match.
+    ///
+    /// This is set to `0` by default.
     pub fn before_context(
         &mut self,
         line_count: usize,
@@ -307,11 +397,22 @@ impl SearcherBuilder {
         self
     }
 
-    pub fn line_number(&mut self, yes: bool) -> &mut SearcherBuilder {
-        self.config.line_number = yes;
-        self
-    }
-
+    /// Set an approximate limit on the amount of heap space used by a
+    /// searcher.
+    ///
+    /// The heap limit is enforced in two scenarios:
+    ///
+    /// * When searching using a fixed size buffer, the heap limit controls
+    ///   how big this buffer is allowed to be. Assuming contexts are disabled,
+    ///   the minimum size of this buffer is the length (in bytes) of the
+    ///   largest single line in the contents being searched. If any line
+    ///   exceeds the heap limit, then an error will be returned.
+    /// * When performing a multi line search, a fixed size buffer cannot be
+    ///   used. Thus, the only choices are to read the entire contents on to
+    ///   the heap, or use memory maps. In the former case, the heap limit set
+    ///   here is enforced.
+    ///
+    /// By default, no limit is set.
     pub fn heap_limit(
         &mut self,
         bytes: Option<usize>,
@@ -320,6 +421,22 @@ impl SearcherBuilder {
         self
     }
 
+    /// Set the strategy to employ use of memory maps.
+    ///
+    /// Currently, there are only two strategies that can be employed:
+    ///
+    /// * **Automatic** - A searcher will use heuristics, including but not
+    ///   limited to file size and platform, to determine whether to use memory
+    ///   maps or not.
+    /// * **Never** - Memory maps will never be used. If multi line search is
+    ///   enabled, then the entire contents will be read on to the heap before
+    ///   searching begins.
+    ///
+    /// The default behavior is **automatic**. The only reason to disable
+    /// memory maps explicitly is if there are concerns using them. For
+    /// example, if your process is searching a file backed memory map at the
+    /// same time that file is truncated, then it's possible for the process to
+    /// terminate with a bus error.
     pub fn memory_map(
         &mut self,
         strategy: MmapChoice,
@@ -328,6 +445,14 @@ impl SearcherBuilder {
         self
     }
 
+    /// Set the binary detection strategy.
+    ///
+    /// The binary detection strategy determines not only how the searcher
+    /// detects binary data, but how it responds to the presence of binary
+    /// data. See the [`BinaryDetection`](struct.BinaryDetection.html) type
+    /// for more information.
+    ///
+    /// By default, binary detection is disabled.
     pub fn binary_detection(
         &mut self,
         detection: BinaryDetection,
@@ -335,16 +460,22 @@ impl SearcherBuilder {
         self.config.binary = detection;
         self
     }
-
-    pub fn multi_line(&mut self, yes: bool) -> &mut SearcherBuilder {
-        self.config.multi_line = yes;
-        self
-    }
 }
 
+/// A searcher executes searches over a haystack and writes results to a caller
+/// provided sink. Matches are detected via implementations of the `Matcher`
+/// trait, which is represented by the `M` type parameter.
+///
+/// When possible, a single searcher should be reused.
 #[derive(Debug)]
 pub struct Searcher<M> {
+    /// The configuration for this searcher.
+    ///
+    /// We make most of these settings available to users of `Searcher` via
+    /// public API methods, which can be queried in implementations of `Sink`
+    /// if necessary.
     config: Config,
+    /// The underlying matcher used to find matching lines.
     matcher: M,
     /// A line buffer for use in line oriented searching.
     ///
@@ -358,7 +489,7 @@ pub struct Searcher<M> {
     /// performed incrementally, and need the entire haystack in memory at
     /// once.
     ///
-    /// This is a RefCell for the same reason that line_buffer is a RefCell.
+    /// (This isn't `RefCell` like `line_buffer` because it is never mutated.)
     multi_line_buffer: Vec<u8>,
 }
 
@@ -366,10 +497,16 @@ impl<M> Searcher<M>
 where M: Matcher,
       M::Error: fmt::Display
 {
-    pub fn multi_line(&self) -> bool {
-        self.config.multi_line
-    }
-
+    /// Execute a search over any implementation of `io::Read` and write the
+    /// results to the given sink.
+    ///
+    /// When possible, this implementation will search the reader incrementally
+    /// without reading it into memory. In some cases---for example, if multi
+    /// line search is enabled---an incremental search isn't possible and the
+    /// given reader is consumed completely and placed on the heap before
+    /// searching begins. For this reason, when multi line search is enabled,
+    /// one should try to use higher level APIs (e.g., searching by file or
+    /// file path) so that memory maps can be used if they are available.
     pub fn search_reader<R: io::Read, S: Sink>(
         &mut self,
         read_from: R,
@@ -377,7 +514,7 @@ where M: Matcher,
     ) -> Result<(), S::Error> {
         if self.config.multi_line {
             self.fill_multi_line_buffer_from_reader::<R, S>(read_from)?;
-            self.search_multi_line(&self.multi_line_buffer, write_to)
+            MultiLine::new(self, &self.multi_line_buffer, write_to).run()
         } else {
             let mut line_buffer = self.line_buffer.borrow_mut();
             let rdr = LineBufferReader::new(read_from, &mut *line_buffer);
@@ -385,29 +522,60 @@ where M: Matcher,
         }
     }
 
+    /// Execute a search over the given slice and write the results to the
+    /// given sink.
     pub fn search_slice<S: Sink>(
         &mut self,
         slice: &[u8],
         write_to: S,
     ) -> Result<(), S::Error> {
         if self.config.multi_line {
-            self.search_multi_line(slice, write_to)
+            MultiLine::new(self, slice, write_to).run()
         } else {
             SliceByLine::new(self, slice, write_to).run()
         }
     }
 
-    fn search_multi_line<S: Sink>(
-        &self,
-        slice: &[u8],
-        write_to: S,
-    ) -> Result<(), S::Error> {
-        MultiLine::new(self, slice, write_to).run()
+    /// Returns the line terminator used by this searcher.
+    pub fn line_terminator(&self) -> u8 {
+        self.config.line_term
+    }
+
+    /// Returns true if and only if this searcher is configured to invert its
+    /// search results. That is, matching lines are lines that do **not** match
+    /// the searcher's matcher.
+    pub fn invert_match(&self) -> bool {
+        self.config.invert_match
+    }
+
+    /// Returns true if and only if this searcher is configured to count line
+    /// numbers.
+    pub fn line_number(&self) -> bool {
+        self.config.line_number
+    }
+
+    /// Returns true if and only if this searcher is configured to perform
+    /// multi line search.
+    pub fn multi_line(&self) -> bool {
+        self.config.multi_line
+    }
+
+    /// Returns the number of "after" context lines to report. When context
+    /// reporting is not enabled, this returns `0`.
+    pub fn after_context(&self) -> usize {
+        self.config.after_context
+    }
+
+    /// Returns the number of "before" context lines to report. When context
+    /// reporting is not enabled, this returns `0`.
+    pub fn before_context(&self) -> usize {
+        self.config.before_context
     }
 
     /// Fill the buffer for use with multi-line searching from the given file.
     /// This reads from the file until EOF or until an error occurs. If the
     /// contents exceed the configured heap limit, then an error is returned.
+    #[allow(dead_code)]
     fn fill_multi_line_buffer_from_file<S: Sink>(
         &mut self,
         mut read_from: &File,
@@ -426,7 +594,7 @@ where M: Matcher,
                 .map(|m| m.len() as usize + 1)
                 .unwrap_or(0);
             buf.reserve(cap);
-            read_from.read_to_end(buf).map_err(S::error_io)?;
+            read_from.read_to_end(buf).map_err(S::Error::error_io)?;
         }
         self.fill_multi_line_buffer_from_reader::<&File, S>(read_from)
     }
@@ -449,12 +617,12 @@ where M: Matcher,
         let heap_limit = match self.config.heap_limit {
             Some(heap_limit) => heap_limit,
             None => {
-                read_from.read_to_end(buf).map_err(S::error_io)?;
+                read_from.read_to_end(buf).map_err(S::Error::error_io)?;
                 return Ok(());
             }
         };
         if heap_limit == 0 {
-            return Err(S::error_io(alloc_error(heap_limit)));
+            return Err(S::Error::error_io(alloc_error(heap_limit)));
         }
 
         // ... otherwise we need to roll our own. This is likely quite a bit
@@ -468,7 +636,7 @@ where M: Matcher,
                 Err(ref err) if err.kind() == io::ErrorKind::Interrupted => {
                     continue;
                 }
-                Err(err) => return Err(S::error_io(err)),
+                Err(err) => return Err(S::Error::error_io(err)),
             };
             if nread == 0 {
                 buf.resize(pos, 0);
@@ -479,7 +647,7 @@ where M: Matcher,
             if buf[pos..].is_empty() {
                 let additional = heap_limit - buf.len();
                 if additional == 0 {
-                    return Err(S::error_io(alloc_error(heap_limit)));
+                    return Err(S::Error::error_io(alloc_error(heap_limit)));
                 }
                 let limit = buf.len() + additional;
                 let doubled = 2 * buf.len();
