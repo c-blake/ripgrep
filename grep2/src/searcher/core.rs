@@ -1,4 +1,3 @@
-use std::cell::{Cell, RefCell};
 use std::cmp;
 use std::fmt;
 
@@ -15,16 +14,16 @@ pub struct Core<'s, M: 's, S> {
     config: &'s Config,
     matcher: &'s M,
     searcher: &'s Searcher<M>,
-    sink: RefCell<S>,
+    sink: S,
     binary: bool,
-    pos: Cell<usize>,
-    absolute_byte_offset: Cell<u64>,
-    binary_byte_offset: Cell<Option<usize>>,
-    line_number: Option<Cell<u64>>,
-    last_line_counted: Cell<usize>,
-    last_line_visited: Cell<usize>,
-    after_context_left: Cell<usize>,
-    has_sunk: Cell<bool>,
+    pos: usize,
+    absolute_byte_offset: u64,
+    binary_byte_offset: Option<usize>,
+    line_number: Option<u64>,
+    last_line_counted: usize,
+    last_line_visited: usize,
+    after_context_left: usize,
+    has_sunk: bool,
 }
 
 impl<'s, M, S> Core<'s, M, S>
@@ -39,7 +38,7 @@ where M: Matcher,
     ) -> Core<'s, M, S> {
         let line_number =
             if searcher.config.line_number {
-                Some(Cell::new(1))
+                Some(1)
             } else {
                 None
             };
@@ -47,33 +46,33 @@ where M: Matcher,
             config: &searcher.config,
             matcher: &searcher.matcher,
             searcher: searcher,
-            sink: RefCell::new(sink),
+            sink: sink,
             binary: binary,
-            pos: Cell::new(0),
-            absolute_byte_offset: Cell::new(0),
-            binary_byte_offset: Cell::new(None),
+            pos: 0,
+            absolute_byte_offset: 0,
+            binary_byte_offset: None,
             line_number: line_number,
-            last_line_counted: Cell::new(0),
-            last_line_visited: Cell::new(0),
-            after_context_left: Cell::new(0),
-            has_sunk: Cell::new(false),
+            last_line_counted: 0,
+            last_line_visited: 0,
+            after_context_left: 0,
+            has_sunk: false,
         }
     }
 
     pub fn pos(&self) -> usize {
-        self.pos.get()
+        self.pos
     }
 
-    pub fn set_pos(&self, pos: usize) {
-        self.pos.set(pos);
+    pub fn set_pos(&mut self, pos: usize) {
+        self.pos = pos;
     }
 
     pub fn binary_byte_offset(&self) -> Option<u64> {
-        self.binary_byte_offset.get().map(|offset| offset as u64)
+        self.binary_byte_offset.map(|offset| offset as u64)
     }
 
     pub fn matched(
-        &self,
+        &mut self,
         buf: &[u8],
         range: &Range,
     ) -> Result<bool, S::Error> {
@@ -81,11 +80,11 @@ where M: Matcher,
     }
 
     pub fn finish(
-        &self,
+        &mut self,
         byte_count: u64,
         binary_byte_offset: Option<u64>,
     ) -> Result<(), S::Error> {
-        self.sink.borrow_mut().finish(
+        self.sink.finish(
             &self.searcher,
             &SinkFinish {
                 byte_count,
@@ -93,7 +92,7 @@ where M: Matcher,
             })
     }
 
-    pub fn match_by_line(&self, buf: &[u8]) -> Result<bool, S::Error> {
+    pub fn match_by_line(&mut self, buf: &[u8]) -> Result<bool, S::Error> {
         if self.is_line_by_line_fast() {
             self.match_by_line_fast(buf)
         } else {
@@ -101,7 +100,7 @@ where M: Matcher,
         }
     }
 
-    pub fn roll(&self, absolute_byte_offset: u64, buf: &[u8]) -> usize {
+    pub fn roll(&mut self, buf: &[u8]) -> usize {
         let consumed =
             if self.config.max_context() == 0 {
                 buf.len()
@@ -116,22 +115,19 @@ where M: Matcher,
                     self.config.line_term,
                     self.config.max_context(),
                 );
-                let consumed = cmp::max(
-                    context_start,
-                    self.last_line_visited.get(),
-                );
+                let consumed = cmp::max(context_start, self.last_line_visited);
                 consumed
             };
         self.count_lines(buf, consumed);
-        self.absolute_byte_offset.set(absolute_byte_offset + consumed as u64);
-        self.last_line_counted.set(0);
-        self.last_line_visited.set(0);
+        self.absolute_byte_offset += consumed as u64;
+        self.last_line_counted = 0;
+        self.last_line_visited = 0;
         self.set_pos(buf.len() - consumed);
         consumed
     }
 
-    pub fn detect_binary(&self, buf: &[u8], range: &Range) -> bool {
-        if self.binary_byte_offset.get().is_some() {
+    pub fn detect_binary(&mut self, buf: &[u8], range: &Range) -> bool {
+        if self.binary_byte_offset.is_some() {
             return true;
         }
         let binary_byte = match self.config.binary.0 {
@@ -139,8 +135,7 @@ where M: Matcher,
             _ => return false,
         };
         if let Some(i) = memchr(binary_byte, &buf[*range]) {
-            let offset = Some(range.start() + i);
-            self.binary_byte_offset.set(offset);
+            self.binary_byte_offset = Some(range.start() + i);
             true
         } else {
             false
@@ -148,14 +143,14 @@ where M: Matcher,
     }
 
     pub fn before_context_by_line(
-        &self,
+        &mut self,
         buf: &[u8],
         upto: usize,
     ) -> Result<bool, S::Error> {
         if self.config.before_context == 0 {
             return Ok(true);
         }
-        let range = Range::new(self.last_line_visited.get(), upto);
+        let range = Range::new(self.last_line_visited, upto);
         if range.is_empty() {
             return Ok(true);
         }
@@ -179,27 +174,27 @@ where M: Matcher,
     }
 
     pub fn after_context_by_line(
-        &self,
+        &mut self,
         buf: &[u8],
         upto: usize,
     ) -> Result<bool, S::Error> {
-        if self.after_context_left.get() == 0 {
+        if self.after_context_left == 0 {
             return Ok(true);
         }
-        let range = Range::new(self.last_line_visited.get(), upto);
+        let range = Range::new(self.last_line_visited, upto);
         let mut stepper = LineStep::new(self.config.line_term, range);
         while let Some(line) = stepper.next(buf) {
             if !self.sink_after_context(buf, &line)? {
                 return Ok(false);
             }
-            if self.after_context_left.get() == 0 {
+            if self.after_context_left == 0 {
                 break;
             }
         }
         Ok(true)
     }
 
-    fn match_by_line_slow(&self, buf: &[u8]) -> Result<bool, S::Error> {
+    fn match_by_line_slow(&mut self, buf: &[u8]) -> Result<bool, S::Error> {
         assert!(!self.config.multi_line);
 
         let range = Range::new(self.pos(), buf.len());
@@ -227,7 +222,7 @@ where M: Matcher,
                 if !self.sink_matched(buf, &line)? {
                     return Ok(false);
                 }
-            } else if self.after_context_left.get() >= 1 {
+            } else if self.after_context_left >= 1 {
                 if !self.sink_after_context(buf, &line)? {
                     return Ok(false);
                 }
@@ -236,7 +231,7 @@ where M: Matcher,
         Ok(true)
     }
 
-    fn match_by_line_fast(&self, buf: &[u8]) -> Result<bool, S::Error> {
+    fn match_by_line_fast(&mut self, buf: &[u8]) -> Result<bool, S::Error> {
         while !buf[self.pos()..].is_empty() {
             if self.config.invert_match {
                 if !self.match_by_line_fast_invert(buf)? {
@@ -264,7 +259,10 @@ where M: Matcher,
         Ok(true)
     }
 
-    fn match_by_line_fast_invert(&self, buf: &[u8]) -> Result<bool, S::Error> {
+    fn match_by_line_fast_invert(
+        &mut self,
+        buf: &[u8],
+    ) -> Result<bool, S::Error> {
         assert!(self.config.invert_match);
 
         let invert_match = match self.find_by_line_fast(buf)? {
@@ -308,7 +306,7 @@ where M: Matcher,
             "requires a matcher's line terminator to match config",
         );
 
-        let mut pos = self.pos.get();
+        let mut pos = self.pos();
         while !buf[pos..].is_empty() {
             match self.matcher.find_candidate_line(&buf[pos..]) {
                 Err(err) => return Err(S::error_message(err)),
@@ -357,7 +355,7 @@ where M: Matcher,
     }
 
     fn sink_matched(
-        &self,
+        &mut self,
         buf: &[u8],
         range: &Range,
     ) -> Result<bool, S::Error> {
@@ -368,27 +366,27 @@ where M: Matcher,
             return Ok(false);
         }
         self.count_lines(buf, range.start());
-        let offset = self.absolute_byte_offset.get() + range.start() as u64;
-        let keepgoing = self.sink.borrow_mut().matched(
+        let offset = self.absolute_byte_offset + range.start() as u64;
+        let keepgoing = self.sink.matched(
             &self.searcher,
             &SinkMatch {
                 line_term: self.config.line_term,
                 bytes: &buf[*range],
                 absolute_byte_offset: offset,
-                line_number: self.line_number(),
+                line_number: self.line_number,
             },
         )?;
         if !keepgoing {
             return Ok(false);
         }
-        self.last_line_visited.set(range.end());
-        self.after_context_left.set(self.config.after_context);
-        self.has_sunk.set(true);
+        self.last_line_visited = range.end();
+        self.after_context_left = self.config.after_context;
+        self.has_sunk = true;
         Ok(true)
     }
 
     fn sink_before_context(
-        &self,
+        &mut self,
         buf: &[u8],
         range: &Range,
     ) -> Result<bool, S::Error> {
@@ -396,85 +394,80 @@ where M: Matcher,
             return Ok(false);
         }
         self.count_lines(buf, range.start());
-        let offset = self.absolute_byte_offset.get() + range.start() as u64;
-        let keepgoing = self.sink.borrow_mut().context(
+        let offset = self.absolute_byte_offset + range.start() as u64;
+        let keepgoing = self.sink.context(
             &self.searcher,
             &SinkContext {
                 bytes: &buf[*range],
                 kind: SinkContextKind::Before,
                 absolute_byte_offset: offset,
-                line_number: self.line_number(),
+                line_number: self.line_number,
             },
         )?;
         if !keepgoing {
             return Ok(false);
         }
-        self.last_line_visited.set(range.end());
-        self.has_sunk.set(true);
+        self.last_line_visited = range.end();
+        self.has_sunk = true;
         Ok(true)
     }
 
     fn sink_after_context(
-        &self,
+        &mut self,
         buf: &[u8],
         range: &Range,
     ) -> Result<bool, S::Error> {
-        assert!(self.after_context_left.get() >= 1);
+        assert!(self.after_context_left >= 1);
 
         if self.binary && self.detect_binary(buf, range) {
             return Ok(false);
         }
         self.count_lines(buf, range.start());
-        let offset = self.absolute_byte_offset.get() + range.start() as u64;
-        let keepgoing = self.sink.borrow_mut().context(
+        let offset = self.absolute_byte_offset + range.start() as u64;
+        let keepgoing = self.sink.context(
             &self.searcher,
             &SinkContext {
                 bytes: &buf[*range],
                 kind: SinkContextKind::After,
                 absolute_byte_offset: offset,
-                line_number: self.line_number(),
+                line_number: self.line_number,
             },
         )?;
         if !keepgoing {
             return Ok(false);
         }
-        self.last_line_visited.set(range.end());
-        self.after_context_left.set(self.after_context_left.get() - 1);
-        self.has_sunk.set(true);
+        self.last_line_visited = range.end();
+        self.after_context_left -= 1;
+        self.has_sunk = true;
         Ok(true)
     }
 
     fn sink_break_context(
-        &self,
+        &mut self,
         start_of_line: usize,
     ) -> Result<bool, S::Error> {
+        let is_gap = self.last_line_visited < start_of_line;
         let any_context =
             self.config.before_context > 0
             || self.config.after_context > 0;
-        let is_gap =
-            self.last_line_visited.get() < start_of_line;
 
-        if !any_context || !self.has_sunk.get() || !is_gap {
+        if !any_context || !self.has_sunk || !is_gap {
             Ok(true)
         } else {
-            self.sink.borrow_mut().context_break(&self.searcher)
+            self.sink.context_break(&self.searcher)
         }
     }
 
-    fn count_lines(&self, buf: &[u8], upto: usize) {
-        if let Some(ref line_number) = self.line_number {
-            if self.last_line_counted.get() >= upto {
+    fn count_lines(&mut self, buf: &[u8], upto: usize) {
+        if let Some(ref mut line_number) = self.line_number {
+            if self.last_line_counted >= upto {
                 return;
             }
-            let slice = &buf[self.last_line_counted.get()..upto];
+            let slice = &buf[self.last_line_counted..upto];
             let count = lines::count(slice, self.config.line_term);
-            line_number.set(line_number.get() + count);
-            self.last_line_counted.set(upto);
+            *line_number += count;
+            self.last_line_counted = upto;
         }
-    }
-
-    fn line_number(&self) -> Option<u64> {
-        self.line_number.as_ref().map(|cell| cell.get())
     }
 
     fn is_line_by_line_fast(&self) -> bool {

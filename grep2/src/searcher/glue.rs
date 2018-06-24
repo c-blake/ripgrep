@@ -51,8 +51,7 @@ where M: Matcher,
         assert!(self.rdr.buffer()[self.core.pos()..].is_empty());
 
         let old_buf_len = self.rdr.buffer().len();
-        let consumed = self.core.roll(
-            self.rdr.absolute_byte_offset(), self.rdr.buffer());
+        let consumed = self.core.roll(self.rdr.buffer());
         self.rdr.consume(consumed);
         let didread = match self.rdr.fill() {
             Err(err) => return Err(S::error_io(err)),
@@ -99,7 +98,7 @@ where M: Matcher,
         }
     }
 
-    pub fn run(self) -> Result<(), S::Error> {
+    pub fn run(mut self) -> Result<(), S::Error> {
         assert!(!self.config.multi_line);
 
         let binary_upto = cmp::min(self.slice.len(), DEFAULT_BUFFER_CAPACITY);
@@ -114,7 +113,7 @@ where M: Matcher,
         self.core.finish(byte_count, binary_byte_offset)
     }
 
-    fn byte_count(&self) -> u64 {
+    fn byte_count(&mut self) -> u64 {
         match self.core.binary_byte_offset() {
             Some(offset) if offset < self.core.pos() as u64 => offset,
             _ => self.core.pos() as u64,
@@ -219,7 +218,7 @@ where M: Matcher,
         }
     }
 
-    fn sink_matched_inverted(&self) -> Result<bool, S::Error> {
+    fn sink_matched_inverted(&mut self) -> Result<bool, S::Error> {
         assert!(self.config.invert_match);
 
         let invert_match = match self.find()? {
@@ -251,7 +250,7 @@ where M: Matcher,
         Ok(true)
     }
 
-    fn sink_matched(&self, range: &Range) -> Result<bool, S::Error> {
+    fn sink_matched(&mut self, range: &Range) -> Result<bool, S::Error> {
         if range.is_empty() {
             // The only way we can produce an empty line for a match is if we
             // match the position immediately following the last byte that we
@@ -263,7 +262,7 @@ where M: Matcher,
         self.core.matched(self.slice, range)
     }
 
-    fn sink_context(&self, range: &Range) -> Result<bool, S::Error> {
+    fn sink_context(&mut self, range: &Range) -> Result<bool, S::Error> {
         if !self.core.after_context_by_line(self.slice, range.start())? {
             return Ok(false);
         }
@@ -273,7 +272,7 @@ where M: Matcher,
         Ok(true)
     }
 
-    fn find(&self) -> Result<Option<Range>, S::Error> {
+    fn find(&mut self) -> Result<Option<Range>, S::Error> {
         match self.matcher.find(&self.slice[self.core.pos()..]) {
             Err(err) => Err(S::error_message(err)),
             Ok(None) => Ok(None),
@@ -285,14 +284,15 @@ where M: Matcher,
     ///
     /// If the previous match is zero width, then this advances the search
     /// position one byte past the end of the match.
-    fn advance(&self, range: &Range) {
+    fn advance(&mut self, range: &Range) {
         self.core.set_pos(range.end());
         if range.is_empty() && self.core.pos() < self.slice.len() {
-            self.core.set_pos(self.core.pos() + 1);
+            let newpos = self.core.pos() + 1;
+            self.core.set_pos(newpos);
         }
     }
 
-    fn byte_count(&self) -> u64 {
+    fn byte_count(&mut self) -> u64 {
         match self.core.binary_byte_offset() {
             Some(offset) if offset < self.core.pos() as u64 => offset,
             _ => self.core.pos() as u64,
