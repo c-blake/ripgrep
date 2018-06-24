@@ -1,7 +1,17 @@
+/*!
+An interface for regular expressions, with a focus on line oriented search.
+*/
+
+#![deny(missing_docs)]
+
+extern crate memchr;
+
 use std::fmt;
 use std::ops;
 
 use interpolate::interpolate;
+
+mod interpolate;
 
 /// The type of a match.
 ///

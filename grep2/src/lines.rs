@@ -4,8 +4,7 @@ A collection of routines for performing operations on lines.
 
 use bytecount;
 use memchr::{memchr, memrchr};
-
-use matcher::Match;
+use grep_matcher::Match;
 
 /// Count the number of occurrences of `line_term` in `bytes`.
 pub fn count(bytes: &[u8], line_term: u8) -> u64 {
@@ -187,7 +186,7 @@ fn preceding_by_pos(
 mod tests {
     use std::ops::Range;
     use std::str;
-    use matcher::Match;
+    use grep_matcher::Match;
     use super::*;
 
     const SHERLOCK: &'static str = "\

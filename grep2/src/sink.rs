@@ -1,8 +1,8 @@
 use std::fmt;
 use std::io;
 
+use grep_matcher::Matcher;
 use lines::LineIter;
-use matcher::Matcher;
 use searcher::{ConfigError, Searcher};
 
 /// A trait that describes errors that can be reported by searchers and
@@ -394,7 +394,7 @@ pub mod sinks {
     use std::io;
     use std::str;
 
-    use matcher::Matcher;
+    use grep_matcher::Matcher;
     use searcher::Searcher;
     use super::{Sink, SinkError, SinkMatch};
 

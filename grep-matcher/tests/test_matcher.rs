@@ -1,4 +1,4 @@
-use grep2::{Captures, Match, Matcher};
+use grep_matcher::{Captures, Match, Matcher};
 use regex::bytes::Regex;
 
 use util::{RegexMatcher, RegexMatcherNoCaps};

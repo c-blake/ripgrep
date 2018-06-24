@@ -11,20 +11,15 @@ repository = "https://github.com/BurntSushi/ripgrep"
 readme = "README.md"
 keywords = ["regex", "grep", "egrep", "search", "pattern"]
 license = "Unlicense/MIT"
-autotests = false
-
-[[test]]
-name = "integration"
-path = "tests/tests.rs"
 
 [dependencies]
 bytecount = "0.3.1"
+grep-matcher = { version = "0.0.1", path = "../grep-matcher" }
 log = "0.4"
 memchr = "2"
 
 [dev-dependencies]
 regex = "1"
-regex-syntax = "0.6"
 
 [features]
 avx-accel = [

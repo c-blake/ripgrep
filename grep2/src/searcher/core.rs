@@ -3,9 +3,9 @@ use std::fmt;
 
 use memchr::memchr;
 
+use grep_matcher::{LineMatchKind, Matcher};
 use lines::{self, LineStep};
 use line_buffer::BinaryDetection;
-use matcher::{LineMatchKind, Matcher};
 use searcher::{Config, Range, Searcher};
 use sink::{
     Sink, SinkError,

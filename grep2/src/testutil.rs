@@ -5,7 +5,7 @@ use std::str;
 use memchr::memchr;
 use regex::bytes::{Regex, RegexBuilder};
 
-use matcher::{LineMatchKind, Match, Matcher, NoCaptures, NoError};
+use grep_matcher::{LineMatchKind, Match, Matcher, NoCaptures, NoError};
 use searcher::{BinaryDetection, Searcher, SearcherBuilder};
 use sink::{Sink, SinkContext, SinkFinish, SinkMatch};
 
@@ -690,7 +690,7 @@ impl TesterConfig {
 
 #[cfg(test)]
 mod tests {
-    use matcher::{Match, Matcher};
+    use grep_matcher::{Match, Matcher};
 
     use super::*;
 

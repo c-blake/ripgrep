@@ -4,11 +4,11 @@ use std::fmt;
 use std::fs::File;
 use std::io::{self, Read};
 
+use grep_matcher::{Match, Matcher};
 use line_buffer::{
     self, BufferAllocation, LineBuffer, LineBufferBuilder, LineBufferReader,
     DEFAULT_BUFFER_CAPACITY, alloc_error,
 };
-use matcher::{Match, Matcher};
 use searcher::glue::{ReadByLine, SliceByLine, MultiLine};
 use sink::{Sink, SinkError};
 

@@ -2,9 +2,9 @@ use std::cmp;
 use std::fmt;
 use std::io;
 
+use grep_matcher::Matcher;
 use lines::{self, LineStep};
 use line_buffer::{DEFAULT_BUFFER_CAPACITY, LineBufferReader};
-use matcher::Matcher;
 use sink::{Sink, SinkError};
 
 use searcher::{Config, Range, Searcher};

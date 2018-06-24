@@ -4,7 +4,7 @@ use std::result;
 
 use regex::bytes::{Locations, Regex};
 
-use grep2::{Captures, Match, Matcher, NoCaptures, NoError};
+use grep_matcher::{Captures, Match, Matcher, NoCaptures, NoError};
 
 #[derive(Debug)]
 pub struct RegexMatcher {
