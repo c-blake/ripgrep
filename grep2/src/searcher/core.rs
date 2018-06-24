@@ -60,6 +60,47 @@ where M: Matcher,
         }
     }
 
+    pub fn pos(&self) -> usize {
+        self.pos.get()
+    }
+
+    pub fn set_pos(&self, pos: usize) {
+        self.pos.set(pos);
+    }
+
+    pub fn binary_byte_offset(&self) -> Option<u64> {
+        self.binary_byte_offset.get().map(|offset| offset as u64)
+    }
+
+    pub fn matched(
+        &self,
+        buf: &[u8],
+        range: &Range,
+    ) -> Result<bool, S::Error> {
+        self.sink_matched(buf, range)
+    }
+
+    pub fn finish(
+        &self,
+        byte_count: u64,
+        binary_byte_offset: Option<u64>,
+    ) -> Result<(), S::Error> {
+        self.sink.borrow_mut().finish(
+            &self.searcher,
+            &SinkFinish {
+                byte_count,
+                binary_byte_offset,
+            })
+    }
+
+    pub fn match_by_line(&self, buf: &[u8]) -> Result<bool, S::Error> {
+        if self.is_line_by_line_fast() {
+            self.match_by_line_fast(buf)
+        } else {
+            self.match_by_line_slow(buf)
+        }
+    }
+
     pub fn roll(&self, absolute_byte_offset: u64, buf: &[u8]) -> usize {
         let consumed =
             if self.config.max_context() == 0 {
@@ -89,51 +130,6 @@ where M: Matcher,
         consumed
     }
 
-    fn config(&self) -> &Config {
-        &self.config
-    }
-
-    pub fn finish(
-        &self,
-        byte_count: u64,
-        binary_byte_offset: Option<u64>,
-    ) -> Result<(), S::Error> {
-        self.sink.borrow_mut().finish(
-            &self.searcher,
-            &SinkFinish {
-                byte_count,
-                binary_byte_offset,
-            })
-    }
-
-    pub fn pos(&self) -> usize {
-        self.pos.get()
-    }
-
-    pub fn set_pos(&self, pos: usize) {
-        self.pos.set(pos);
-    }
-
-    fn line_number(&self) -> Option<u64> {
-        self.line_number.as_ref().map(|cell| cell.get())
-    }
-
-    fn count_lines(&self, buf: &[u8], upto: usize) {
-        if let Some(ref line_number) = self.line_number {
-            if self.last_line_counted.get() >= upto {
-                return;
-            }
-            let slice = &buf[self.last_line_counted.get()..upto];
-            let count = lines::count(slice, self.config.line_term);
-            line_number.set(line_number.get() + count);
-            self.last_line_counted.set(upto);
-        }
-    }
-
-    pub fn binary_byte_offset(&self) -> Option<u64> {
-        self.binary_byte_offset.get().map(|offset| offset as u64)
-    }
-
     pub fn detect_binary(&self, buf: &[u8], range: &Range) -> bool {
         if self.binary_byte_offset.get().is_some() {
             return true;
@@ -151,43 +147,56 @@ where M: Matcher,
         }
     }
 
-    pub fn sink_matched(
+    pub fn before_context_by_line(
         &self,
         buf: &[u8],
-        range: &Range,
+        upto: usize,
     ) -> Result<bool, S::Error> {
-        if self.binary && self.detect_binary(buf, range) {
-            return Ok(false);
+        if self.config.before_context == 0 {
+            return Ok(true);
         }
-        if !self.sink_break_context(range.start())? {
-            return Ok(false);
+        let range = Range::new(self.last_line_visited.get(), upto);
+        if range.is_empty() {
+            return Ok(true);
         }
-        self.count_lines(buf, range.start());
-        let offset = self.absolute_byte_offset.get() + range.start() as u64;
-        let keepgoing = self.sink.borrow_mut().matched(
-            &self.searcher,
-            &SinkMatch {
-                line_term: self.config.line_term,
-                bytes: &buf[*range],
-                absolute_byte_offset: offset,
-                line_number: self.line_number(),
-            },
-        )?;
-        if !keepgoing {
-            return Ok(false);
+        let before_context_start = range.start() + lines::preceding(
+            &buf[range],
+            self.config.line_term,
+            self.config.before_context - 1,
+        );
+
+        let range = Range::new(before_context_start, range.end());
+        let mut stepper = LineStep::new(self.config.line_term, range);
+        while let Some(line) = stepper.next(buf) {
+            if !self.sink_break_context(line.start())? {
+                return Ok(false);
+            }
+            if !self.sink_before_context(buf, &line)? {
+                return Ok(false);
+            }
         }
-        self.last_line_visited.set(range.end());
-        self.after_context_left.set(self.config.after_context);
-        self.has_sunk.set(true);
         Ok(true)
     }
 
-    pub fn match_by_line(&self, buf: &[u8]) -> Result<bool, S::Error> {
-        if self.is_line_by_line_fast() {
-            self.match_by_line_fast(buf)
-        } else {
-            self.match_by_line_slow(buf)
+    pub fn after_context_by_line(
+        &self,
+        buf: &[u8],
+        upto: usize,
+    ) -> Result<bool, S::Error> {
+        if self.after_context_left.get() == 0 {
+            return Ok(true);
         }
+        let range = Range::new(self.last_line_visited.get(), upto);
+        let mut stepper = LineStep::new(self.config.line_term, range);
+        while let Some(line) = stepper.next(buf) {
+            if !self.sink_after_context(buf, &line)? {
+                return Ok(false);
+            }
+            if self.after_context_left.get() == 0 {
+                break;
+            }
+        }
+        Ok(true)
     }
 
     fn match_by_line_slow(&self, buf: &[u8]) -> Result<bool, S::Error> {
@@ -347,23 +356,24 @@ where M: Matcher,
         Ok(None)
     }
 
-    fn sink_after_context(
+    fn sink_matched(
         &self,
         buf: &[u8],
         range: &Range,
     ) -> Result<bool, S::Error> {
-        assert!(self.after_context_left.get() >= 1);
-
         if self.binary && self.detect_binary(buf, range) {
+            return Ok(false);
+        }
+        if !self.sink_break_context(range.start())? {
             return Ok(false);
         }
         self.count_lines(buf, range.start());
         let offset = self.absolute_byte_offset.get() + range.start() as u64;
-        let keepgoing = self.sink.borrow_mut().context(
+        let keepgoing = self.sink.borrow_mut().matched(
             &self.searcher,
-            &SinkContext {
+            &SinkMatch {
+                line_term: self.config.line_term,
                 bytes: &buf[*range],
-                kind: SinkContextKind::After,
                 absolute_byte_offset: offset,
                 line_number: self.line_number(),
             },
@@ -372,29 +382,8 @@ where M: Matcher,
             return Ok(false);
         }
         self.last_line_visited.set(range.end());
-        self.after_context_left.set(self.after_context_left.get() - 1);
+        self.after_context_left.set(self.config.after_context);
         self.has_sunk.set(true);
-        Ok(true)
-    }
-
-    pub fn after_context_by_line(
-        &self,
-        buf: &[u8],
-        upto: usize,
-    ) -> Result<bool, S::Error> {
-        if self.after_context_left.get() == 0 {
-            return Ok(true);
-        }
-        let range = Range::new(self.last_line_visited.get(), upto);
-        let mut stepper = LineStep::new(self.config.line_term, range);
-        while let Some(line) = stepper.next(buf) {
-            if !self.sink_after_context(buf, &line)? {
-                return Ok(false);
-            }
-            if self.after_context_left.get() == 0 {
-                break;
-            }
-        }
         Ok(true)
     }
 
@@ -425,34 +414,33 @@ where M: Matcher,
         Ok(true)
     }
 
-    pub fn before_context_by_line(
+    fn sink_after_context(
         &self,
         buf: &[u8],
-        upto: usize,
+        range: &Range,
     ) -> Result<bool, S::Error> {
-        if self.config.before_context == 0 {
-            return Ok(true);
-        }
-        let range = Range::new(self.last_line_visited.get(), upto);
-        if range.is_empty() {
-            return Ok(true);
-        }
-        let before_context_start = range.start() + lines::preceding(
-            &buf[range],
-            self.config.line_term,
-            self.config.before_context - 1,
-        );
+        assert!(self.after_context_left.get() >= 1);
 
-        let range = Range::new(before_context_start, range.end());
-        let mut stepper = LineStep::new(self.config.line_term, range);
-        while let Some(line) = stepper.next(buf) {
-            if !self.sink_break_context(line.start())? {
-                return Ok(false);
-            }
-            if !self.sink_before_context(buf, &line)? {
-                return Ok(false);
-            }
+        if self.binary && self.detect_binary(buf, range) {
+            return Ok(false);
         }
+        self.count_lines(buf, range.start());
+        let offset = self.absolute_byte_offset.get() + range.start() as u64;
+        let keepgoing = self.sink.borrow_mut().context(
+            &self.searcher,
+            &SinkContext {
+                bytes: &buf[*range],
+                kind: SinkContextKind::After,
+                absolute_byte_offset: offset,
+                line_number: self.line_number(),
+            },
+        )?;
+        if !keepgoing {
+            return Ok(false);
+        }
+        self.last_line_visited.set(range.end());
+        self.after_context_left.set(self.after_context_left.get() - 1);
+        self.has_sunk.set(true);
         Ok(true)
     }
 
@@ -471,6 +459,22 @@ where M: Matcher,
         } else {
             self.sink.borrow_mut().context_break(&self.searcher)
         }
+    }
+
+    fn count_lines(&self, buf: &[u8], upto: usize) {
+        if let Some(ref line_number) = self.line_number {
+            if self.last_line_counted.get() >= upto {
+                return;
+            }
+            let slice = &buf[self.last_line_counted.get()..upto];
+            let count = lines::count(slice, self.config.line_term);
+            line_number.set(line_number.get() + count);
+            self.last_line_counted.set(upto);
+        }
+    }
+
+    fn line_number(&self) -> Option<u64> {
+        self.line_number.as_ref().map(|cell| cell.get())
     }
 
     fn is_line_by_line_fast(&self) -> bool {

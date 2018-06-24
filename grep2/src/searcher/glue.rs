@@ -260,7 +260,7 @@ where M: Matcher,
             // point anyway, so stop the search.
             return Ok(false);
         }
-        self.core.sink_matched(self.slice, range)
+        self.core.matched(self.slice, range)
     }
 
     fn sink_context(&self, range: &Range) -> Result<bool, S::Error> {
