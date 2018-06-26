@@ -272,7 +272,7 @@ pub trait Matcher {
     ///
     /// The significance of the starting point is that it takes the surrounding
     /// context into consideration. For example, the `\A` anchor can only
-    /// match when `start == 0`.
+    /// match when `at == 0`.
     fn find_at(
         &self,
         haystack: &[u8],
@@ -286,34 +286,6 @@ pub trait Matcher {
     /// the `NoCaptures` type and implement this method by calling
     /// `NoCaptures::new()`.
     fn new_captures(&self) -> Result<Self::Captures, Self::Error>;
-
-    /// Populates the first set of capture group matches from `haystack`
-    /// into `matches` after `at`, where the byte offsets in each capturing
-    /// group are relative to the start of `haystack` (and not `at`). If no
-    /// match exists, then `false` is returned and the contents of the given
-    /// capturing groups are unspecified.
-    ///
-    /// The text encoding of `haystack` is not strictly specified. Matchers are
-    /// advised to assume UTF-8, or at worst, some ASCII compatible encoding.
-    ///
-    /// The significance of the starting point is that it takes the surrounding
-    /// context into consideration. For example, the `\A` anchor can only
-    /// match when `start == 0`.
-    ///
-    /// By default, capturing groups aren't supported, and this implementation
-    /// will always behave as if a match were impossible.
-    ///
-    /// Implementors that provide support for capturing groups must guarantee
-    /// that when a match occurs, the first capture match (at index `0`) is
-    /// always set to the overall match offsets.
-    fn captures_at(
-        &self,
-        _haystack: &[u8],
-        _at: usize,
-        _caps: &mut Self::Captures,
-    ) -> Result<bool, Self::Error> {
-        Ok(false)
-    }
 
     /// Returns the total number of capturing groups in this matcher.
     ///
@@ -452,6 +424,38 @@ pub trait Matcher {
         }
     }
 
+    /// Populates the first set of capture group matches from `haystack`
+    /// into `matches` after `at`, where the byte offsets in each capturing
+    /// group are relative to the start of `haystack` (and not `at`). If no
+    /// match exists, then `false` is returned and the contents of the given
+    /// capturing groups are unspecified.
+    ///
+    /// The text encoding of `haystack` is not strictly specified. Matchers are
+    /// advised to assume UTF-8, or at worst, some ASCII compatible encoding.
+    ///
+    /// The significance of the starting point is that it takes the surrounding
+    /// context into consideration. For example, the `\A` anchor can only
+    /// match when `at == 0`.
+    ///
+    /// By default, capturing groups aren't supported, and this implementation
+    /// will always behave as if a match were impossible.
+    ///
+    /// Implementors that provide support for capturing groups must guarantee
+    /// that when a match occurs, the first capture match (at index `0`) is
+    /// always set to the overall match offsets.
+    ///
+    /// Note that if implementors seek to support capturing groups, then they
+    /// should implement this method. Other methods that match based on
+    /// captures will then work automatically.
+    fn captures_at(
+        &self,
+        _haystack: &[u8],
+        _at: usize,
+        _caps: &mut Self::Captures,
+    ) -> Result<bool, Self::Error> {
+        Ok(false)
+    }
+
     /// Replaces every match in the given haystack with the result of calling
     /// `append`. `append` is given the start and end of a match, along with
     /// a handle to the `dst` buffer provided.
@@ -503,7 +507,23 @@ pub trait Matcher {
     ///
     /// By default, this method is implemented by calling `shortest_match`.
     fn is_match(&self, haystack: &[u8]) -> Result<bool, Self::Error> {
-        Ok(self.shortest_match(haystack)?.is_some())
+        self.is_match_at(haystack, 0)
+    }
+
+    /// Returns true if and only if the matcher matches the given haystack
+    /// starting at the given position.
+    ///
+    /// By default, this method is implemented by calling `shortest_match_at`.
+    ///
+    /// The significance of the starting point is that it takes the surrounding
+    /// context into consideration. For example, the `\A` anchor can only
+    /// match when `at == 0`.
+    fn is_match_at(
+        &self,
+        haystack: &[u8],
+        at: usize,
+    ) -> Result<bool, Self::Error> {
+        Ok(self.shortest_match_at(haystack, at)?.is_some())
     }
 
     /// Returns an end location of the first match in `haystack`. If no match
@@ -524,7 +544,33 @@ pub trait Matcher {
         &self,
         haystack: &[u8],
     ) -> Result<Option<usize>, Self::Error> {
-        Ok(self.find(haystack)?.map(|m| m.end))
+        self.shortest_match_at(haystack, 0)
+    }
+
+    /// Returns an end location of the first match in `haystack` starting at
+    /// the given position. If no match exists, then `None` is returned.
+    ///
+    /// Note that the end location reported by this method may be less than the
+    /// same end location reported by `find`. For example, running `find` with
+    /// the pattern `a+` on the haystack `aaa` should report a range of `[0,
+    /// 3)`, but `shortest_match` may report `1` as the ending location since
+    /// that is the place at which a match is guaranteed to occur.
+    ///
+    /// This method should never report false positives or false negatives. The
+    /// point of this method is that some implementors may be able to provide
+    /// a faster implementation of this than what `find` does.
+    ///
+    /// By default, this method is implemented by calling `find_at`.
+    ///
+    /// The significance of the starting point is that it takes the surrounding
+    /// context into consideration. For example, the `\A` anchor can only
+    /// match when `at == 0`.
+    fn shortest_match_at(
+        &self,
+        haystack: &[u8],
+        at: usize,
+    ) -> Result<Option<usize>, Self::Error> {
+        Ok(self.find_at(haystack, at)?.map(|m| m.end))
     }
 
     /// If this matcher was compiled as a line oriented matcher, then this
@@ -682,11 +728,27 @@ impl<'a, M: Matcher> Matcher for &'a M {
         (*self).is_match(haystack)
     }
 
+    fn is_match_at(
+        &self,
+        haystack: &[u8],
+        at: usize
+    ) -> Result<bool, Self::Error> {
+        (*self).is_match_at(haystack, at)
+    }
+
     fn shortest_match(
         &self,
         haystack: &[u8],
     ) -> Result<Option<usize>, Self::Error> {
         (*self).shortest_match(haystack)
+    }
+
+    fn shortest_match_at(
+        &self,
+        haystack: &[u8],
+        at: usize,
+    ) -> Result<Option<usize>, Self::Error> {
+        (*self).shortest_match_at(haystack, at)
     }
 
     fn line_terminator(&self) -> Option<u8> {
@@ -700,120 +762,3 @@ impl<'a, M: Matcher> Matcher for &'a M {
         (*self).find_candidate_line(haystack)
     }
 }
-
-/*
-impl<M: Matcher> Matcher for Arc<M> {
-    type Captures = M::Captures;
-    type Error = M::Error;
-
-    fn find_at(
-        &self,
-        haystack: &[u8],
-        at: usize,
-    ) -> Result<Option<(usize, usize)>, Self::Error> {
-        (**self).find_at(haystack, at)
-    }
-
-    fn new_captures(&self) -> Result<Self::Captures, Self::Error> {
-        (**self).new_captures()
-    }
-
-    fn captures_at(
-        &self,
-        haystack: &[u8],
-        at: usize,
-        caps: &mut Self::Captures,
-    ) -> Result<bool, Self::Error> {
-        (**self).captures_at(haystack, at, caps)
-    }
-
-    fn capture_index(&self, name: &str) -> Option<usize> {
-        (**self).capture_index(name)
-    }
-
-    fn capture_count(&self) -> usize {
-        (**self).capture_count()
-    }
-
-    fn find(
-        &self,
-        haystack: &[u8]
-    ) -> Result<Option<(usize, usize)>, Self::Error> {
-        (**self).find(haystack)
-    }
-
-    fn find_iter<F>(
-        &self,
-        haystack: &[u8],
-        matched: F,
-    ) -> Result<(), Self::Error>
-    where F: FnMut(usize, usize) -> bool
-    {
-        (**self).find_iter(haystack, matched)
-    }
-
-    fn captures(
-        &self,
-        haystack: &[u8],
-        caps: &mut Self::Captures,
-    ) -> Result<bool, Self::Error> {
-        (**self).captures(haystack, caps)
-    }
-
-    fn captures_iter<F>(
-        &self,
-        haystack: &[u8],
-        caps: &mut Self::Captures,
-        matched: F,
-    ) -> Result<(), Self::Error>
-    where F: FnMut(&Self::Captures) -> bool
-    {
-        (**self).captures_iter(haystack, caps, matched)
-    }
-
-    fn replace<F>(
-        &self,
-        haystack: &[u8],
-        dst: &mut Vec<u8>,
-        append: F,
-    ) -> Result<(), Self::Error>
-    where F: FnMut(usize, usize, &mut Vec<u8>) -> bool
-    {
-        (**self).replace(haystack, dst, append)
-    }
-
-    fn replace_with_captures<F>(
-        &self,
-        haystack: &[u8],
-        caps: &mut Self::Captures,
-        dst: &mut Vec<u8>,
-        append: F,
-    ) -> Result<(), Self::Error>
-    where F: FnMut(&Self::Captures, &mut Vec<u8>) -> bool
-    {
-        (**self).replace_with_captures(haystack, caps, dst, append)
-    }
-
-    fn is_match(&self, haystack: &[u8]) -> Result<bool, Self::Error> {
-        (**self).is_match(haystack)
-    }
-
-    fn shortest_match(
-        &self,
-        haystack: &[u8],
-    ) -> Result<Option<usize>, Self::Error> {
-        (**self).shortest_match(haystack)
-    }
-
-    fn line_terminator(&self) -> Option<u8> {
-        (**self).line_terminator()
-    }
-
-    fn find_candidate_line(
-        &self,
-        haystack: &[u8],
-    ) -> Result<Option<LineMatchKind>, Self::Error> {
-        (**self).find_candidate_line(haystack)
-    }
-}
-*/

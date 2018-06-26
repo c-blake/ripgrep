@@ -1,10 +1,8 @@
 use std::collections::HashMap;
-use std::fmt;
 use std::result;
 
-use regex::bytes::{Locations, Regex};
-
 use grep_matcher::{Captures, Match, Matcher, NoCaptures, NoError};
+use regex::bytes::{CaptureLocations, Regex};
 
 #[derive(Debug)]
 pub struct RegexMatcher {
@@ -38,15 +36,13 @@ impl Matcher for RegexMatcher {
         haystack: &[u8],
         at: usize,
     ) -> Result<Option<Match>> {
-        // TODO: This relies on an undocumented part of the regex API.
-        // It is simple enough that we should probably just expose it.
         Ok(self.re
             .find_at(haystack, at)
             .map(|m| Match::new(m.start(), m.end())))
     }
 
     fn new_captures(&self) -> Result<RegexCaptures> {
-        Ok(RegexCaptures(self.re.locations()))
+        Ok(RegexCaptures(self.re.capture_locations()))
     }
 
     fn captures_at(
@@ -55,14 +51,7 @@ impl Matcher for RegexMatcher {
         at: usize,
         caps: &mut RegexCaptures,
     ) -> Result<bool> {
-        // TODO: This relies on an undocumented part of the regex API.
-        // This needs a little thought. The simplest solution is to push
-        // the burden of satisfying the API contract on to the caller, which
-        // is tempting, and potentially justifiable by virtue of it being a low
-        // level API.
-        //
-        // See: https://github.com/rust-lang/regex/issues/219
-        Ok(self.re.read_captures_at(&mut caps.0, haystack, at).is_some())
+        Ok(self.re.captures_read_at(&mut caps.0, haystack, at).is_some())
     }
 
     fn capture_count(&self) -> usize {
@@ -101,7 +90,8 @@ impl Matcher for RegexMatcherNoCaps {
     }
 }
 
-pub struct RegexCaptures(Locations);
+#[derive(Clone, Debug)]
+pub struct RegexCaptures(CaptureLocations);
 
 impl Captures for RegexCaptures {
     fn len(&self) -> usize {
@@ -110,15 +100,5 @@ impl Captures for RegexCaptures {
 
     fn get(&self, i: usize) -> Option<Match> {
         self.0.pos(i).map(|(s, e)| Match::new(s, e))
-    }
-}
-
-impl fmt::Debug for RegexCaptures {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        let mut list = f.debug_list();
-        for x in self.0.iter() {
-            list.entry(&x);
-        }
-        list.finish()
     }
 }

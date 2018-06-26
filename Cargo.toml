@@ -33,7 +33,7 @@ path = "tests/tests.rs"
 
 [workspace]
 members = [
-  "grep", "grep2", "grep-matcher",
+  "grep", "grep2", "grep-matcher", "grep-regex",
   "globset", "ignore", "termcolor", "wincolor",
 ]
 
