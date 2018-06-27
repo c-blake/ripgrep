@@ -10,6 +10,14 @@ use std::cmp;
 use regex_syntax::hir::{self, Hir, HirKind};
 use regex_syntax::hir::literal::{Literal, Literals};
 
+use util;
+
+/// Represents prefix, suffix and inner "required" literals for a regular
+/// expression.
+///
+/// Prefixes and suffixes are detected using regex-syntax. The inner required
+/// literals are detected using something custom (but based on the code in
+/// regex-syntax).
 #[derive(Clone, Debug)]
 pub struct LiteralSets {
     /// A set of prefix literals.
@@ -92,15 +100,15 @@ impl LiteralSets {
             debug!("required literals found: {:?}", req_lits);
             let alts: Vec<String> = req_lits
                 .into_iter()
-                .map(|x| bytes_to_regex(x))
+                .map(|x| util::bytes_to_regex(x))
                 .collect();
             // We're matching raw bytes, so disable Unicode mode.
             Some(format!("(?-u:{})", alts.join("|")))
         } else if lit.is_empty() {
             None
         } else {
-            debug!("required literal found: {:?}", show(lit));
-            Some(format!("(?-u:{})", bytes_to_regex(&lit)))
+            debug!("required literal found: {:?}", util::show_bytes(lit));
+            Some(format!("(?-u:{})", util::bytes_to_regex(&lit)))
         }
     }
 }
@@ -252,27 +260,45 @@ fn count_byte_class(cls: &hir::ClassBytes) -> u32 {
     cls.iter().map(|r| 1 + (r.end() as u32 - r.start() as u32)).sum()
 }
 
-/// Converts an arbitrary sequence of bytes to a literal suitable for building
-/// a regular expression.
-fn bytes_to_regex(bs: &[u8]) -> String {
-    use std::fmt::Write;
+#[cfg(test)]
+mod tests {
+    use regex_syntax::Parser;
+    use super::LiteralSets;
 
-    let mut s = String::with_capacity(bs.len());
-    for &b in bs {
-        write!(s, r"\x{:02x}", b).unwrap();
+    fn sets(pattern: &str) -> LiteralSets {
+        let hir = Parser::new().parse(pattern).unwrap();
+        LiteralSets::new(&hir)
     }
-    s
-}
 
-/// Converts arbitrary bytes to a nice string.
-fn show(bs: &[u8]) -> String {
-    use std::ascii::escape_default;
-    use std::str;
-
-    let mut nice = String::new();
-    for &b in bs {
-        let part: Vec<u8> = escape_default(b).collect();
-        nice.push_str(str::from_utf8(&part).unwrap());
+    fn one_regex(pattern: &str) -> Option<String> {
+        sets(pattern).one_regex()
     }
-    nice
+
+    // Put a pattern into the same format as the one returned by `one_regex`.
+    fn pat(pattern: &str) -> Option<String> {
+        Some(format!("(?-u:{})", pattern))
+    }
+
+    #[test]
+    fn various() {
+        // Obviously no literals.
+        assert!(one_regex(r"\w").is_none());
+        assert!(one_regex(r"\pL").is_none());
+
+        // Tantalizingly close.
+        assert!(one_regex(r"\w|foo").is_none());
+
+        // There's a literal, but it's better if the regex engine handles it
+        // internally.
+        assert!(one_regex(r"abc").is_none());
+
+        // Core use cases.
+        assert_eq!(one_regex(r"\wabc\w"), pat("abc"));
+        assert_eq!(one_regex(r"abc\w"), pat("abc"));
+
+        // TODO: Make these pass. We're missing some potentially big wins
+        // without these.
+        // assert_eq!(one_regex(r"\w(foo|bar|baz)"), pat("foo|bar|baz"));
+        // assert_eq!(one_regex(r"\w(foo|bar|baz)\w"), pat("foo|bar|baz"));
+    }
 }

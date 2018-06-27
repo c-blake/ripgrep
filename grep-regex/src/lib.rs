@@ -13,6 +13,7 @@ use grep_matcher::{Captures, Match, Matcher, NoError};
 use regex::bytes::{CaptureLocations, Regex};
 
 pub use ast::AstAnalysis;
+pub use error::{Error, ErrorKind};
 
 // BREADCRUMBS:
 //
@@ -42,7 +43,9 @@ pub use ast::AstAnalysis;
 //   to introduce...
 
 mod ast;
+mod error;
 mod literal;
+mod util;
 
 type Result<T> = result::Result<T, NoError>;
 
