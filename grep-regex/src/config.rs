@@ -131,9 +131,7 @@ impl ConfiguredHIR {
         mut f: F,
     ) -> Result<ConfiguredHIR, Error>
     {
-        let mut chir = self.pattern_to_hir(&f(&self.expr.to_string()))?;
-        chir.original = self.original.clone();
-        Ok(chir)
+        self.pattern_to_hir(&f(&self.expr.to_string()))
     }
 
     fn pattern_to_regex(&self, pattern: &str) -> Result<Regex, Error> {
