@@ -18,6 +18,10 @@ impl Error {
         Error { kind }
     }
 
+    pub(crate) fn regex<E: error::Error>(err: E) -> Error {
+        Error { kind: ErrorKind::Regex(err.to_string()) }
+    }
+
     /// Return the kind of this error.
     pub fn kind(&self) -> &ErrorKind {
         &self.kind
@@ -72,7 +76,7 @@ impl fmt::Display for Error {
         match self.kind {
             ErrorKind::Regex(ref s) => write!(f, "{}", s),
             ErrorKind::NotAllowed(ref lit) => {
-                write!(f, "the literal '{}' is not allowed in a regex", lit)
+                write!(f, "the literal '{:?}' is not allowed in a regex", lit)
             }
             ErrorKind::InvalidLineTerminator(byte) => {
                 let x = util::show_bytes(&[byte]);

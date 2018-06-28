@@ -26,6 +26,13 @@ impl AstAnalysis {
             .ok()
     }
 
+    /// Perform an AST analysis given the AST.
+    pub fn from_ast(ast: &Ast) -> AstAnalysis {
+        let mut analysis = AstAnalysis::new();
+        analysis.from_ast_impl(ast);
+        analysis
+    }
+
     /// Returns true if and only if a literal uppercase character occurs in
     /// the pattern.
     ///
@@ -65,12 +72,6 @@ impl AstAnalysis {
             any_literal: false,
             all_verbatim_literal: true,
         }
-    }
-
-    fn from_ast(ast: &Ast) -> AstAnalysis {
-        let mut analysis = AstAnalysis::new();
-        analysis.from_ast_impl(ast);
-        analysis
     }
 
     fn from_ast_impl(&mut self, ast: &Ast) {

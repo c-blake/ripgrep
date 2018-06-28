@@ -1,4 +1,4 @@
-#![allow(dead_code)]
+#![allow(dead_code, unused_imports, unused_variables)]
 
 extern crate grep_matcher;
 #[macro_use]
@@ -19,8 +19,6 @@ pub use error::{Error, ErrorKind};
 //
 // Still have a lot of work to do:
 //
-// * Add routines for stripping/erroring if line terminators are in the
-//   pattern. Make sure to leave room for stripping CRLF.
 // * Add RegexMatcherBuilder, which probably needs to re-export most of
 //   RegexBuilder in addition to grep-regex specific options. e.g., Setting
 //   a line terminator.
@@ -43,9 +41,12 @@ pub use error::{Error, ErrorKind};
 //   to introduce...
 
 mod ast;
+mod config;
 mod error;
 mod literal;
+mod strip;
 mod util;
+mod word;
 
 type Result<T> = result::Result<T, NoError>;
 
