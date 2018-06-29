@@ -17,3 +17,4 @@ log = "0.4"
 grep-matcher = { version = "0.0.1", path = "../grep-matcher" }
 regex = { version = "1", path = "/home/andrew/rust/regex" }
 regex-syntax = { version = "0.6", path = "/home/andrew/rust/regex/regex-syntax" }
+thread_local = "0.3.5"

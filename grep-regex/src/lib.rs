@@ -5,6 +5,7 @@ extern crate grep_matcher;
 extern crate log;
 extern crate regex;
 extern crate regex_syntax;
+extern crate thread_local;
 
 use std::collections::HashMap;
 use std::result;
