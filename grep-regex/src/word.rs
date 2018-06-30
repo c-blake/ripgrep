@@ -50,7 +50,7 @@ impl WordMatcher {
         let mut names = HashMap::new();
         for (i, optional_name) in regex.capture_names().enumerate() {
             if let Some(name) = optional_name {
-                names.insert(name.to_string(), i);
+                names.insert(name.to_string(), i.checked_sub(1).unwrap());
             }
         }
         Ok(WordMatcher { regex, names, locs })
@@ -68,6 +68,12 @@ impl Matcher for WordMatcher {
         haystack: &[u8],
         at: usize,
     ) -> MResult<Option<Match>> {
+        // To make this easy to get right, we extract captures here instead of
+        // calling `find_at`. The actual match is at capture group `1` instead
+        // of `0`. We *could* use `find_at` here and then trim the match after
+        // the fact, but that's a bit harder to get right, and it's not clear
+        // if it's worth it.
+
         let cell = self.locs.get_or(|| {
             Box::new(RefCell::new(self.regex.capture_locations()))
         });
@@ -77,30 +83,15 @@ impl Matcher for WordMatcher {
     }
 
     fn new_captures(&self) -> MResult<RegexCaptures> {
-        Ok(RegexCaptures(self.regex.capture_locations()))
+        Ok(RegexCaptures::with_offset(self.regex.capture_locations(), 1))
     }
 
     fn capture_count(&self) -> usize {
-        self.regex.captures_len()
+        self.regex.captures_len().checked_sub(1).unwrap()
     }
 
     fn capture_index(&self, name: &str) -> Option<usize> {
         self.names.get(name).map(|i| *i)
-    }
-
-    fn find_iter<F>(
-        &self,
-        haystack: &[u8],
-        mut matched: F,
-    ) -> MResult<()>
-    where F: FnMut(Match) -> bool
-    {
-        for m in self.regex.find_iter(haystack) {
-            if !matched(Match::new(m.start(), m.end())) {
-                return Ok(());
-            }
-        }
-        Ok(())
     }
 
     fn captures_at(
@@ -109,30 +100,98 @@ impl Matcher for WordMatcher {
         at: usize,
         caps: &mut RegexCaptures,
     ) -> MResult<bool> {
-        Ok(self.regex.captures_read_at(&mut caps.0, haystack, at).is_some())
+        Ok(self.regex.captures_read_at(&mut caps.locs, haystack, at).is_some())
     }
 
-    fn shortest_match_at(
-        &self,
-        haystack: &[u8],
-        at: usize,
-    ) -> MResult<Option<usize>> {
-        Ok(self.regex.shortest_match_at(haystack, at))
-    }
+    // We specifically do not implement other methods like find_iter or
+    // captures_iter. Namely, the iter methods are guaranteed to be correct
+    // by virtue of implementing find_at and captures_at above.
 }
 
 #[cfg(test)]
 mod tests {
-    use grep_matcher::Matcher;
+    use grep_matcher::{Captures, Match, Matcher};
     use config::{Config, ConfiguredHIR};
     use super::WordMatcher;
 
-    #[test]
-    fn scratch() {
-        let chir = Config::default().hir(r"foo").unwrap();
-        let wmatcher = WordMatcher::new(&chir).unwrap();
+    fn matcher(pattern: &str) -> WordMatcher {
+        let chir = Config::default().hir(pattern).unwrap();
+        WordMatcher::new(&chir).unwrap()
+    }
 
-        let r = wmatcher.find(b"a^!foo@#");
-        println!("{:?}", r);
+    fn find(pattern: &str, haystack: &str) -> Option<(usize, usize)> {
+        matcher(pattern)
+            .find(haystack.as_bytes())
+            .unwrap()
+            .map(|m| (m.start(), m.end()))
+    }
+
+    fn find_by_caps(pattern: &str, haystack: &str) -> Option<(usize, usize)> {
+        let m = matcher(pattern);
+        let mut caps = m.new_captures().unwrap();
+        if !m.captures(haystack.as_bytes(), &mut caps).unwrap() {
+            None
+        } else {
+            caps.get(0).map(|m| (m.start(), m.end()))
+        }
+    }
+
+    // Test that the standard `find` API reports offsets correctly.
+    #[test]
+    fn various_find() {
+        assert_eq!(Some((0, 3)), find(r"foo", "foo"));
+        assert_eq!(Some((0, 3)), find(r"foo", "foo("));
+        assert_eq!(Some((1, 4)), find(r"foo", "!foo("));
+        assert_eq!(None, find(r"foo", "!afoo("));
+
+        assert_eq!(Some((0, 3)), find(r"foo", "foo☃"));
+        assert_eq!(None, find(r"foo", "fooб"));
+        // assert_eq!(Some((0, 3)), find(r"foo", "fooб"));
+
+        // See: https://github.com/BurntSushi/ripgrep/issues/389
+        assert_eq!(Some((0, 2)), find(r"-2", "-2"));
+    }
+
+    // Test that the captures API also reports offsets correctly, just as
+    // find does. This exercises a different path in the code since captures
+    // are handled differently.
+    #[test]
+    fn various_captures() {
+        assert_eq!(Some((0, 3)), find_by_caps(r"foo", "foo"));
+        assert_eq!(Some((0, 3)), find_by_caps(r"foo", "foo("));
+        assert_eq!(Some((1, 4)), find_by_caps(r"foo", "!foo("));
+        assert_eq!(None, find_by_caps(r"foo", "!afoo("));
+
+        assert_eq!(Some((0, 3)), find_by_caps(r"foo", "foo☃"));
+        assert_eq!(None, find_by_caps(r"foo", "fooб"));
+        // assert_eq!(Some((0, 3)), find_by_caps(r"foo", "fooб"));
+
+        // See: https://github.com/BurntSushi/ripgrep/issues/389
+        assert_eq!(Some((0, 2)), find_by_caps(r"-2", "-2"));
+    }
+
+    // Test that the capture reporting methods work as advertised.
+    #[test]
+    fn capture_indexing() {
+        let m = matcher(r"(a)(?P<foo>b)(c)");
+        assert_eq!(4, m.capture_count());
+        assert_eq!(Some(2), m.capture_index("foo"));
+
+        let mut caps = m.new_captures().unwrap();
+        assert_eq!(4, caps.len());
+
+        assert!(m.captures(b"abc", &mut caps).unwrap());
+        assert_eq!(caps.get(0), Some(Match::new(0, 3)));
+        assert_eq!(caps.get(1), Some(Match::new(0, 1)));
+        assert_eq!(caps.get(2), Some(Match::new(1, 2)));
+        assert_eq!(caps.get(3), Some(Match::new(2, 3)));
+        assert_eq!(caps.get(4), None);
+
+        assert!(m.captures(b"#abc#", &mut caps).unwrap());
+        assert_eq!(caps.get(0), Some(Match::new(1, 4)));
+        assert_eq!(caps.get(1), Some(Match::new(1, 2)));
+        assert_eq!(caps.get(2), Some(Match::new(2, 3)));
+        assert_eq!(caps.get(3), Some(Match::new(3, 4)));
+        assert_eq!(caps.get(4), None);
     }
 }

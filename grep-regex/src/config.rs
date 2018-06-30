@@ -3,6 +3,7 @@ use regex_syntax::ast::{self, Ast};
 use regex_syntax::hir::Hir;
 
 use ast::AstAnalysis;
+use crlf::crlfify;
 use error::Error;
 use literal::LiteralSets;
 use strip::{LineTerminator, strip_from_match};
@@ -70,7 +71,8 @@ impl Config {
             original: pattern.to_string(),
             config: self.clone(),
             analysis: analysis,
-            expr: expr,
+            // If CRLF mode is enabled, replace `$` with `(?:\r?$)`.
+            expr: if self.crlf { crlfify(expr) } else { expr },
         })
     }
 
@@ -122,6 +124,21 @@ impl ConfiguredHIR {
         };
         match LiteralSets::new(&self.expr).one_regex() {
             None => Ok(None),
+                /*
+                if !self.config.crlf {
+                    return Ok(None);
+                }
+                // If we're trying to support CRLF, then our "fast" line
+                // oriented regex needs `$` to be able to match at a `\r\n`
+                // boundary. The regex engine doesn't support this, so we
+                // "fake" it by replacing `$` with `(?:\r?$)`. Since the
+                // fast line regex is only used to detect lines, this never
+                // infects match offsets. Namely, the regex generated via
+                // `self.expr` is matched against lines with line terminators
+                // stripped.
+                let pattern = crlfify(self.expr.clone()).to_string();
+                self.pattern_to_regex(&pattern).map(Some)
+                */
             Some(pattern) => self.pattern_to_regex(&pattern).map(Some),
         }
     }
