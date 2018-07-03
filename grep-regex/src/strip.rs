@@ -3,7 +3,7 @@ use regex_syntax::hir::{self, Hir, HirKind};
 use error::{Error, ErrorKind};
 
 /// Represents the type of line terminator to strip from a regex.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum LineTerminator {
     /// A special value that will prevent a regex from matching either a `\r`
     /// or a `\n`.

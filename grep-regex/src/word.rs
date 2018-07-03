@@ -3,12 +3,12 @@ use std::cell::RefCell;
 use std::sync::Arc;
 
 use grep_matcher::{Match, Matcher, NoError};
-use regex::bytes::{CaptureLocations, Regex, RegexBuilder};
+use regex::bytes::{CaptureLocations, Regex};
 use thread_local::CachedThreadLocal;
 
 use config::ConfiguredHIR;
 use error::Error;
-use RegexCaptures;
+use matcher::RegexCaptures;
 
 /// A matcher for implementing "word match" semantics.
 #[derive(Debug)]
@@ -57,8 +57,6 @@ impl WordMatcher {
     }
 }
 
-type MResult<T> = Result<T, NoError>;
-
 impl Matcher for WordMatcher {
     type Captures = RegexCaptures;
     type Error = NoError;
@@ -67,7 +65,7 @@ impl Matcher for WordMatcher {
         &self,
         haystack: &[u8],
         at: usize,
-    ) -> MResult<Option<Match>> {
+    ) -> Result<Option<Match>, NoError> {
         // To make this easy to get right, we extract captures here instead of
         // calling `find_at`. The actual match is at capture group `1` instead
         // of `0`. We *could* use `find_at` here and then trim the match after
@@ -82,7 +80,7 @@ impl Matcher for WordMatcher {
         Ok(caps.get(1).map(|m| Match::new(m.0, m.1)))
     }
 
-    fn new_captures(&self) -> MResult<RegexCaptures> {
+    fn new_captures(&self) -> Result<RegexCaptures, NoError> {
         Ok(RegexCaptures::with_offset(self.regex.capture_locations(), 1))
     }
 
@@ -99,8 +97,9 @@ impl Matcher for WordMatcher {
         haystack: &[u8],
         at: usize,
         caps: &mut RegexCaptures,
-    ) -> MResult<bool> {
-        Ok(self.regex.captures_read_at(&mut caps.locs, haystack, at).is_some())
+    ) -> Result<bool, NoError> {
+        let r = self.regex.captures_read_at(caps.locations(), haystack, at);
+        Ok(r.is_some())
     }
 
     // We specifically do not implement other methods like find_iter or

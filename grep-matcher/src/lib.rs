@@ -19,6 +19,25 @@ mod interpolate;
 /// block of addressable memory.
 ///
 /// Every `Match` is guaranteed to satisfy the invariant that `start <= end`.
+///
+/// # Indexing
+///
+/// This type is structurally identical to `std::ops::Range<usize>`, but
+/// is a bit more ergonomic for dealing with match indices. In particular,
+/// this type implements `Copy` and provides methods for building new `Match`
+/// values based on old `Match` values. Finally, the invariant that `start`
+/// is always less than or equal to `end` is enforced.
+///
+/// A `Match` can be used to slice a `&[u8]`, `&mut [u8]` or `&str` using
+/// range notation. e.g.,
+///
+/// ```
+/// use grep_matcher::Match;
+///
+/// let m = Match::new(2, 5);
+/// let bytes = b"abcdefghi";
+/// assert_eq!(b"cde", &bytes[m]);
+/// ```
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct Match {
     start: usize,
@@ -53,13 +72,23 @@ impl Match {
 
     /// Return a new match with the start offset replaced with the given
     /// value.
+    ///
+    /// # Panics
+    ///
+    /// This method panics if `start > self.end`.
     pub fn with_start(&self, start: usize) -> Match {
+        assert!(start <= self.end);
         Match { start, ..*self }
     }
 
     /// Return a new match with the end offset replaced with the given
     /// value.
+    ///
+    /// # Panics
+    ///
+    /// This method panics if `self.start > end`.
     pub fn with_end(&self, end: usize) -> Match {
+        assert!(self.start <= end);
         Match { end, ..*self }
     }
 
@@ -151,6 +180,10 @@ pub trait Captures {
 
     /// Expands all instances of `$name` in `replacement` to the corresponding
     /// capture group `name`, and writes them to the `dst` buffer given.
+    ///
+    /// (Note: If you're looking for a convenient way to perform replacements
+    /// with interpolation, then you'll want to use the `replace_with_captures`
+    /// method on the `Matcher` trait.)
     ///
     /// `name` may be an integer corresponding to the index of the
     /// capture group (counted by order of opening parenthesis where `0` is the
