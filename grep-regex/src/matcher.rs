@@ -249,6 +249,20 @@ impl Matcher for RegexMatcher {
         }
     }
 
+    fn try_find_iter<F, E: From<NoError>>(
+        &self,
+        haystack: &[u8],
+        matched: F,
+    ) -> Result<(), E>
+    where F: FnMut(Match) -> Result<bool, E>
+    {
+        use self::RegexMatcherImpl::*;
+        match self.matcher {
+            Standard(ref m) => m.try_find_iter(haystack, matched),
+            Word(ref m) => m.try_find_iter(haystack, matched),
+        }
+    }
+
     fn captures(
         &self,
         haystack: &[u8],
@@ -273,6 +287,21 @@ impl Matcher for RegexMatcher {
         match self.matcher {
             Standard(ref m) => m.captures_iter(haystack, caps, matched),
             Word(ref m) => m.captures_iter(haystack, caps, matched),
+        }
+    }
+
+    fn try_captures_iter<F, E: From<NoError>>(
+        &self,
+        haystack: &[u8],
+        caps: &mut RegexCaptures,
+        matched: F,
+    ) -> Result<(), E>
+    where F: FnMut(&RegexCaptures) -> Result<bool, E>
+    {
+        use self::RegexMatcherImpl::*;
+        match self.matcher {
+            Standard(ref m) => m.try_captures_iter(haystack, caps, matched),
+            Word(ref m) => m.try_captures_iter(haystack, caps, matched),
         }
     }
 
@@ -383,10 +412,9 @@ impl Matcher for RegexMatcher {
             Some(ref regex) => {
                 regex.shortest_match(haystack).map(LineMatchKind::Candidate)
             }
-            None if self.config.line_terminator.is_some() => {
+            None => {
                 self.shortest_match(haystack)?.map(LineMatchKind::Confirmed)
             }
-            None => panic!("misuse of find_candidate_line; no line term set"),
         })
     }
 }
@@ -440,15 +468,15 @@ impl Matcher for StandardMatcher {
         self.names.get(name).map(|i| *i)
     }
 
-    fn find_iter<F>(
+    fn try_find_iter<F, E: From<NoError>>(
         &self,
         haystack: &[u8],
         mut matched: F,
-    ) -> Result<(), NoError>
-    where F: FnMut(Match) -> bool
+    ) -> Result<(), E>
+    where F: FnMut(Match) -> Result<bool, E>
     {
         for m in self.regex.find_iter(haystack) {
-            if !matched(Match::new(m.start(), m.end())) {
+            if !matched(Match::new(m.start(), m.end()))? {
                 return Ok(());
             }
         }
@@ -529,5 +557,133 @@ impl RegexCaptures {
 
     pub(crate) fn locations(&mut self) -> &mut CaptureLocations {
         &mut self.locs
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use grep_matcher::{LineMatchKind, Matcher};
+    use super::*;
+
+    // Test that enabling word matches does the right thing and demonstrate
+    // the difference between it and surrounding the regex in `\b`.
+    #[test]
+    fn word() {
+        let matcher = RegexMatcherBuilder::new()
+            .word(true)
+            .build(r"-2")
+            .unwrap();
+        assert!(matcher.is_match(b"abc -2 foo").unwrap());
+
+        let matcher = RegexMatcherBuilder::new()
+            .word(false)
+            .build(r"\b-2\b")
+            .unwrap();
+        assert!(!matcher.is_match(b"abc -2 foo").unwrap());
+    }
+
+    // Test that enabling a line terminator prevents it from matching through
+    // said line terminator.
+    #[test]
+    fn line_terminator() {
+        // This works, because there's no line terminator specified.
+        let matcher = RegexMatcherBuilder::new()
+            .build(r"abc\sxyz")
+            .unwrap();
+        assert!(matcher.is_match(b"abc\nxyz").unwrap());
+
+        // This doesn't.
+        let matcher = RegexMatcherBuilder::new()
+            .line_terminator(Some(b'\n'))
+            .build(r"abc\sxyz")
+            .unwrap();
+        assert!(!matcher.is_match(b"abc\nxyz").unwrap());
+    }
+
+    // Ensure that the builder returns an error if a line terminator is set
+    // and the regex could not be modified to remove a line terminator.
+    #[test]
+    fn line_terminator_error() {
+        assert!(RegexMatcherBuilder::new()
+            .line_terminator(Some(b'\n'))
+            .build(r"a\nz")
+            .is_err())
+    }
+
+    // Test that enabling CRLF permits `$` to match at the end of a line.
+    #[test]
+    fn line_terminator_crlf() {
+        // Test normal use of `$` with a `\n` line terminator.
+        let matcher = RegexMatcherBuilder::new()
+            .multi_line(true)
+            .build(r"abc$")
+            .unwrap();
+        assert!(matcher.is_match(b"abc\n").unwrap());
+
+        // Test that `$` doesn't match at `\r\n` boundary normally.
+        let matcher = RegexMatcherBuilder::new()
+            .multi_line(true)
+            .build(r"abc$")
+            .unwrap();
+        assert!(!matcher.is_match(b"abc\r\n").unwrap());
+
+        // Now check the CRLF handling.
+        let matcher = RegexMatcherBuilder::new()
+            .multi_line(true)
+            .crlf(true)
+            .build(r"abc$")
+            .unwrap();
+        assert!(matcher.is_match(b"abc\r\n").unwrap());
+    }
+
+    // Test that smart case works.
+    #[test]
+    fn case_smart() {
+        let matcher = RegexMatcherBuilder::new()
+            .case_smart(true)
+            .build(r"abc")
+            .unwrap();
+        assert!(matcher.is_match(b"ABC").unwrap());
+
+        let matcher = RegexMatcherBuilder::new()
+            .case_smart(true)
+            .build(r"aBc")
+            .unwrap();
+        assert!(!matcher.is_match(b"ABC").unwrap());
+    }
+
+    // Test that finding candidate lines works as expected.
+    #[test]
+    fn candidate_lines() {
+        fn is_confirmed(m: LineMatchKind) -> bool {
+            match m {
+                LineMatchKind::Confirmed(_) => true,
+                _ => false,
+            }
+        }
+        fn is_candidate(m: LineMatchKind) -> bool {
+            match m {
+                LineMatchKind::Candidate(_) => true,
+                _ => false,
+            }
+        }
+
+        // With no line terminator set, we can't employ any optimizations,
+        // so we get a confirmed match.
+        let matcher = RegexMatcherBuilder::new()
+            .build(r"\wfoo\s")
+            .unwrap();
+        let m = matcher.find_candidate_line(b"afoo ").unwrap().unwrap();
+        assert!(is_confirmed(m));
+
+        // With a line terminator and a regex specially crafted to have an
+        // easy-to-detect inner literal, we can apply an optimization that
+        // quickly finds candidate matches.
+        let matcher = RegexMatcherBuilder::new()
+            .line_terminator(Some(b'\n'))
+            .build(r"\wfoo\s")
+            .unwrap();
+        let m = matcher.find_candidate_line(b"afoo ").unwrap().unwrap();
+        assert!(is_candidate(m));
     }
 }

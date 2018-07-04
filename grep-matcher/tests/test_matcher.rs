@@ -1,4 +1,4 @@
-use grep_matcher::{Captures, Match, Matcher};
+use grep_matcher::{Captures, Match, Matcher, NoError};
 use regex::bytes::Regex;
 
 use util::{RegexMatcher, RegexMatcherNoCaps};
@@ -38,6 +38,30 @@ fn find_iter() {
         false
     }).unwrap();
     assert_eq!(matches, vec![m(0, 5)]);
+}
+
+#[test]
+fn try_find_iter() {
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    struct MyError;
+    impl From<NoError> for MyError {
+        fn from(_: NoError) -> MyError {
+            panic!("BUG: an impossible error occurred")
+        }
+    }
+
+    let matcher = matcher(r"(\w+)\s+(\w+)");
+    let mut matches = vec![];
+    let err = matcher.try_find_iter(b"aa bb cc dd", |m| {
+        if matches.is_empty() {
+            matches.push(m);
+            Ok(true)
+        } else {
+            Err(MyError)
+        }
+    }).unwrap_err();
+    assert_eq!(matches, vec![m(0, 5)]);
+    assert_eq!(err, MyError);
 }
 
 #[test]
@@ -92,6 +116,33 @@ fn captures_iter() {
     assert_eq!(matches, vec![
         m(0, 5), m(0, 2), m(3, 5),
     ]);
+}
+
+#[test]
+fn try_captures_iter() {
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    struct MyError;
+    impl From<NoError> for MyError {
+        fn from(_: NoError) -> MyError {
+            panic!("BUG: an impossible error occurred")
+        }
+    }
+
+    let matcher = matcher(r"(?P<a>\w+)\s+(?P<b>\w+)");
+    let mut caps = matcher.new_captures().unwrap();
+    let mut matches = vec![];
+    let err = matcher.try_captures_iter(b"aa bb cc dd", &mut caps, |caps| {
+        if matches.is_empty() {
+            matches.push(caps.get(0).unwrap());
+            matches.push(caps.get(1).unwrap());
+            matches.push(caps.get(2).unwrap());
+            Ok(true)
+        } else {
+            Err(MyError)
+        }
+    }).unwrap_err();
+    assert_eq!(matches, vec![m(0, 5), m(0, 2), m(3, 5)]);
+    assert_eq!(err, MyError);
 }
 
 // Test that our default impls for capturing are correct. Namely, when

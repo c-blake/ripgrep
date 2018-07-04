@@ -110,7 +110,7 @@ impl Matcher for WordMatcher {
 #[cfg(test)]
 mod tests {
     use grep_matcher::{Captures, Match, Matcher};
-    use config::{Config, ConfiguredHIR};
+    use config::Config;
     use super::WordMatcher;
 
     fn matcher(pattern: &str) -> WordMatcher {

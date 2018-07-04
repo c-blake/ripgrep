@@ -1,5 +1,3 @@
-// #![allow(dead_code, unused_imports, unused_variables)]
-
 extern crate grep_matcher;
 #[macro_use]
 extern crate log;

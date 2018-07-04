@@ -370,6 +370,23 @@ pub trait Matcher {
     ) -> Result<(), Self::Error>
     where F: FnMut(Match) -> bool
     {
+        self.try_find_iter(haystack, |m| Ok(matched(m)))
+    }
+
+    /// Executes the given function over successive non-overlapping matches
+    /// in `haystack`. If no match exists, then the given function is never
+    /// called. If the function returns `false`, then iteration stops.
+    /// Similarly, if the function returns an error then iteration stops and
+    /// the error is yielded. If an error occurs while executing the search,
+    /// then it is converted to
+    /// `E`.
+    fn try_find_iter<F, E: From<Self::Error>>(
+        &self,
+        haystack: &[u8],
+        mut matched: F,
+    ) -> Result<(), E>
+    where F: FnMut(Match) -> Result<bool, E>
+    {
         let mut last_end = 0;
         let mut last_match = None;
 
@@ -395,7 +412,7 @@ pub trait Matcher {
                 last_end = m.end;
             }
             last_match = Some(m.end);
-            if !matched(m) {
+            if !matched(m)? {
                 return Ok(());
             }
         }
@@ -426,6 +443,24 @@ pub trait Matcher {
     ) -> Result<(), Self::Error>
     where F: FnMut(&Self::Captures) -> bool
     {
+        self.try_captures_iter(haystack, caps, |caps| Ok(matched(caps)))
+    }
+
+    /// Executes the given function over successive non-overlapping matches
+    /// in `haystack` with capture groups extracted from each match. If no
+    /// match exists, then the given function is never called. If the function
+    /// returns `false`, then iteration stops. Similarly, if the function
+    /// returns an error then iteration stops and the error is yielded. If
+    /// an error occurs while executing the search, then it is converted to
+    /// `E`.
+    fn try_captures_iter<F, E: From<Self::Error>>(
+        &self,
+        haystack: &[u8],
+        caps: &mut Self::Captures,
+        mut matched: F,
+    ) -> Result<(), E>
+    where F: FnMut(&Self::Captures) -> Result<bool, E>
+    {
         let mut last_end = 0;
         let mut last_match = None;
 
@@ -451,7 +486,7 @@ pub trait Matcher {
                 last_end = m.end;
             }
             last_match = Some(m.end);
-            if !matched(caps) {
+            if !matched(caps)? {
                 return Ok(());
             }
         }
@@ -715,6 +750,16 @@ impl<'a, M: Matcher> Matcher for &'a M {
         (*self).find_iter(haystack, matched)
     }
 
+    fn try_find_iter<F, E: From<Self::Error>>(
+        &self,
+        haystack: &[u8],
+        matched: F,
+    ) -> Result<(), E>
+    where F: FnMut(Match) -> Result<bool, E>
+    {
+        (*self).try_find_iter(haystack, matched)
+    }
+
     fn captures(
         &self,
         haystack: &[u8],
@@ -732,6 +777,17 @@ impl<'a, M: Matcher> Matcher for &'a M {
     where F: FnMut(&Self::Captures) -> bool
     {
         (*self).captures_iter(haystack, caps, matched)
+    }
+
+    fn try_captures_iter<F, E: From<Self::Error>>(
+        &self,
+        haystack: &[u8],
+        caps: &mut Self::Captures,
+        matched: F,
+    ) -> Result<(), E>
+    where F: FnMut(&Self::Captures) -> Result<bool, E>
+    {
+        (*self).try_captures_iter(haystack, caps, matched)
     }
 
     fn replace<F>(

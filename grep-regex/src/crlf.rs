@@ -57,8 +57,6 @@ pub fn crlfify(expr: Hir) -> Hir {
 #[cfg(test)]
 mod tests {
     use regex_syntax::Parser;
-
-    use error::Error;
     use super::crlfify;
 
     fn roundtrip(pattern: &str) -> String {
