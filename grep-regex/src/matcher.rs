@@ -9,6 +9,14 @@ use strip::LineTerminator;
 use word::WordMatcher;
 
 /// A builder for constructing a `Matcher` using regular expressions.
+///
+/// This builder re-exports many of the same options found on the regex crate's
+/// builder, in addition to a few other options such as smart case, word
+/// matching and the ability to set a line terminator which may enable certain
+/// types of optimizations.
+///
+/// The syntax supported is documented as part of the regex crate:
+/// https://docs.rs/regex/*/regex/#syntax
 #[derive(Clone, Debug)]
 pub struct RegexMatcherBuilder {
     config: Config,
@@ -21,12 +29,18 @@ impl Default for RegexMatcherBuilder {
 }
 
 impl RegexMatcherBuilder {
+    /// Create a new builder for configuring a regex matcher.
     pub fn new() -> RegexMatcherBuilder {
         RegexMatcherBuilder {
             config: Config::default(),
         }
     }
 
+    /// Build a new matcher using the current configuration for the provided
+    /// pattern.
+    ///
+    /// The syntax supported is documented as part of the regex crate:
+    /// https://docs.rs/regex/*/regex/#syntax
     pub fn build(&self, pattern: &str) -> Result<RegexMatcher, Error> {
         let chir = self.config.hir(pattern)?;
         let fast_line_regex = chir.fast_line_regex()?;
@@ -37,21 +51,50 @@ impl RegexMatcherBuilder {
         })
     }
 
+    /// Set the value for the case insensitive (`i`) flag.
+    ///
+    /// When enabled, letters in the pattern will match both upper case and
+    /// lower case variants.
     pub fn case_insensitive(&mut self, yes: bool) -> &mut RegexMatcherBuilder {
         self.config.case_insensitive = yes;
         self
     }
 
+    /// Whether to enable "smart case" or not.
+    ///
+    /// When smart case is enabled, the builder will automatically enable
+    /// case insensitive matching based on how the pattern is written. Namely,
+    /// case insensitive mode is enabled when both of the following things
+    /// are true:
+    ///
+    /// 1. The pattern contains at least one literal character. For example,
+    ///    `a\w` contains a literal (`a`) but `\w` does not.
+    /// 2. Of the literals in the pattern, none of them are considered to be
+    ///    uppercase according to Unicode. For example, `foo\pL` has no
+    ///    uppercase literals but `Foo\pL` does.
     pub fn case_smart(&mut self, yes: bool) -> &mut RegexMatcherBuilder {
         self.config.case_smart = yes;
         self
     }
 
+    /// Set the value for the multi-line matching (`m`) flag.
+    ///
+    /// When enabled, `^` matches the beginning of lines and `$` matches the
+    /// end of lines.
+    ///
+    /// By default, they match beginning/end of the input.
     pub fn multi_line(&mut self, yes: bool) -> &mut RegexMatcherBuilder {
         self.config.multi_line = yes;
         self
     }
 
+    /// Set the value for the any character (`s`) flag, where in `.` matches
+    /// anything when `s` is set and matches anything except for new line when
+    /// it is not set (the default).
+    ///
+    /// N.B. "matches anything" means "any byte" when Unicode is disabled and
+    /// means "any valid UTF-8 encoding of any Unicode scalar value" when
+    /// Unicode is enabled.
     pub fn dot_matches_new_line(
         &mut self,
         yes: bool,
@@ -60,11 +103,22 @@ impl RegexMatcherBuilder {
         self
     }
 
+    /// Set the value for the greedy swap (`U`) flag.
+    ///
+    /// When enabled, a pattern like `a*` is lazy (tries to find shortest
+    /// match) and `a*?` is greedy (tries to find longest match).
+    ///
+    /// By default, `a*` is greedy and `a*?` is lazy.
     pub fn swap_greed(&mut self, yes: bool) -> &mut RegexMatcherBuilder {
         self.config.swap_greed = yes;
         self
     }
 
+    /// Set the value for the ignore whitespace (`x`) flag.
+    ///
+    /// When enabled, whitespace such as new lines and spaces will be ignored
+    /// between expressions of the pattern, and `#` can be used to start a
+    /// comment until the next new line.
     pub fn ignore_whitespace(
         &mut self,
         yes: bool,
@@ -73,21 +127,54 @@ impl RegexMatcherBuilder {
         self
     }
 
+    /// Set the value for the Unicode (`u`) flag.
+    ///
+    /// Enabled by default. When disabled, character classes such as `\w` only
+    /// match ASCII word characters instead of all Unicode word characters.
     pub fn unicode(&mut self, yes: bool) -> &mut RegexMatcherBuilder {
         self.config.unicode = yes;
         self
     }
 
+    /// Whether to support octal syntax or not.
+    ///
+    /// Octal syntax is a little-known way of uttering Unicode codepoints in
+    /// a regular expression. For example, `a`, `\x61`, `\u0061` and
+    /// `\141` are all equivalent regular expressions, where the last example
+    /// shows octal syntax.
+    ///
+    /// While supporting octal syntax isn't in and of itself a problem, it does
+    /// make good error messages harder. That is, in PCRE based regex engines,
+    /// syntax like `\0` invokes a backreference, which is explicitly
+    /// unsupported in Rust's regex engine. However, many users expect it to
+    /// be supported. Therefore, when octal support is disabled, the error
+    /// message will explicitly mention that backreferences aren't supported.
+    ///
+    /// Octal syntax is disabled by default.
     pub fn octal(&mut self, yes: bool) -> &mut RegexMatcherBuilder {
         self.config.octal = yes;
         self
     }
 
+    /// Set the approximate size limit of the compiled regular expression.
+    ///
+    /// This roughly corresponds to the number of bytes occupied by a single
+    /// compiled program. If the program exceeds this number, then a
+    /// compilation error is returned.
     pub fn size_limit(&mut self, bytes: usize) -> &mut RegexMatcherBuilder {
         self.config.size_limit = bytes;
         self
     }
 
+    /// Set the approximate size of the cache used by the DFA.
+    ///
+    /// This roughly corresponds to the number of bytes that the DFA will
+    /// use while searching.
+    ///
+    /// Note that this is a *per thread* limit. There is no way to set a global
+    /// limit. In particular, if a regex is used from multiple threads
+    /// simultaneously, then each thread may use up to the number of bytes
+    /// specified here.
     pub fn dfa_size_limit(
         &mut self,
         bytes: usize,
@@ -96,11 +183,53 @@ impl RegexMatcherBuilder {
         self
     }
 
+    /// Set the nesting limit for this parser.
+    ///
+    /// The nesting limit controls how deep the abstract syntax tree is allowed
+    /// to be. If the AST exceeds the given limit (e.g., with too many nested
+    /// groups), then an error is returned by the parser.
+    ///
+    /// The purpose of this limit is to act as a heuristic to prevent stack
+    /// overflow for consumers that do structural induction on an `Ast` using
+    /// explicit recursion. While this crate never does this (instead using
+    /// constant stack space and moving the call stack to the heap), other
+    /// crates may.
+    ///
+    /// This limit is not checked until the entire Ast is parsed. Therefore,
+    /// if callers want to put a limit on the amount of heap space used, then
+    /// they should impose a limit on the length, in bytes, of the concrete
+    /// pattern string. In particular, this is viable since this parser
+    /// implementation will limit itself to heap space proportional to the
+    /// lenth of the pattern string.
+    ///
+    /// Note that a nest limit of `0` will return a nest limit error for most
+    /// patterns but not all. For example, a nest limit of `0` permits `a` but
+    /// not `ab`, since `ab` requires a concatenation, which results in a nest
+    /// depth of `1`. In general, a nest limit is not something that manifests
+    /// in an obvious way in the concrete syntax, therefore, it should not be
+    /// used in a granular way.
     pub fn nest_limit(&mut self, limit: u32) -> &mut RegexMatcherBuilder {
         self.config.nest_limit = limit;
         self
     }
 
+    /// Set a line terminator for the matcher.
+    ///
+    /// The purpose of setting a line terminator is to enable a certain class
+    /// of optimizations that can make line oriented searching faster. Namely,
+    /// when a line terminator is enabled, then the builder will guarantee that
+    /// the resulting matcher will never be capable of producing a match that
+    /// contains the line terminator. Because of this guarantee, users of the
+    /// resulting matcher do not need to slowly execute a search line by line
+    /// for line oriented search.
+    ///
+    /// If the aforementioned guarantee about not matching a line terminator
+    /// cannot be made because of how the pattern was written, then the builder
+    /// will return an error when attempting to construct the matcher. For
+    /// example, the pattern `a\sb` will be transformed such that it can never
+    /// match `a\nb` (when `\n` is the line terminator), but the pattern `a\nb`
+    /// will result in an error since the `\n` cannot be easily removed without
+    /// changing the fundamental intent of the pattern.
     pub fn line_terminator(
         &mut self,
         line_term: Option<u8>,
@@ -109,6 +238,27 @@ impl RegexMatcherBuilder {
         self
     }
 
+    /// Set the line terminator to `\r\n` and enabled CRLF matching for `$`.
+    ///
+    /// This method sets two distinct settings:
+    ///
+    /// 1. It causes the line terminator for the matcher to be `\r\n`. Namely,
+    ///    this prevents the matcher from ever producing a match that contains
+    ///    a `\r` or `\n`.
+    /// 2. It translates all instances of `$` in the pattern to `(?:\r??$)`.
+    ///    This works around the fact that the regex engine does not support
+    ///    matching CRLF as a line terminator when using `$`.
+    ///
+    /// In particular, because of (2), the matches produced by the matcher may
+    /// be slightly different than what one would expect given the pattern.
+    /// This is the trade off made: in many cases, `$` will "just work" in the
+    /// presence of `\r\n` line terminators, but matches may require some
+    /// trimming to faithfully represent the indended match.
+    ///
+    /// Note that if you do not wish to set the line terminator but would still
+    /// like `$` to match `\r\n` line terminators, then it is valid to call
+    /// `crlf(true)` followed by `line_terminator(None)`. Ordering is
+    /// important, since `crlf` and `line_terminator` override each other.
     pub fn crlf(&mut self, yes: bool) -> &mut RegexMatcherBuilder {
         if yes {
             self.config.line_terminator = Some(LineTerminator::CRLF);
@@ -119,6 +269,17 @@ impl RegexMatcherBuilder {
         self
     }
 
+    /// Require that all matches occur on word boundaries.
+    ///
+    /// Enabling this option is subtly different than putting `\b` assertions
+    /// on both sides of your pattern. In particular, a `\b` assertion requires
+    /// that one side of it match a word character while the other match a
+    /// non-word character. This option, in contrast, merely requires that
+    /// one side match a non-word character.
+    ///
+    /// For example, `\b-2\b` will not match `foo -2 bar` since `-` is not a
+    /// word character. However, `-2` with this `word` option enabled will
+    /// match the `-2` in `foo -2 bar`.
     pub fn word(&mut self, yes: bool) -> &mut RegexMatcherBuilder {
         self.config.word = yes;
         self
