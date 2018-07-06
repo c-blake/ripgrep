@@ -1,11 +1,11 @@
 [package]
 name = "grep-regex"
-version = "0.1.8"  #:version
+version = "0.0.1"  #:version
 authors = ["Andrew Gallant <jamslam@gmail.com>"]
 description = """
 Use Rust's regex library with the 'grep' crate.
 """
-documentation = "https://docs.rs/grep"
+documentation = "https://docs.rs/grep-regex"
 homepage = "https://github.com/BurntSushi/ripgrep"
 repository = "https://github.com/BurntSushi/ripgrep"
 readme = "README.md"
