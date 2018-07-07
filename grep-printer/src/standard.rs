@@ -256,13 +256,45 @@ where M: Matcher,
     }
 
     fn matched(&self, mat: &SinkMatch) -> io::Result<bool> {
-        let mut line_number = mat.line_number();
-        for line in mat.lines() {
-            if let Some(ref mut n) = line_number {
-                write!(self.wtr.borrow_mut(), "{}:", n)?;
-                *n += 1;
+        if !self.needs_match_granularity() {
+            self.matched_fast(mat)
+        } else {
+            Ok(true)
+        }
+    }
+
+    /// Print matched lines quickly by avoiding the detection of each
+    /// individual match in the lines reported in the given `SinkMatch`.
+    ///
+    /// This should only be used when the configuration does not demand match
+    /// granularity.
+    fn matched_fast(&self, mat: &SinkMatch) -> io::Result<bool> {
+        debug_assert!(!self.needs_match_granularity());
+
+        if self.path.is_some() {
+            if self.config.heading {
+                self.write_file_separator()?;
+                self.write_path_line()?;
+            } else {
+                self.write_path_field(self.config.separator_field_match)?;
             }
-            self.wtr.borrow_mut().write_all(line)?;
+        }
+        if let Some(n) = mat.line_number() {
+            self.write_line_number(n, self.config.separator_field_match)?;
+        }
+        if self.config.byte_offset {
+            self.write_byte_offset(
+                mat.absolute_byte_offset(),
+                self.config.separator_field_match,
+            )?;
+        }
+        if self.exceeds_max_columns(mat.bytes()) {
+            self.write(b"[Omitted long matching line]")?;
+            self.write_line_term()?;
+        }
+        self.write(mat.bytes())?;
+        if !self.has_line_terminator(mat.bytes()) {
+            self.write_line_term()?;
         }
         Ok(true)
     }
@@ -306,6 +338,10 @@ where M: Matcher,
         Ok(true)
     }
 
+    /// If this printer has a file path associated with it, then this will
+    /// write that path to the underlying writer followed by a line terminator.
+    /// (If a path terminator is set, then that is used instead of the line
+    /// terminator.)
     fn write_path_line(&self) -> io::Result<()> {
         if let Some(path) = self.path {
             self.write_spec(self.config.colors.path(), path.as_bytes())?;
@@ -318,6 +354,10 @@ where M: Matcher,
         Ok(())
     }
 
+    /// If this printer has a file path associated with it, then this will
+    /// write that path to the underlying writer followed by the given field
+    /// separator. (If a path terminator is set, then that is used instead of
+    /// the field separator.)
     fn write_path_field(&self, field_separator: u8) -> io::Result<()> {
         if let Some(path) = self.path {
             self.write_spec(self.config.colors.path(), path.as_bytes())?;
@@ -347,6 +387,17 @@ where M: Matcher,
     ) -> io::Result<()> {
         let n = line_number.to_string();
         self.write_spec(self.config.colors.line(), n.as_bytes())?;
+        self.write(&[field_separator])?;
+        Ok(())
+    }
+
+    fn write_column_number(
+        &self,
+        column_number: u64,
+        field_separator: u8,
+    ) -> io::Result<()> {
+        let n = column_number.to_string();
+        self.write_spec(self.config.colors.column(), n.as_bytes())?;
         self.write(&[field_separator])?;
         Ok(())
     }
@@ -386,6 +437,22 @@ where M: Matcher,
         buf.last() == Some(&self.searcher.line_terminator())
     }
 
+    /// Returns true if and only if the configuration of the printer requires
+    /// us to find each individual match in the lines reported by the searcher.
+    ///
+    /// We care about this distinction because finding each individual match
+    /// costs more.
+    fn needs_match_granularity(&self) -> bool {
+        !self.config.colors.matched.is_none()
+        || self.config.column
+        || self.config.replacement.is_some()
+        || self.config.line_per_match
+        || self.config.only_matching
+        || self.config.stats
+    }
+
+    /// Returns true if and only if the given line exceeds the maximum number
+    /// of columns set. If no maximum is set, then this always returns false.
     fn exceeds_max_columns(&self, line: &[u8]) -> bool {
         self.config.max_columns.map_or(false, |m| line.len() as u64 > m)
     }
@@ -454,6 +521,8 @@ impl<'a> PrinterPath<'a> {
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+
     use grep2::SearcherBuilder;
     use grep_regex::RegexMatcher;
     use termcolor::{NoColor, WriteColor};
@@ -493,11 +562,17 @@ and exhibited clearly, with a label attached.\
     #[test]
     fn scratch() {
         let mut printer = StandardBuilder::new()
-            .build(None, NoColor::new(vec![]));
-        let buf = search(&mut printer, "Sherlock", SHERLOCK);
-        assert!(printer.matched());
+            .build(Some(Path::new("sherlock")), NoColor::new(vec![]));
+        SearcherBuilder::new()
+            .after_context(1)
+            .line_number(true)
+            .build(RegexMatcher::new("Sherlock").unwrap())
+            .unwrap()
+            .search_reader(SHERLOCK.as_bytes(), &mut printer)
+            .unwrap();
+        let got = printer_contents(&mut printer);
 
-        println!("{}", buf);
+        println!("{}", got);
     }
 
     #[test]
