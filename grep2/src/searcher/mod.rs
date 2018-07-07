@@ -536,6 +536,11 @@ where M: Matcher,
         }
     }
 
+    /// Returns the underlying matcher.
+    pub fn matcher(&self) -> &M {
+        &self.matcher
+    }
+
     /// Returns the line terminator used by this searcher.
     pub fn line_terminator(&self) -> u8 {
         self.config.line_term

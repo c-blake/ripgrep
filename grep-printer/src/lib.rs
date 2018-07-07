@@ -14,9 +14,12 @@ extern crate serde_derive;
 extern crate termcolor;
 
 pub use color::UserColorSpec;
+pub use stats::Stats;
 
 mod ackmate;
 mod color;
+mod counter;
 #[cfg(feature = "serde1")]
 mod json;
 mod standard;
+mod stats;
