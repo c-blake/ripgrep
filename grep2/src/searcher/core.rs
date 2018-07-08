@@ -82,6 +82,10 @@ where M: Matcher,
         self.sink_matched(buf, range)
     }
 
+    pub fn begin(&mut self) -> Result<bool, S::Error> {
+        self.sink.begin(&self.searcher)
+    }
+
     pub fn finish(
         &mut self,
         byte_count: u64,

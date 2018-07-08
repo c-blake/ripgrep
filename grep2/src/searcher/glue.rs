@@ -40,7 +40,11 @@ where M: Matcher,
     pub fn run(mut self) -> Result<(), S::Error> {
         assert!(!self.config.multi_line);
 
-        while self.fill()? && self.core.match_by_line(self.rdr.buffer())? {}
+        if self.core.begin()? {
+            while
+                self.fill()? && self.core.match_by_line(self.rdr.buffer())?
+            {}
+        }
         self.core.finish(
             self.rdr.absolute_byte_offset(),
             self.rdr.binary_byte_offset(),
@@ -101,12 +105,18 @@ where M: Matcher,
     pub fn run(mut self) -> Result<(), S::Error> {
         assert!(!self.config.multi_line);
 
-        let binary_upto = cmp::min(self.slice.len(), DEFAULT_BUFFER_CAPACITY);
-        if !self.core.detect_binary(self.slice, &Range::new(0, binary_upto)) {
-            while
-                !self.slice[self.core.pos()..].is_empty()
-                && self.core.match_by_line(self.slice)?
-            {}
+        if self.core.begin()? {
+            let binary_upto = cmp::min(
+                self.slice.len(),
+                DEFAULT_BUFFER_CAPACITY,
+            );
+            let binary_range = Range::new(0, binary_upto);
+            if !self.core.detect_binary(self.slice, &binary_range) {
+                while
+                    !self.slice[self.core.pos()..].is_empty()
+                    && self.core.match_by_line(self.slice)?
+                {}
+            }
         }
         let byte_count = self.byte_count();
         let binary_byte_offset = self.core.binary_byte_offset();
@@ -154,21 +164,32 @@ where M: Matcher,
     pub fn run(mut self) -> Result<(), S::Error> {
         assert!(self.config.multi_line);
 
-        let binary_upto = cmp::min(self.slice.len(), DEFAULT_BUFFER_CAPACITY);
-        if !self.core.detect_binary(self.slice, &Range::new(0, binary_upto)) {
-            while !self.slice[self.core.pos()..].is_empty() && self.sink()? {}
-            let keepgoing = match self.last_match.take() {
-                None => true,
-                Some(last_match) => {
-                    if self.sink_context(&last_match)? {
-                        self.sink_matched(&last_match)?;
+        if self.core.begin()? {
+            let binary_upto = cmp::min(
+                self.slice.len(),
+                DEFAULT_BUFFER_CAPACITY,
+            );
+            let binary_range = Range::new(0, binary_upto);
+            if !self.core.detect_binary(self.slice, &binary_range) {
+                while
+                    !self.slice[self.core.pos()..].is_empty() && self.sink()?
+                {}
+                let keepgoing = match self.last_match.take() {
+                    None => true,
+                    Some(last_match) => {
+                        if self.sink_context(&last_match)? {
+                            self.sink_matched(&last_match)?;
+                        }
+                        true
                     }
-                    true
+                };
+                // Take care of any remaining context after the last match.
+                if keepgoing {
+                    self.core.after_context_by_line(
+                        self.slice,
+                        self.slice.len(),
+                    )?;
                 }
-            };
-            // Take care of any remaining context after the last match.
-            if keepgoing {
-                self.core.after_context_by_line(self.slice, self.slice.len())?;
             }
         }
         let byte_count = self.byte_count();

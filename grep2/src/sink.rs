@@ -169,6 +169,25 @@ pub trait Sink {
         Ok(true)
     }
 
+    /// This method is called when a search has begun, before any search is
+    /// executed. By default, this does nothing.
+    ///
+    /// If this returns `true`, then searching continues. If this returns
+    /// `false`, then searching is stopped immediately and `finish` is called.
+    ///
+    /// If this returns an error, then searching is stopped immediately,
+    /// `finish` is not called and the error is bubbled back up to the caller
+    /// of the searcher.
+    fn begin<M>(
+        &mut self,
+        _searcher: &Searcher<M>,
+    ) -> Result<bool, Self::Error>
+    where M: Matcher,
+          M::Error: fmt::Display
+    {
+        Ok(true)
+    }
+
     /// This method is called when a search has completed. By default, this
     /// does nothing.
     ///
@@ -219,6 +238,16 @@ impl<'a, S: Sink> Sink for &'a mut S {
           M::Error: fmt::Display
     {
         (**self).context_break(searcher)
+    }
+
+    fn begin<M>(
+        &mut self,
+        searcher: &Searcher<M>,
+    ) -> Result<bool, S::Error>
+    where M: Matcher,
+          M::Error: fmt::Display
+    {
+        (**self).begin(searcher)
     }
 
     fn finish<M>(

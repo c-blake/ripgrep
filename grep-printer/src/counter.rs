@@ -8,15 +8,38 @@ use termcolor::{ColorSpec, WriteColor};
 pub struct CounterWriter<W> {
     wtr: W,
     count: u64,
+    total_count: u64,
 }
 
 impl<W: Write> CounterWriter<W> {
     pub fn new(wtr: W) -> CounterWriter<W> {
-        CounterWriter { wtr: wtr, count: 0 }
+        CounterWriter { wtr: wtr, count: 0, total_count: 0 }
     }
 
+    /// Returns the total number of bytes written since construction or the
+    /// last time `reset` was called.
     pub fn count(&self) -> u64 {
         self.count
+    }
+
+    /// Returns the total number of bytes written since construction.
+    pub fn total_count(&self) -> u64 {
+        self.total_count + self.count
+    }
+
+    /// Resets the number of bytes written to `0`.
+    pub fn reset_count(&mut self) {
+        self.total_count += self.count;
+        self.count = 0;
+    }
+
+    /// Clear resets all counting related state for this writer.
+    ///
+    /// After this call, the total count of bytes written to the underlying
+    /// writer is erased and reset.
+    pub fn clear(&mut self) {
+        self.count = 0;
+        self.total_count = 0;
     }
 
     pub fn get_ref(&self) -> &W {

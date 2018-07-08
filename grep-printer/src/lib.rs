@@ -14,6 +14,7 @@ extern crate serde_derive;
 extern crate termcolor;
 
 pub use color::UserColorSpec;
+pub use standard::{Standard, StandardBuilder};
 pub use stats::Stats;
 
 mod ackmate;
