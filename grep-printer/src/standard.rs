@@ -6,7 +6,10 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
 
-use grep2::{Searcher, Sink, SinkContext, SinkFinish, SinkMatch};
+use grep2::{
+    Searcher,
+    Sink, SinkContext, SinkContextKind, SinkFinish, SinkMatch,
+};
 use grep_matcher::Matcher;
 use termcolor::{ColorSpec, WriteColor};
 
@@ -80,7 +83,8 @@ impl StandardBuilder {
             config: self.config.clone(),
             wtr: RefCell::new(CounterWriter::new(wtr)),
             start_time: Instant::now(),
-            matched: false,
+            match_count: 0,
+            after_context_remaining: 0,
             binary_byte_offset: None,
             path: path.map(|p| {
                 PrinterPath::with_separator(p, self.config.separator_path)
@@ -334,7 +338,8 @@ pub struct Standard<'a, W> {
     config: Config,
     wtr: RefCell<CounterWriter<W>>,
     start_time: Instant,
-    matched: bool,
+    match_count: u64,
+    after_context_remaining: u64,
     binary_byte_offset: Option<u64>,
     path: Option<PrinterPath<'a>>,
     stats: Option<Stats>,
@@ -370,7 +375,8 @@ impl<'a, W: WriteColor> Standard<'a, W> {
             config: self.config,
             wtr: self.wtr,
             start_time: self.start_time,
-            matched: self.matched,
+            match_count: self.match_count,
+            after_context_remaining: self.after_context_remaining,
             binary_byte_offset: self.binary_byte_offset,
             path: None,
             stats: self.stats,
@@ -382,8 +388,8 @@ impl<'a, W: WriteColor> Standard<'a, W> {
     ///
     /// This is unaffected by the result of searches before the previous
     /// search.
-    pub fn matched(&self) -> bool {
-        self.matched
+    pub fn has_match(&self) -> bool {
+        self.match_count > 0
     }
 
     /// If binary data was found in the previous search, this returns the
@@ -423,8 +429,14 @@ impl<'a, W: WriteColor> Sink for Standard<'a, W> {
     where M: Matcher,
           M::Error: fmt::Display
     {
-        self.matched = true;
-        StandardImpl::new(searcher, self).matched(mat)
+        self.match_count += 1;
+        self.after_context_remaining = searcher.after_context() as u64;
+
+        let imp = StandardImpl::new(searcher, self);
+        if !imp.matched(mat)? || imp.should_quit() {
+            return Ok(false);
+        }
+        Ok(true)
     }
 
     fn context<M>(
@@ -435,7 +447,15 @@ impl<'a, W: WriteColor> Sink for Standard<'a, W> {
     where M: Matcher,
           M::Error: fmt::Display
     {
-        StandardImpl::new(searcher, self).context(context)
+        if context.kind() == &SinkContextKind::After {
+            self.after_context_remaining =
+                self.after_context_remaining.saturating_sub(1);
+        }
+        let imp = StandardImpl::new(searcher, self);
+        if !imp.context(context)? || imp.should_quit() {
+            return Ok(false);
+        }
+        Ok(true)
     }
 
     fn context_break<M>(
@@ -457,8 +477,13 @@ impl<'a, W: WriteColor> Sink for Standard<'a, W> {
     {
         self.wtr.borrow_mut().reset_count();
         self.start_time = Instant::now();
-        self.matched = false;
+        self.match_count = 0;
+        self.after_context_remaining = 0;
         self.binary_byte_offset = None;
+        if self.config.max_matches == Some(0) {
+            return Ok(false);
+        }
+
         StandardImpl::new(searcher, self).begin()?;
         Ok(true)
     }
@@ -475,7 +500,7 @@ impl<'a, W: WriteColor> Sink for Standard<'a, W> {
         if let Some(stats) = self.stats.as_mut() {
             stats.add_elapsed(self.start_time.elapsed());
             stats.add_searches(1);
-            if self.matched {
+            if self.match_count > 0 {
                 stats.add_searches_with_match(1);
             }
             stats.add_bytes_searched(finish.byte_count());
@@ -493,6 +518,8 @@ pub struct StandardImpl<'a, M: 'a, W: 'a> {
     searcher: &'a Searcher<M>,
     config: &'a Config,
     wtr: &'a RefCell<CounterWriter<W>>,
+    match_count: u64,
+    after_context_remaining: u64,
     path: Option<&'a PrinterPath<'a>>,
 }
 
@@ -514,6 +541,8 @@ where M: Matcher,
             searcher: searcher,
             config: &printer.config,
             wtr: &printer.wtr,
+            match_count: printer.match_count,
+            after_context_remaining: printer.after_context_remaining,
             path: printer.path.as_ref(),
         }
     }
@@ -797,6 +826,22 @@ where M: Matcher,
     fn exceeds_max_columns(&self, line: &[u8]) -> bool {
         self.config.max_columns.map_or(false, |m| line.len() as u64 > m)
     }
+
+    /// Returns true if this printer should quit.
+    ///
+    /// This implements the logic for handling quitting after seeing a certain
+    /// amount of matches. In most cases, the logic is simple, but we must
+    /// permits all "after" contextual lines to print after reaching the limit.
+    fn should_quit(&self) -> bool {
+        let limit = match self.config.max_matches {
+            None => return false,
+            Some(limit) => limit,
+        };
+        if self.match_count < limit {
+            return false;
+        }
+        self.after_context_remaining == 0
+    }
 }
 
 /// A simple encapsulation of a file path used by the printer.
@@ -871,28 +916,6 @@ mod tests {
     use stats::Stats;
     use super::{Standard, StandardBuilder};
 
-    macro_rules! assert_eq_printed {
-        ($expected:expr, $got:expr) => {
-            let expected = &*$expected;
-            let got = &*$got;
-            if expected != got {
-                panic!("
-printed outputs differ!
-
-expected:
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-{}
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-
-got:
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-{}
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-", expected, got);
-            }
-        }
-    }
-
     const SHERLOCK: &'static str = "\
 For the Doctor Watsons of this world, as opposed to the Sherlock
 Holmeses, success in the province of detective work must always
@@ -933,7 +956,7 @@ and exhibited clearly, with a label attached.\
             .unwrap()
             .search_reader(SHERLOCK.as_bytes(), &mut printer)
             .unwrap();
-        assert!(printer.matched());
+        assert!(printer.has_match());
 
         let mut printer = StandardBuilder::new()
             .build(None, NoColor::new(vec![]));
@@ -942,7 +965,7 @@ and exhibited clearly, with a label attached.\
             .unwrap()
             .search_reader(SHERLOCK.as_bytes(), &mut printer)
             .unwrap();
-        assert!(!printer.matched());
+        assert!(!printer.has_match());
     }
 
     #[test]
@@ -1370,6 +1393,109 @@ but Doctor Watson has to have it taken out for him and dusted,
         let expected = "\
 [Omitted long matching line]
 but Doctor Watson has to have it taken out for him and dusted,
+";
+        assert_eq_printed!(expected, got);
+    }
+
+    #[test]
+    fn max_matches() {
+        let mut printer = StandardBuilder::new()
+            .max_matches(Some(1))
+            .build(None, NoColor::new(vec![]));
+        SearcherBuilder::new()
+            .build(RegexMatcher::new("Sherlock").unwrap())
+            .unwrap()
+            .search_reader(SHERLOCK.as_bytes(), &mut printer)
+            .unwrap();
+
+        let got = printer_contents(&mut printer);
+        let expected = "\
+For the Doctor Watsons of this world, as opposed to the Sherlock
+";
+        assert_eq_printed!(expected, got);
+    }
+
+    #[test]
+    fn max_matches_context() {
+        // after context: 1
+        let mut printer = StandardBuilder::new()
+            .max_matches(Some(1))
+            .build(None, NoColor::new(vec![]));
+        SearcherBuilder::new()
+            .after_context(1)
+            .build(RegexMatcher::new("Doctor Watsons").unwrap())
+            .unwrap()
+            .search_reader(SHERLOCK.as_bytes(), &mut printer)
+            .unwrap();
+
+        let got = printer_contents(&mut printer);
+        let expected = "\
+For the Doctor Watsons of this world, as opposed to the Sherlock
+Holmeses, success in the province of detective work must always
+";
+        assert_eq_printed!(expected, got);
+
+        // after context: 4
+        let mut printer = StandardBuilder::new()
+            .max_matches(Some(1))
+            .build(None, NoColor::new(vec![]));
+        SearcherBuilder::new()
+            .after_context(4)
+            .build(RegexMatcher::new("Doctor Watsons").unwrap())
+            .unwrap()
+            .search_reader(SHERLOCK.as_bytes(), &mut printer)
+            .unwrap();
+
+        let got = printer_contents(&mut printer);
+        let expected = "\
+For the Doctor Watsons of this world, as opposed to the Sherlock
+Holmeses, success in the province of detective work must always
+be, to a very large extent, the result of luck. Sherlock Holmes
+can extract a clew from a wisp of straw or a flake of cigar ash;
+but Doctor Watson has to have it taken out for him and dusted,
+";
+        assert_eq_printed!(expected, got);
+
+        // after context: 1, max matches: 2
+        let mut printer = StandardBuilder::new()
+            .max_matches(Some(2))
+            .build(None, NoColor::new(vec![]));
+        SearcherBuilder::new()
+            .after_context(1)
+            .build(RegexMatcher::new("Doctor Watsons|but Doctor").unwrap())
+            .unwrap()
+            .search_reader(SHERLOCK.as_bytes(), &mut printer)
+            .unwrap();
+
+        let got = printer_contents(&mut printer);
+        let expected = "\
+For the Doctor Watsons of this world, as opposed to the Sherlock
+Holmeses, success in the province of detective work must always
+--
+but Doctor Watson has to have it taken out for him and dusted,
+and exhibited clearly, with a label attached.
+";
+        assert_eq_printed!(expected, got);
+
+        // after context: 4, max matches: 2
+        let mut printer = StandardBuilder::new()
+            .max_matches(Some(2))
+            .build(None, NoColor::new(vec![]));
+        SearcherBuilder::new()
+            .after_context(4)
+            .build(RegexMatcher::new("Doctor Watsons|but Doctor").unwrap())
+            .unwrap()
+            .search_reader(SHERLOCK.as_bytes(), &mut printer)
+            .unwrap();
+
+        let got = printer_contents(&mut printer);
+        let expected = "\
+For the Doctor Watsons of this world, as opposed to the Sherlock
+Holmeses, success in the province of detective work must always
+be, to a very large extent, the result of luck. Sherlock Holmes
+can extract a clew from a wisp of straw or a flake of cigar ash;
+but Doctor Watson has to have it taken out for him and dusted,
+and exhibited clearly, with a label attached.
 ";
         assert_eq_printed!(expected, got);
     }

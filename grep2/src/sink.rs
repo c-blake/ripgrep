@@ -339,7 +339,7 @@ impl<'b> SinkMatch<'b> {
 }
 
 /// The type of context reported by a searcher.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum SinkContextKind {
     /// The line reported occurred before a match.
     Before,

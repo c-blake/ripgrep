@@ -17,6 +17,9 @@ pub use color::UserColorSpec;
 pub use standard::{Standard, StandardBuilder};
 pub use stats::Stats;
 
+#[macro_use]
+mod macros;
+
 mod ackmate;
 mod color;
 mod counter;
