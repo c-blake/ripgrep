@@ -7,6 +7,7 @@ An interface for regular expressions, with a focus on line oriented search.
 extern crate memchr;
 
 use std::fmt;
+use std::io;
 use std::ops;
 
 use interpolate::interpolate;
@@ -260,6 +261,12 @@ impl ::std::error::Error for NoError {
 
 impl fmt::Display for NoError {
     fn fmt(&self, _: &mut fmt::Formatter) -> fmt::Result {
+        panic!("BUG for NoError: an impossible error occurred")
+    }
+}
+
+impl From<io::Error> for NoError {
+    fn from(_: io::Error) -> NoError {
         panic!("BUG for NoError: an impossible error occurred")
     }
 }

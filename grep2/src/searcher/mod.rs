@@ -535,7 +535,9 @@ where M: Matcher,
             SliceByLine::new(self, slice, write_to).run()
         }
     }
+}
 
+impl<M> Searcher<M> {
     /// Returns the underlying matcher.
     pub fn matcher(&self) -> &M {
         &self.matcher

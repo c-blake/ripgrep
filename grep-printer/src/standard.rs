@@ -8,9 +8,9 @@ use std::time::Instant;
 
 use grep2::{
     Searcher,
-    Sink, SinkContext, SinkContextKind, SinkFinish, SinkMatch,
+    Sink, SinkError, SinkContext, SinkContextKind, SinkFinish, SinkMatch,
 };
-use grep_matcher::Matcher;
+use grep_matcher::{Match, Matcher};
 use termcolor::{ColorSpec, WriteColor};
 
 use color::{ColorSpecs, UserColorSpec};
@@ -68,11 +68,7 @@ impl StandardBuilder {
         StandardBuilder { config: Config::default() }
     }
 
-    pub fn build<'a, W: WriteColor>(
-        &self,
-        path: Option<&'a Path>,
-        wtr: W,
-    ) -> Standard<'a, W> {
+    pub fn build<W: WriteColor>(&self, wtr: W) -> Standard<W> {
         let stats =
             if self.config.stats {
                 Some(Stats::new())
@@ -82,13 +78,7 @@ impl StandardBuilder {
         Standard {
             config: self.config.clone(),
             wtr: RefCell::new(CounterWriter::new(wtr)),
-            start_time: Instant::now(),
-            match_count: 0,
-            after_context_remaining: 0,
-            binary_byte_offset: None,
-            path: path.map(|p| {
-                PrinterPath::with_separator(p, self.config.separator_path)
-            }),
+            matches: vec![],
             stats: stats,
         }
     }
@@ -119,9 +109,9 @@ impl StandardBuilder {
     /// Enable the gathering of various aggregate statistics.
     ///
     /// When this is enabled (it's disabled by default), statistics will be
-    /// gathered on the subsequent search, including but not limited to, the
-    /// total number of matches, the total number of bytes searched and the
-    /// total number of bytes printed.
+    /// gathered for all uses of `Standard` printer returned by `build`,
+    /// including but not limited to, the total number of matches, the total
+    /// number of bytes searched and the total number of bytes printed.
     ///
     /// Aggregate statistics can be accessed via the printer's
     /// [`Standard::build`](struct.Standard.html#method.stats)
@@ -129,7 +119,7 @@ impl StandardBuilder {
     ///
     /// When this is enabled, this printer may need to do extra work in order
     /// to compute certain statistics, which could cause the search to take
-    /// long.
+    /// longer.
     ///
     /// For a complete description of available statistics, see
     /// [`Stats`](struct.Stats.html).
@@ -334,55 +324,111 @@ impl StandardBuilder {
 }
 
 #[derive(Debug)]
-pub struct Standard<'a, W> {
+pub struct Standard<W> {
     config: Config,
     wtr: RefCell<CounterWriter<W>>,
+    matches: Vec<Match>,
+    stats: Option<Stats>,
+}
+
+impl<W: WriteColor> Standard<W> {
+    /// Return an implementation of `Sink` for the standard printer.
+    ///
+    /// This does not associate the printer with a file path, which means this
+    /// implementation will never print a file path along with the matches.
+    pub fn sink<'s>(&'s mut self) -> StandardSink<'static, 's, W> {
+        StandardSink {
+            standard: self,
+            path: None,
+            start_time: Instant::now(),
+            match_count: 0,
+            after_context_remaining: 0,
+            binary_byte_offset: None,
+        }
+    }
+
+    /// Return an implementation of `Sink` associated with a file path.
+    ///
+    /// When the printer is associated with a path, then it may, depending on
+    /// its configuration, print the path along with the matches found.
+    pub fn sink_with_path<'p, 's, P: ?Sized + AsRef<Path>>(
+        &'s mut self,
+        path: &'p P,
+    ) -> StandardSink<'p, 's, W> {
+        let ppath = PrinterPath::with_separator(
+            path.as_ref(), self.config.separator_path);
+        StandardSink {
+            standard: self,
+            path: Some(ppath),
+            start_time: Instant::now(),
+            match_count: 0,
+            after_context_remaining: 0,
+            binary_byte_offset: None,
+        }
+    }
+
+    /// Return a mutable reference to the underlying writer.
+    pub fn get_mut(&mut self) -> &mut W {
+        self.wtr.get_mut().get_mut()
+    }
+
+    /// Consume this printer and return back ownership of the underlying
+    /// writer.
+    pub fn into_inner(self) -> W {
+        self.wtr.into_inner().into_inner()
+    }
+
+    /// Return a reference to the stats produced by the printer, if they
+    /// exist.
+    pub fn stats(&self) -> Option<&Stats> {
+        self.stats.as_ref()
+    }
+
+    /// Returns true if and only if the configuration of the printer requires
+    /// us to find each individual match in the lines reported by the searcher.
+    ///
+    /// We care about this distinction because finding each individual match
+    /// costs more, so we only do it when we need to.
+    fn needs_match_granularity<M>(
+        &self,
+        searcher: &Searcher<M>,
+    ) -> bool {
+        let multi_line = searcher.multi_line();
+        let supports_color = self.wtr.borrow().supports_color();
+        let match_colored = !self.config.colors.matched().is_none();
+
+        // Coloring requires identifying each individual match.
+        (supports_color && match_colored)
+        // The column feature requires finding the position of the first match.
+        || (!multi_line && self.config.column)
+        // Requires finding each match for performing replacement.
+        || self.config.replacement.is_some()
+        // Emitting a line for each match requires finding each match.
+        || (!multi_line && self.config.line_per_match)
+        // Emitting only the match requires finding each match.
+        || self.config.only_matching
+        // Computing certain statistics requires finding each match.
+        || self.config.stats
+        // Imposing a limit on matched lines generally doesn't require finding
+        // each individual match, but when multi line mode is enabled, we
+        // can't assume that each match is one line, nor can we assume that
+        // each `SinkMatch` contains exactly one match, so we must go out and
+        // find each individual match.
+        || (multi_line && self.config.max_matches.is_some())
+    }
+}
+
+#[derive(Debug)]
+pub struct StandardSink<'p, 's, W: 's> {
+    standard: &'s mut Standard<W>,
+    path: Option<PrinterPath<'p>>,
     start_time: Instant,
     match_count: u64,
     after_context_remaining: u64,
     binary_byte_offset: Option<u64>,
-    path: Option<PrinterPath<'a>>,
-    stats: Option<Stats>,
 }
 
-impl<'a, W: WriteColor> Standard<'a, W> {
-    /// Set the path on this printer to the path provided.
-    ///
-    /// When a printer is associated with a path, then it may, depending on
-    /// its configuration, print the path along with the matches found.
-    ///
-    /// While this will not reset the state of aggregate statistics (if
-    /// enabled), this will reset other search oriented state such as whether
-    /// the printer matched and the first offset at which binary data has been
-    /// detected.
-    pub fn with_path<'p>(
-        self,
-        path: &'p Path,
-    ) -> Standard<'p, W> {
-        Standard {
-            path: Some(PrinterPath::with_separator(
-                path, self.config.separator_path)),
-            ..self.without_path()
-        }
-    }
-
-    /// Disassociate this printer with any path.
-    ///
-    /// Since this disassociates a file path from the printer it is impossible
-    /// for the printer to emit a file path.
-    pub fn without_path(self) -> Standard<'static, W> {
-        Standard {
-            config: self.config,
-            wtr: self.wtr,
-            start_time: self.start_time,
-            match_count: self.match_count,
-            after_context_remaining: self.after_context_remaining,
-            binary_byte_offset: self.binary_byte_offset,
-            path: None,
-            stats: self.stats,
-        }
-    }
-
+impl<'p, 's, W> StandardSink<'p, 's, W> {
     /// Returns true if and only if this printer received a match in the
     /// previous search.
     ///
@@ -405,20 +451,9 @@ impl<'a, W: WriteColor> Standard<'a, W> {
     pub fn binary_byte_offset(&self) -> Option<u64> {
         self.binary_byte_offset
     }
-
-    /// Return a mutable reference to the underlying writer.
-    pub fn get_mut(&mut self) -> &mut W {
-        self.wtr.get_mut().get_mut()
-    }
-
-    /// Return a reference to the stats produced by the printer, if they
-    /// exist.
-    pub fn stats(&self) -> Option<&Stats> {
-        self.stats.as_ref()
-    }
 }
 
-impl<'a, W: WriteColor> Sink for Standard<'a, W> {
+impl<'p, 's, W: WriteColor> Sink for StandardSink<'p, 's, W> {
     type Error = io::Error;
 
     fn matched<M>(
@@ -431,6 +466,22 @@ impl<'a, W: WriteColor> Sink for Standard<'a, W> {
     {
         self.match_count += 1;
         self.after_context_remaining = searcher.after_context() as u64;
+        self.standard.matches.clear();
+        if self.standard.needs_match_granularity(searcher) {
+            searcher.matcher().find_iter(mat.bytes(), |m| {
+                self.standard.matches.push(m);
+                true
+            }).map_err(io::Error::error_message)?;
+            if self.standard.matches.is_empty() {
+                panic!("BUG: searcher reported a matching line with no match");
+            }
+            if let Some(ref mut stats) = self.standard.stats {
+                stats.add_matches(self.standard.matches.len() as u64);
+            }
+        }
+        if let Some(ref mut stats) = self.standard.stats {
+            stats.add_matched_lines(mat.lines().count() as u64);
+        }
 
         let imp = StandardImpl::new(searcher, self);
         if !imp.matched(mat)? || imp.should_quit() {
@@ -475,12 +526,12 @@ impl<'a, W: WriteColor> Sink for Standard<'a, W> {
     where M: Matcher,
           M::Error: fmt::Display
     {
-        self.wtr.borrow_mut().reset_count();
+        self.standard.wtr.borrow_mut().reset_count();
         self.start_time = Instant::now();
         self.match_count = 0;
         self.after_context_remaining = 0;
         self.binary_byte_offset = None;
-        if self.config.max_matches == Some(0) {
+        if self.standard.config.max_matches == Some(0) {
             return Ok(false);
         }
 
@@ -497,14 +548,14 @@ impl<'a, W: WriteColor> Sink for Standard<'a, W> {
           M::Error: fmt::Display
     {
         self.binary_byte_offset = finish.binary_byte_offset();
-        if let Some(stats) = self.stats.as_mut() {
+        if let Some(stats) = self.standard.stats.as_mut() {
             stats.add_elapsed(self.start_time.elapsed());
             stats.add_searches(1);
             if self.match_count > 0 {
                 stats.add_searches_with_match(1);
             }
             stats.add_bytes_searched(finish.byte_count());
-            stats.add_bytes_printed(self.wtr.borrow().count());
+            stats.add_bytes_printed(self.standard.wtr.borrow().count());
         }
         Ok(())
     }
@@ -518,9 +569,19 @@ pub struct StandardImpl<'a, M: 'a, W: 'a> {
     searcher: &'a Searcher<M>,
     config: &'a Config,
     wtr: &'a RefCell<CounterWriter<W>>,
+    matches: &'a [Match],
+    path: Option<&'a PrinterPath<'a>>,
     match_count: u64,
     after_context_remaining: u64,
-    path: Option<&'a PrinterPath<'a>>,
+}
+
+/// A set of different line types that can be written, which is used by the
+/// printer to configure certain kinds of output.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LineType {
+    Match,
+    Replacement,
+    Context,
 }
 
 impl<'a, M, W> StandardImpl<'a, M, W>
@@ -528,34 +589,34 @@ where M: Matcher,
       M::Error: fmt::Display,
       W: WriteColor
 {
-    fn new<'unused>(
+    fn new(
         searcher: &'a Searcher<M>,
-        // The borrow checker can't seem to figure out what to do with
-        // `Standard`'s lifetime here. It seems like it _should_ be OK in that
-        // the lifetime should just shrink, but this is beyond my paygrade.
-        // Interestingly, switching to a superfluous lifetime appeases the
-        // compiler, but it's not clear why. Perhaps invariance is the culprit.
-        printer: &'a mut Standard<'unused, W>,
+        printer: &'a StandardSink<'a, 'a, W>,
     ) -> StandardImpl<'a, M, W> {
         StandardImpl {
             searcher: searcher,
-            config: &printer.config,
-            wtr: &printer.wtr,
+            config: &printer.standard.config,
+            wtr: &printer.standard.wtr,
+            matches: &printer.standard.matches,
+            path: printer.path.as_ref(),
             match_count: printer.match_count,
             after_context_remaining: printer.after_context_remaining,
-            path: printer.path.as_ref(),
         }
     }
 
     fn matched(&self, mat: &SinkMatch) -> io::Result<bool> {
-        if !self.needs_match_granularity() {
+        if self.matches.is_empty() {
             if self.searcher.multi_line() {
                 self.matched_fast_multi_line(mat)
             } else {
                 self.matched_fast(mat)
             }
         } else {
-            Ok(true)
+            if self.searcher.multi_line() {
+                unimplemented!()
+            } else {
+                self.matched_slow(mat)
+            }
         }
     }
 
@@ -566,30 +627,16 @@ where M: Matcher,
     /// This should only be used when the configuration does not demand match
     /// granularity and the searcher is not in multi line mode.
     fn matched_fast(&self, mat: &SinkMatch) -> io::Result<bool> {
-        debug_assert!(!self.needs_match_granularity());
+        debug_assert!(self.matches.is_empty());
         debug_assert!(!self.searcher.multi_line());
 
-        if !self.config.heading {
-            self.write_path_field(&self.config.separator_field_match)?;
-        }
-        if let Some(n) = mat.line_number() {
-            self.write_line_number(n, &self.config.separator_field_match)?;
-        }
-        if self.config.byte_offset {
-            self.write_byte_offset(
-                mat.absolute_byte_offset(),
-                &self.config.separator_field_match,
-            )?;
-        }
-        if self.exceeds_max_columns(mat.bytes()) {
-            self.write(b"[Omitted long matching line]")?;
-            self.write_line_term()?;
-            return Ok(true);
-        }
-        self.write(mat.bytes())?;
-        if !self.has_line_terminator(mat.bytes()) {
-            self.write_line_term()?;
-        }
+        self.write_prelude(
+            mat.absolute_byte_offset(),
+            mat.line_number(),
+            None,
+            &self.config.separator_field_match,
+        )?;
+        self.write_line(LineType::Match, mat.bytes())?;
         Ok(true)
     }
 
@@ -600,7 +647,7 @@ where M: Matcher,
     /// This should only be used when the configuration does not demand match
     /// granularity. This may be used when the searcher is in multi line mode.
     fn matched_fast_multi_line(&self, mat: &SinkMatch) -> io::Result<bool> {
-        debug_assert!(!self.needs_match_granularity());
+        debug_assert!(self.matches.is_empty());
         // This isn't actually a required invariant for using this method,
         // but if we wind up here and multi line mode is disabled, then we
         // should still treat it as a bug since we should be using matched_fast
@@ -609,27 +656,13 @@ where M: Matcher,
 
         let mut absolute_byte_offset = mat.absolute_byte_offset();
         for (i, line) in mat.lines().enumerate() {
-            if !self.config.heading {
-                self.write_path_field(&self.config.separator_field_match)?;
-            }
-            if let Some(n) = mat.line_number() {
-                self.write_line_number(
-                    n + i as u64,
-                    &self.config.separator_field_match,
-                )?;
-            }
-            if self.config.byte_offset {
-                self.write_byte_offset(
-                    absolute_byte_offset,
-                    &self.config.separator_field_match,
-                )?;
-            }
-            if self.exceeds_max_columns(line) {
-                self.write(b"[Omitted long matching line]")?;
-                self.write_line_term()?;
-            } else {
-                self.write(line)?;
-            }
+            self.write_prelude(
+                absolute_byte_offset,
+                mat.line_number().map(|n| n + i as u64),
+                None,
+                &self.config.separator_field_match,
+            )?;
+            self.write_line(LineType::Match, line)?;
             absolute_byte_offset += line.len() as u64;
         }
         if !self.has_line_terminator(mat.bytes()) {
@@ -638,27 +671,62 @@ where M: Matcher,
         Ok(true)
     }
 
-    fn context(&self, context: &SinkContext) -> io::Result<bool> {
-        if !self.config.heading {
-            self.write_path_field(&self.config.separator_field_context)?;
-        }
-        if let Some(n) = context.line_number() {
-            self.write_line_number(n, &self.config.separator_field_context)?;
-        }
-        if self.config.byte_offset {
-            self.write_byte_offset(
-                context.absolute_byte_offset(),
-                &self.config.separator_field_context,
+    /// Print a matching line where the configuration of the printer requires
+    /// finding each individual match (e.g., for coloring).
+    fn matched_slow(&self, mat: &SinkMatch) -> io::Result<bool> {
+        debug_assert!(!self.matches.is_empty());
+        debug_assert!(!self.searcher.multi_line());
+
+        if self.config.only_matching {
+            for &m in self.matches {
+                self.write_prelude(
+                    mat.absolute_byte_offset() + m.start() as u64,
+                    mat.line_number(),
+                    Some(m.start() as u64 + 1),
+                    &self.config.separator_field_match,
+                )?;
+
+                let buf = &mat.bytes()[m];
+                self.write_colored_line(
+                    LineType::Match,
+                    &[Match::new(0, buf.len())],
+                    buf,
+                )?;
+            }
+        } else if self.config.line_per_match {
+            for &m in self.matches {
+                self.write_prelude(
+                    mat.absolute_byte_offset() + m.start() as u64,
+                    mat.line_number(),
+                    Some(m.start() as u64 + 1),
+                    &self.config.separator_field_match,
+                )?;
+                self.write_colored_line(LineType::Match, &[m], mat.bytes())?;
+            }
+        } else {
+            self.write_prelude(
+                mat.absolute_byte_offset(),
+                mat.line_number(),
+                Some(self.matches[0].start() as u64 + 1),
+                &self.config.separator_field_match,
+            )?;
+            self.write_colored_line(
+                LineType::Match,
+                self.matches,
+                mat.bytes(),
             )?;
         }
-        if self.exceeds_max_columns(context.bytes()) {
-            self.write(b"[Omitted long context line]")?;
-            self.write_line_term()?;
-        }
-        self.write(context.bytes())?;
-        if !self.has_line_terminator(context.bytes()) {
-            self.write_line_term()?;
-        }
+        Ok(true)
+    }
+
+    fn context(&self, context: &SinkContext) -> io::Result<bool> {
+        self.write_prelude(
+            context.absolute_byte_offset(),
+            context.line_number(),
+            None,
+            &self.config.separator_field_context,
+        )?;
+        self.write_line(LineType::Context, context.bytes())?;
         // TODO: Highlight matches if search is inverted and colors are
         // enabled.
         Ok(true)
@@ -674,6 +742,124 @@ where M: Matcher,
         if self.config.heading {
             self.write_path_line()?;
         }
+        Ok(())
+    }
+
+    /// Write the beginning part of a matching line. This (may) include things
+    /// like the file path, line number among others, depending on the
+    /// configuration and the parameters given.
+    fn write_prelude(
+        &self,
+        absolute_byte_offset: u64,
+        line_number: Option<u64>,
+        column: Option<u64>,
+        separator: &[u8],
+    ) -> io::Result<()> {
+        if !self.config.heading {
+            self.write_path_field(separator)?;
+        }
+        if let Some(n) = line_number {
+            self.write_line_number(n, separator)?;
+        }
+        if let Some(n) = column {
+            if self.config.column {
+                self.write_column_number(n, separator)?;
+            }
+        }
+        if self.config.byte_offset {
+            self.write_byte_offset(absolute_byte_offset, separator)?;
+        }
+        Ok(())
+    }
+
+    fn write_line(
+        &self,
+        typ: LineType,
+        line: &[u8],
+    ) -> io::Result<()> {
+        if self.exceeds_max_columns(line) {
+            self.write_exceeded_line(typ)?;
+        } else {
+            self.write(line)?;
+            if !self.has_line_terminator(line) {
+                self.write_line_term()?;
+            }
+        }
+        Ok(())
+    }
+
+    fn write_colored_line(
+        &self,
+        typ: LineType,
+        matches: &[Match],
+        line: &[u8],
+    ) -> io::Result<()> {
+        // If we know we aren't going to emit color, then we can go faster.
+        let spec = self.config.colors.matched();
+        if !self.wtr.borrow().supports_color() || spec.is_none() {
+            return self.write_line(typ, line);
+        }
+
+        let mut last_written = 0;
+        for &m in matches {
+            self.write(&line[last_written..m.start()])?;
+            // This conditional checks if the match is both empty *and*
+            // past the end of the line. In this case, we never want to
+            // emit an additional color escape.
+            if m.start() != m.end() || m.end() != line.len() {
+                self.write_spec(spec, &line[m])?;
+            }
+            last_written = m.end();
+        }
+        self.write(&line[last_written..])?;
+        if !self.has_line_terminator(line) {
+            self.write_line_term()?;
+        }
+        Ok(())
+    }
+
+    fn write_exceeded_line(&self, typ: LineType) -> io::Result<()> {
+        if self.matches.is_empty() {
+            match typ {
+                LineType::Match => {
+                    self.write(b"[Omitted long matching line]")?;
+                }
+                LineType::Replacement => {
+                    // This case can't actually happen, but we implement
+                    // it for completeness. (Replacements imply that
+                    // `matches` is not empty.)
+                    self.write(b"[Omitted long replacement line]")?;
+                }
+                LineType::Context => {
+                    self.write(b"[Omitted long context line]")?;
+                }
+            }
+        } else {
+            match typ {
+                LineType::Match => {
+                    write!(
+                        self.wtr.borrow_mut(),
+                        "[Omitted long line with {} matches]",
+                        self.matches.len(),
+                    )?;
+                }
+                LineType::Replacement => {
+                    write!(
+                        self.wtr.borrow_mut(),
+                        "[Omitted long line with {} replacements]",
+                        self.matches.len(),
+                    )?;
+                }
+                LineType::Context => {
+                    write!(
+                        self.wtr.borrow_mut(),
+                        "[Omitted long context line with {} matches]",
+                        self.matches.len(),
+                    )?;
+                }
+            }
+        }
+        self.write_line_term()?;
         Ok(())
     }
 
@@ -791,36 +977,6 @@ where M: Matcher,
         self.searcher.before_context() > 0 || self.searcher.after_context() > 0
     }
 
-    /// Returns true if and only if the configuration of the printer requires
-    /// us to find each individual match in the lines reported by the searcher.
-    ///
-    /// We care about this distinction because finding each individual match
-    /// costs more.
-    fn needs_match_granularity(&self) -> bool {
-        let multi_line = self.searcher.multi_line();
-        let supports_color = self.wtr.borrow().supports_color();
-        let match_colored = !self.config.colors.matched.is_none();
-
-        // Coloring requires identifying each individual match.
-        (supports_color && match_colored)
-        // The column feature requires finding the position of the first match.
-        || (!multi_line && self.config.column)
-        // Requires finding each match for performing replacement.
-        || self.config.replacement.is_some()
-        // Emitting a line for each match requires finding each match.
-        || (!multi_line && self.config.line_per_match)
-        // Emitting only the match requires finding each match.
-        || self.config.only_matching
-        // Computing certain statistics requires finding each match.
-        || self.config.stats
-        // Imposing a limit on matched lines generally doesn't require finding
-        // each individual match, but when multi line mode is enabled, we
-        // can't assume that each match is one line, nor can we assume that
-        // each `SinkMatch` contains exactly one match, so we must go out and
-        // find each individual match.
-        || (multi_line && self.config.max_matches.is_some())
-    }
-
     /// Returns true if and only if the given line exceeds the maximum number
     /// of columns set. If no maximum is set, then this always returns false.
     fn exceeds_max_columns(&self, line: &[u8]) -> bool {
@@ -911,7 +1067,7 @@ mod tests {
 
     use grep2::SearcherBuilder;
     use grep_regex::RegexMatcher;
-    use termcolor::{NoColor, WriteColor};
+    use termcolor::{Ansi, NoColor, WriteColor};
 
     use stats::Stats;
     use super::{Standard, StandardBuilder};
@@ -925,8 +1081,14 @@ but Doctor Watson has to have it taken out for him and dusted,
 and exhibited clearly, with a label attached.\
 ";
 
-    fn printer_contents<'a>(
-        printer: &mut Standard<'a, NoColor<Vec<u8>>>,
+    fn printer_contents(
+        printer: &mut Standard<NoColor<Vec<u8>>>,
+    ) -> String {
+        String::from_utf8(printer.get_mut().get_ref().to_owned()).unwrap()
+    }
+
+    fn printer_contents_ansi(
+        printer: &mut Standard<Ansi<Vec<u8>>>,
     ) -> String {
         String::from_utf8(printer.get_mut().get_ref().to_owned()).unwrap()
     }
@@ -934,15 +1096,30 @@ and exhibited clearly, with a label attached.\
     #[test]
     fn scratch() {
         let mut printer = StandardBuilder::new()
-            .build(Some(Path::new("sherlock")), NoColor::new(vec![]));
+            .stats(true)
+            .line_per_match(true)
+            .column(true)
+            .byte_offset(true)
+            .user_color_specs(&[
+                "match:bg:0xff,0x7f,0x00".parse().unwrap(),
+                "match:fg:white".parse().unwrap(),
+                "match:style:bold".parse().unwrap(),
+                "line:none".parse().unwrap(),
+                "line:fg:magenta".parse().unwrap(),
+                "path:fg:green".parse().unwrap(),
+            ])
+            .build(Ansi::new(vec![]));
         SearcherBuilder::new()
             .after_context(1)
             .line_number(true)
-            .build(RegexMatcher::new("Sherlock").unwrap())
+            .build(RegexMatcher::new("Doctor Watsons|Sherlock").unwrap())
             .unwrap()
-            .search_reader(SHERLOCK.as_bytes(), &mut printer)
+            .search_reader(
+                SHERLOCK.as_bytes(),
+                printer.sink_with_path(Path::new("sherlock")),
+            )
             .unwrap();
-        let got = printer_contents(&mut printer);
+        let got = printer_contents_ansi(&mut printer);
 
         println!("{}", got);
     }
@@ -950,22 +1127,24 @@ and exhibited clearly, with a label attached.\
     #[test]
     fn reports_match() {
         let mut printer = StandardBuilder::new()
-            .build(None, NoColor::new(vec![]));
+            .build(NoColor::new(vec![]));
+        let mut sink = printer.sink();
         SearcherBuilder::new()
             .build(RegexMatcher::new("Sherlock").unwrap())
             .unwrap()
-            .search_reader(SHERLOCK.as_bytes(), &mut printer)
+            .search_reader(SHERLOCK.as_bytes(), &mut sink)
             .unwrap();
-        assert!(printer.has_match());
+        assert!(sink.has_match());
 
         let mut printer = StandardBuilder::new()
-            .build(None, NoColor::new(vec![]));
+            .build(NoColor::new(vec![]));
+        let mut sink = printer.sink();
         SearcherBuilder::new()
             .build(RegexMatcher::new("zzzzz").unwrap())
             .unwrap()
-            .search_reader(SHERLOCK.as_bytes(), &mut printer)
+            .search_reader(SHERLOCK.as_bytes(), &mut sink)
             .unwrap();
-        assert!(!printer.has_match());
+        assert!(!sink.has_match());
     }
 
     #[test]
@@ -973,23 +1152,25 @@ and exhibited clearly, with a label attached.\
         use grep2::BinaryDetection;
 
         let mut printer = StandardBuilder::new()
-            .build(None, NoColor::new(vec![]));
+            .build(NoColor::new(vec![]));
+        let mut sink = printer.sink();
         SearcherBuilder::new()
             .build(RegexMatcher::new("Sherlock").unwrap())
             .unwrap()
-            .search_reader(SHERLOCK.as_bytes(), &mut printer)
+            .search_reader(SHERLOCK.as_bytes(), &mut sink)
             .unwrap();
-        assert!(printer.binary_byte_offset().is_none());
+        assert!(sink.binary_byte_offset().is_none());
 
         let mut printer = StandardBuilder::new()
-            .build(None, NoColor::new(vec![]));
+            .build(NoColor::new(vec![]));
+        let mut sink = printer.sink();
         SearcherBuilder::new()
             .binary_detection(BinaryDetection::quit(b'\x00'))
             .build(RegexMatcher::new(".+").unwrap())
             .unwrap()
-            .search_reader(&b"abc\x00"[..], &mut printer)
+            .search_reader(&b"abc\x00"[..], &mut sink)
             .unwrap();
-        assert_eq!(printer.binary_byte_offset(), Some(3));
+        assert_eq!(sink.binary_byte_offset(), Some(3));
     }
 
     #[test]
@@ -998,11 +1179,11 @@ and exhibited clearly, with a label attached.\
 
         let mut printer = StandardBuilder::new()
             .stats(true)
-            .build(None, NoColor::new(vec![]));
+            .build(NoColor::new(vec![]));
         SearcherBuilder::new()
             .build(RegexMatcher::new("Sherlock|opposed").unwrap())
             .unwrap()
-            .search_reader(SHERLOCK.as_bytes(), &mut printer)
+            .search_reader(SHERLOCK.as_bytes(), printer.sink())
             .unwrap();
         let buf = printer_contents(&mut printer);
 
@@ -1013,8 +1194,8 @@ and exhibited clearly, with a label attached.\
         assert_eq!(stats.bytes_searched(), SHERLOCK.len() as u64);
         assert_eq!(stats.bytes_printed(), buf.len() as u64);
         // TODO:
-        // assert_eq!(stats.matched_lines(), 2);
-        // assert_eq!(stats.matches(), 3);
+        assert_eq!(stats.matched_lines(), 2);
+        assert_eq!(stats.matches(), 3);
     }
 
     #[test]
@@ -1023,21 +1204,21 @@ and exhibited clearly, with a label attached.\
 
         let mut printer = StandardBuilder::new()
             .stats(true)
-            .build(None, NoColor::new(vec![]));
+            .build(NoColor::new(vec![]));
         SearcherBuilder::new()
             .build(RegexMatcher::new("Sherlock|opposed").unwrap())
             .unwrap()
-            .search_reader(SHERLOCK.as_bytes(), &mut printer)
+            .search_reader(SHERLOCK.as_bytes(), printer.sink())
             .unwrap();
         SearcherBuilder::new()
             .build(RegexMatcher::new("zzzzzzzzz").unwrap())
             .unwrap()
-            .search_reader(SHERLOCK.as_bytes(), &mut printer)
+            .search_reader(SHERLOCK.as_bytes(), printer.sink())
             .unwrap();
         SearcherBuilder::new()
             .build(RegexMatcher::new("Sherlock|opposed").unwrap())
             .unwrap()
-            .search_reader(SHERLOCK.as_bytes(), &mut printer)
+            .search_reader(SHERLOCK.as_bytes(), printer.sink())
             .unwrap();
         let buf = printer_contents(&mut printer);
 
@@ -1046,23 +1227,22 @@ and exhibited clearly, with a label attached.\
         assert_eq!(stats.searches(), 3);
         assert_eq!(stats.searches_with_match(), 2);
         assert_eq!(stats.bytes_searched(), 3 * SHERLOCK.len() as u64);
-        assert_eq!(stats.bytes_printed(), 2 * buf.len() as u64);
-        // TODO:
-        // assert_eq!(stats.matched_lines(), 4);
-        // assert_eq!(stats.matches(), 6);
+        assert_eq!(stats.bytes_printed(), buf.len() as u64);
+        assert_eq!(stats.matched_lines(), 4);
+        assert_eq!(stats.matches(), 6);
     }
 
     #[test]
     fn context_break() {
         let mut printer = StandardBuilder::new()
             .separator_context(Some(b"--abc--".to_vec()))
-            .build(None, NoColor::new(vec![]));
+            .build(NoColor::new(vec![]));
         SearcherBuilder::new()
             .before_context(1)
             .after_context(1)
             .build(RegexMatcher::new("Watson").unwrap())
             .unwrap()
-            .search_reader(SHERLOCK.as_bytes(), &mut printer)
+            .search_reader(SHERLOCK.as_bytes(), printer.sink())
             .unwrap();
 
         let got = printer_contents(&mut printer);
@@ -1081,21 +1261,21 @@ and exhibited clearly, with a label attached.
     fn context_break_multiple_no_heading() {
         let mut printer = StandardBuilder::new()
             .separator_context(Some(b"--abc--".to_vec()))
-            .build(None, NoColor::new(vec![]));
+            .build(NoColor::new(vec![]));
 
         SearcherBuilder::new()
             .before_context(1)
             .after_context(1)
             .build(RegexMatcher::new("Watson").unwrap())
             .unwrap()
-            .search_reader(SHERLOCK.as_bytes(), &mut printer)
+            .search_reader(SHERLOCK.as_bytes(), printer.sink())
             .unwrap();
         SearcherBuilder::new()
             .before_context(1)
             .after_context(1)
             .build(RegexMatcher::new("Sherlock").unwrap())
             .unwrap()
-            .search_reader(SHERLOCK.as_bytes(), &mut printer)
+            .search_reader(SHERLOCK.as_bytes(), printer.sink())
             .unwrap();
 
         let got = printer_contents(&mut printer);
@@ -1120,21 +1300,21 @@ can extract a clew from a wisp of straw or a flake of cigar ash;
         let mut printer = StandardBuilder::new()
             .heading(true)
             .separator_context(Some(b"--abc--".to_vec()))
-            .build(None, NoColor::new(vec![]));
+            .build(NoColor::new(vec![]));
 
         SearcherBuilder::new()
             .before_context(1)
             .after_context(1)
             .build(RegexMatcher::new("Watson").unwrap())
             .unwrap()
-            .search_reader(SHERLOCK.as_bytes(), &mut printer)
+            .search_reader(SHERLOCK.as_bytes(), printer.sink())
             .unwrap();
         SearcherBuilder::new()
             .before_context(1)
             .after_context(1)
             .build(RegexMatcher::new("Sherlock").unwrap())
             .unwrap()
-            .search_reader(SHERLOCK.as_bytes(), &mut printer)
+            .search_reader(SHERLOCK.as_bytes(), printer.sink())
             .unwrap();
 
         let got = printer_contents(&mut printer);
@@ -1159,13 +1339,16 @@ can extract a clew from a wisp of straw or a flake of cigar ash;
         let mut printer = StandardBuilder::new()
             .separator_field_match(b"!!".to_vec())
             .separator_field_context(b"^^".to_vec())
-            .build(Some(Path::new("sherlock")), NoColor::new(vec![]));
+            .build(NoColor::new(vec![]));
         SearcherBuilder::new()
             .before_context(1)
             .after_context(1)
             .build(RegexMatcher::new("Watson").unwrap())
             .unwrap()
-            .search_reader(SHERLOCK.as_bytes(), &mut printer)
+            .search_reader(
+                SHERLOCK.as_bytes(),
+                printer.sink_with_path("sherlock"),
+            )
             .unwrap();
 
         let got = printer_contents(&mut printer);
@@ -1184,11 +1367,14 @@ sherlock^^and exhibited clearly, with a label attached.
     fn heading() {
         let mut printer = StandardBuilder::new()
             .heading(true)
-            .build(Some(Path::new("sherlock")), NoColor::new(vec![]));
+            .build(NoColor::new(vec![]));
         SearcherBuilder::new()
             .build(RegexMatcher::new("Watson").unwrap())
             .unwrap()
-            .search_reader(SHERLOCK.as_bytes(), &mut printer)
+            .search_reader(
+                SHERLOCK.as_bytes(),
+                printer.sink_with_path("sherlock"),
+            )
             .unwrap();
 
         let got = printer_contents(&mut printer);
@@ -1204,11 +1390,14 @@ but Doctor Watson has to have it taken out for him and dusted,
     fn no_heading() {
         let mut printer = StandardBuilder::new()
             .heading(false)
-            .build(Some(Path::new("sherlock")), NoColor::new(vec![]));
+            .build(NoColor::new(vec![]));
         SearcherBuilder::new()
             .build(RegexMatcher::new("Watson").unwrap())
             .unwrap()
-            .search_reader(SHERLOCK.as_bytes(), &mut printer)
+            .search_reader(
+                SHERLOCK.as_bytes(),
+                printer.sink_with_path("sherlock"),
+            )
             .unwrap();
 
         let got = printer_contents(&mut printer);
@@ -1223,16 +1412,22 @@ sherlock:but Doctor Watson has to have it taken out for him and dusted,
     fn no_heading_multiple() {
         let mut printer = StandardBuilder::new()
             .heading(false)
-            .build(Some(Path::new("sherlock")), NoColor::new(vec![]));
+            .build(NoColor::new(vec![]));
         SearcherBuilder::new()
             .build(RegexMatcher::new("Watson").unwrap())
             .unwrap()
-            .search_reader(SHERLOCK.as_bytes(), &mut printer)
+            .search_reader(
+                SHERLOCK.as_bytes(),
+                printer.sink_with_path("sherlock"),
+            )
             .unwrap();
         SearcherBuilder::new()
             .build(RegexMatcher::new("Sherlock").unwrap())
             .unwrap()
-            .search_reader(SHERLOCK.as_bytes(), &mut printer)
+            .search_reader(
+                SHERLOCK.as_bytes(),
+                printer.sink_with_path("sherlock"),
+            )
             .unwrap();
 
         let got = printer_contents(&mut printer);
@@ -1249,16 +1444,22 @@ sherlock:be, to a very large extent, the result of luck. Sherlock Holmes
     fn heading_multiple() {
         let mut printer = StandardBuilder::new()
             .heading(true)
-            .build(Some(Path::new("sherlock")), NoColor::new(vec![]));
+            .build(NoColor::new(vec![]));
         SearcherBuilder::new()
             .build(RegexMatcher::new("Watson").unwrap())
             .unwrap()
-            .search_reader(SHERLOCK.as_bytes(), &mut printer)
+            .search_reader(
+                SHERLOCK.as_bytes(),
+                printer.sink_with_path("sherlock"),
+            )
             .unwrap();
         SearcherBuilder::new()
             .build(RegexMatcher::new("Sherlock").unwrap())
             .unwrap()
-            .search_reader(SHERLOCK.as_bytes(), &mut printer)
+            .search_reader(
+                SHERLOCK.as_bytes(),
+                printer.sink_with_path("sherlock"),
+            )
             .unwrap();
 
         let got = printer_contents(&mut printer);
@@ -1277,12 +1478,12 @@ be, to a very large extent, the result of luck. Sherlock Holmes
     #[test]
     fn line_number() {
         let mut printer = StandardBuilder::new()
-            .build(None, NoColor::new(vec![]));
+            .build(NoColor::new(vec![]));
         SearcherBuilder::new()
             .line_number(true)
             .build(RegexMatcher::new("Watson").unwrap())
             .unwrap()
-            .search_reader(SHERLOCK.as_bytes(), &mut printer)
+            .search_reader(SHERLOCK.as_bytes(), printer.sink())
             .unwrap();
 
         let got = printer_contents(&mut printer);
@@ -1296,13 +1497,13 @@ be, to a very large extent, the result of luck. Sherlock Holmes
     #[test]
     fn line_number_multi_line() {
         let mut printer = StandardBuilder::new()
-            .build(None, NoColor::new(vec![]));
+            .build(NoColor::new(vec![]));
         SearcherBuilder::new()
             .line_number(true)
             .multi_line(true)
             .build(RegexMatcher::new("(?s)Watson.+Watson").unwrap())
             .unwrap()
-            .search_reader(SHERLOCK.as_bytes(), &mut printer)
+            .search_reader(SHERLOCK.as_bytes(), printer.sink())
             .unwrap();
 
         let got = printer_contents(&mut printer);
@@ -1320,11 +1521,11 @@ be, to a very large extent, the result of luck. Sherlock Holmes
     fn byte_offset() {
         let mut printer = StandardBuilder::new()
             .byte_offset(true)
-            .build(None, NoColor::new(vec![]));
+            .build(NoColor::new(vec![]));
         SearcherBuilder::new()
             .build(RegexMatcher::new("Watson").unwrap())
             .unwrap()
-            .search_reader(SHERLOCK.as_bytes(), &mut printer)
+            .search_reader(SHERLOCK.as_bytes(), printer.sink())
             .unwrap();
 
         let got = printer_contents(&mut printer);
@@ -1339,12 +1540,12 @@ be, to a very large extent, the result of luck. Sherlock Holmes
     fn byte_offset_multi_line() {
         let mut printer = StandardBuilder::new()
             .byte_offset(true)
-            .build(None, NoColor::new(vec![]));
+            .build(NoColor::new(vec![]));
         SearcherBuilder::new()
             .multi_line(true)
             .build(RegexMatcher::new("(?s)Watson.+Watson").unwrap())
             .unwrap()
-            .search_reader(SHERLOCK.as_bytes(), &mut printer)
+            .search_reader(SHERLOCK.as_bytes(), printer.sink())
             .unwrap();
 
         let got = printer_contents(&mut printer);
@@ -1362,11 +1563,11 @@ be, to a very large extent, the result of luck. Sherlock Holmes
     fn max_columns() {
         let mut printer = StandardBuilder::new()
             .max_columns(Some(63))
-            .build(None, NoColor::new(vec![]));
+            .build(NoColor::new(vec![]));
         SearcherBuilder::new()
             .build(RegexMatcher::new("ash|dusted").unwrap())
             .unwrap()
-            .search_reader(SHERLOCK.as_bytes(), &mut printer)
+            .search_reader(SHERLOCK.as_bytes(), printer.sink())
             .unwrap();
 
         let got = printer_contents(&mut printer);
@@ -1381,12 +1582,12 @@ but Doctor Watson has to have it taken out for him and dusted,
     fn max_columns_multi_line() {
         let mut printer = StandardBuilder::new()
             .max_columns(Some(63))
-            .build(None, NoColor::new(vec![]));
+            .build(NoColor::new(vec![]));
         SearcherBuilder::new()
             .multi_line(true)
             .build(RegexMatcher::new("(?s)ash.+dusted").unwrap())
             .unwrap()
-            .search_reader(SHERLOCK.as_bytes(), &mut printer)
+            .search_reader(SHERLOCK.as_bytes(), printer.sink())
             .unwrap();
 
         let got = printer_contents(&mut printer);
@@ -1401,11 +1602,11 @@ but Doctor Watson has to have it taken out for him and dusted,
     fn max_matches() {
         let mut printer = StandardBuilder::new()
             .max_matches(Some(1))
-            .build(None, NoColor::new(vec![]));
+            .build(NoColor::new(vec![]));
         SearcherBuilder::new()
             .build(RegexMatcher::new("Sherlock").unwrap())
             .unwrap()
-            .search_reader(SHERLOCK.as_bytes(), &mut printer)
+            .search_reader(SHERLOCK.as_bytes(), printer.sink())
             .unwrap();
 
         let got = printer_contents(&mut printer);
@@ -1420,12 +1621,12 @@ For the Doctor Watsons of this world, as opposed to the Sherlock
         // after context: 1
         let mut printer = StandardBuilder::new()
             .max_matches(Some(1))
-            .build(None, NoColor::new(vec![]));
+            .build(NoColor::new(vec![]));
         SearcherBuilder::new()
             .after_context(1)
             .build(RegexMatcher::new("Doctor Watsons").unwrap())
             .unwrap()
-            .search_reader(SHERLOCK.as_bytes(), &mut printer)
+            .search_reader(SHERLOCK.as_bytes(), printer.sink())
             .unwrap();
 
         let got = printer_contents(&mut printer);
@@ -1438,12 +1639,12 @@ Holmeses, success in the province of detective work must always
         // after context: 4
         let mut printer = StandardBuilder::new()
             .max_matches(Some(1))
-            .build(None, NoColor::new(vec![]));
+            .build(NoColor::new(vec![]));
         SearcherBuilder::new()
             .after_context(4)
             .build(RegexMatcher::new("Doctor Watsons").unwrap())
             .unwrap()
-            .search_reader(SHERLOCK.as_bytes(), &mut printer)
+            .search_reader(SHERLOCK.as_bytes(), printer.sink())
             .unwrap();
 
         let got = printer_contents(&mut printer);
@@ -1459,12 +1660,12 @@ but Doctor Watson has to have it taken out for him and dusted,
         // after context: 1, max matches: 2
         let mut printer = StandardBuilder::new()
             .max_matches(Some(2))
-            .build(None, NoColor::new(vec![]));
+            .build(NoColor::new(vec![]));
         SearcherBuilder::new()
             .after_context(1)
             .build(RegexMatcher::new("Doctor Watsons|but Doctor").unwrap())
             .unwrap()
-            .search_reader(SHERLOCK.as_bytes(), &mut printer)
+            .search_reader(SHERLOCK.as_bytes(), printer.sink())
             .unwrap();
 
         let got = printer_contents(&mut printer);
@@ -1480,12 +1681,12 @@ and exhibited clearly, with a label attached.
         // after context: 4, max matches: 2
         let mut printer = StandardBuilder::new()
             .max_matches(Some(2))
-            .build(None, NoColor::new(vec![]));
+            .build(NoColor::new(vec![]));
         SearcherBuilder::new()
             .after_context(4)
             .build(RegexMatcher::new("Doctor Watsons|but Doctor").unwrap())
             .unwrap()
-            .search_reader(SHERLOCK.as_bytes(), &mut printer)
+            .search_reader(SHERLOCK.as_bytes(), printer.sink())
             .unwrap();
 
         let got = printer_contents(&mut printer);
