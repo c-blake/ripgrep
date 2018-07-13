@@ -1484,6 +1484,8 @@ case \"$1\" in
        *) exec cat ;;
 	 esac;
 esac
+
+This overrides the -z/--search-grep flag.
 ");
     let arg = RGArg::flag("preprocessor", "COMMAND").short("P")
         .help(SHORT).long_help(LONG);
