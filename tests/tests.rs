@@ -1734,16 +1734,16 @@ sherlock!(feature_419_zero_as_shortcut_for_null, "Sherlock", ".",
 
 #[test]
 fn preprocessing() {
-    if !cmd_exists("zcat") {
+    if !cmd_exists("xzcat") {
         return;
     }
-    let gzip_file = include_bytes!("./data/sherlock.gz");
+    let xz_file = include_bytes!("./data/sherlock.xz");
 
     let wd = WorkDir::new("feature_preprocessing");
-    wd.create_bytes("sherlock.gz", gzip_file);
+    wd.create_bytes("sherlock.xz", xz_file);
 
     let mut cmd = wd.command();
-    cmd.arg("-P").arg("zcat").arg("Sherlock").arg("sherlock.gz");
+    cmd.arg("-P").arg("xzcat").arg("Sherlock").arg("sherlock.gz");
     let lines: String = wd.stdout(&mut cmd);
     let expected = "\
 For the Doctor Watsons of this world, as opposed to the Sherlock
