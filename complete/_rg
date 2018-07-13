@@ -171,9 +171,9 @@ _rg() {
     {-x,--line-regexp}'[only show matches surrounded by line boundaries]'
 
     + '(input-decoding)' # Compressed-file options
+    {-P+,--preprocessor=}'[specify preprocessor utility]:preprocessor utility:_command_names -e'
     {-z,--search-zip}'[search in compressed files]'
     $no"--no-search-zip[don't search in compressed files]"
-    {-P+,--preprocessor=}'[specify preprocessor utility]:preprocessor utility:_command_names -e'
 
     + misc # Other options — no need to separate these at the moment
     '(-b --byte-offset)'{-b,--byte-offset}'[show 0-based byte offset for each matching line]'
