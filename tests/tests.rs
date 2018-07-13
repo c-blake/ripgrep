@@ -1743,7 +1743,7 @@ fn preprocessing() {
     wd.create_bytes("sherlock.xz", xz_file);
 
     let mut cmd = wd.command();
-    cmd.arg("-P").arg("xzcat").arg("Sherlock").arg("sherlock.gz");
+    cmd.arg("-P").arg("xzcat").arg("Sherlock").arg("sherlock.xz");
     let lines: String = wd.stdout(&mut cmd);
     let expected = "\
 For the Doctor Watsons of this world, as opposed to the Sherlock
