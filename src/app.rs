@@ -1464,11 +1464,11 @@ This flag can be disabled with --no-search-zip.
 }
 
 fn flag_preprocessor(args: &mut Vec<RGArg>) {
-    const SHORT: &str = "search outputs of \"COMMAND FILE\" for each FILE";
+    const SHORT: &str = "search outputs of COMMAND FILE for each FILE";
     const LONG: &str = long!("\
-For each input FILE, search the standard output of \"COMMAND FILE\" rather
+For each input FILE, search the standard output of COMMAND FILE rather
 than the contents of FILE.  This option expects the COMMAND program to be
-available in your PATH.  An empty string COMMAND deactivats this feature.
+available in your PATH.  An empty string COMMAND deactivates this feature.
 
 When searching over sets of files that may require one of several decoders
 as preprocessors, COMMAND should be a wrapper program or script which first
